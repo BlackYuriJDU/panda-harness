@@ -36,9 +36,9 @@ Nothing is enforced only in the prompt.
       └─────────┬─────┘      │       │
                 │            │       │
                 ▼            ▼       ▼
-     OpenCode Console   PolicyEngine  SessionLog
-     /openai/v1/chat    policy.py     session.py
-     completions              │            │
+     OpenCode Go        PolicyEngine  SessionLog
+     /openai /anthropic policy.py    session.py
+     v1 (streaming)           │            │
                               ▼            ▼
                     corpus/validation  .panda/sessions
                     corpus/studies     *.jsonl + anchor
@@ -50,7 +50,7 @@ Nothing is enforced only in the prompt.
 |---|---|
 | `config.py` | Typed `.panda/config.json` (schema 2), provider settings, path restrictions. |
 | `workspace.py` | Root discovery, path normalization, git/tool probes. |
-| `provider.py` | OpenCode Console client: catalogue, protocol classification, streaming chat completions, usage. |
+| `provider.py` | OpenCode Go client: catalogue, protocol classification, OpenAI-chat and Anthropic Messages streaming adapters, usage. |
 | `agent.py` | System prompt, turn loop, tool dispatch, context trimming, approvals, usage accounting. |
 | `tools.py` | JSON-schema tool specs, path resolution, read/write/shell/validate/study/evidence/claim/number/session tools. |
 | `policy.py` | Ordered rules, last-match-wins, hard denies, `ask` handling. |
@@ -75,21 +75,34 @@ Nothing is enforced only in the prompt.
 
 ## Provider routing
 
-The provider is deliberately narrow. It implements the OpenAI-compatible chat
-completions protocol that OpenCode Console exposes for DeepSeek, Qwen, Kimi, GLM,
-MiniMax, Mistral, and the free models:
+The provider is deliberately narrow: it implements the two wire protocols
+OpenCode Go exposes under one key, and nothing else.
 
 ```text
-POST {base_url}/openai/v1/chat/completions   (stream)
-GET  {base_url}/v1/models                    (catalogue)
+POST {base_url}/openai/v1/chat/completions   (stream, OpenAI chat)
+POST {base_url}/anthropic/v1/messages        (stream, Anthropic Messages)
+GET  {base_url}/v1/models                    (catalogue, 38 models)
 ```
 
-`classify_protocol()` maps a model id to the wire protocol the same catalogue
-requires: `claude-*` → Anthropic messages, `gpt-*`/`o1*`/`o3*` → Responses,
-`gemini-*` → Google generateContent, everything else → OpenAI chat. Only
-`openai-chat` is implemented. Unsupported ids are classified and reported
-honestly (exit `2` when selected) instead of being sent through the wrong
-adapter. There is no silent model fallback and no provider auto-switch.
+Every request sends `User-Agent: panda-harness/<version>` and a stable
+`x-opencode-session` id; Go answers `400 MissingSessionID` without them. The
+provider owns a UUID per conversation, and `stream(..., session_id=...)` lets the
+agent pass the Panda session id so the upstream trace matches the ledger.
+
+`classify_protocol()` maps a model id to its wire protocol: `claude-*` ->
+Anthropic Messages, `gpt-*`/`o1*`/`o3*`/`grok-*`/`muse-*` -> Responses,
+`gemini-*` -> Google generateContent, everything else -> OpenAI chat.
+`openai-chat` and `anthropic` are implemented. Unsupported ids are classified
+and reported honestly (exit `2` when selected) instead of being sent through the
+wrong adapter. There is no silent model fallback and no provider auto-switch.
+
+The Anthropic adapter converts the OpenAI-shaped history the agent owns: system
+messages become the `system` prompt, assistant tool calls become `tool_use`
+blocks, tool results become `tool_result` blocks grouped into a user message, and
+adjacent same-role messages merge so roles alternate. Text deltas,
+`input_json_delta` tool arguments, stop reasons, and usage normalize into the
+same `TextDelta`/`ToolCall`/`Usage` shape as OpenAI chat; cost comes from
+`usage.opencode.list_cost` when present.
 
 The key is read from the environment by name (`OPENCODE_API_KEY` by default) and
 only used in the `Authorization` header. Error messages name the variable, never

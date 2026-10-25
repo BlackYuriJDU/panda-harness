@@ -34,8 +34,10 @@ bypass.
 
 - An autonomous terminal agent (cockpit, line REPL, or headless `panda run`) for a
   corpus with a canonical validator and a study registry.
-- A provider client for OpenCode Console's OpenAI-compatible endpoint, with
-  honest protocol classification for everything else.
+- A provider client for OpenCode Go: OpenAI-compatible chat completions plus
+  Anthropic Messages for Claude, with honest protocol classification for the
+  rest (GPT/Grok/Muse and Gemini are refused, never called with a wrong
+  adapter).
 - A policy engine: ordered rules, last-match-wins, hard denies, `ask` treated as
   deny when nobody can answer.
 - A hash-chained session ledger with a tail anchor and redaction.
@@ -56,7 +58,7 @@ bypass.
 |---|---|
 | Python | 3.12+ |
 | Node.js | 20+, only for `panda validate` |
-| OpenCode Console key | `OPENCODE_API_KEY` in the environment |
+| OpenCode Go key | `OPENCODE_API_KEY` in the environment |
 
 Windows is supported. The MCP extra is optional. There is no OpenCode CLI
 dependency and no OpenRouter account requirement.
@@ -102,15 +104,28 @@ panda run "List the registered studies and validate the corpus."
 OpenCode client. It backs up anything it replaces and refuses to rewrite JSONC in
 legacy mode. Existing model choices are preserved.
 
-`panda models` lists the catalogue (85 models at capture time, live when the
-network is available). Each row shows the protocol and whether it is callable;
-`callable, needs key` means the protocol is implemented but the API key is not
-exported in this shell.
+`panda models` lists the catalogue (38 models on OpenCode Go at capture time,
+live when the network is available). Each row shows the protocol and whether it
+is callable; `callable, needs key` means the protocol is implemented but the API
+key is not exported in this shell.
 
-The default model is `opencode/deepseek-v4.1-flash`. Only the `openai-chat`
-protocol is implemented: `claude-*` (Anthropic), `gpt-*`/`o1*`/`o3*` (Responses),
-and `gemini-*` (Google) are classified, reported as unsupported, and refused
-instead of being called with the wrong adapter. There is no silent fallback.
+The provider is OpenCode Go: `provider.name = "opencode-go"`,
+`provider.base_url = "https://opencode.ai/inference/go"`, key in
+`OPENCODE_API_KEY`. The default model is
+`opencode-go/deepseek-v4.1-flash`; `claude-haiku-5-5` is callable through the
+Anthropic Messages adapter (`/anthropic/v1/messages`). OpenAI-chat models use
+`/openai/v1/chat/completions`. GPT/Grok/Muse (Responses API) and Gemini (Google
+API) are classified, reported as unsupported, and refused instead of being
+called with the wrong adapter; there is no silent fallback. The legacy
+`opencode/` model prefix is accepted as an alias for `opencode-go/` when the
+base URL is Go.
+
+Go requires two request headers that generic OpenAI clients do not send: a
+stable `x-opencode-session` id per conversation and a non-generic
+`User-Agent`. Panda sends `User-Agent: panda-harness/<version>` and the session
+ledger id as `x-opencode-session`; without them Go answers
+`400 MissingSessionID`. The Console/Zen base URL (`/inference`) is not used by
+default: the Go key is rejected there with `402 Insufficient funds`.
 
 ## Commands
 

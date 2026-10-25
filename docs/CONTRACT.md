@@ -2,7 +2,7 @@
 
 **Version:** `0.2.0a1` (unreleased)
 **Status:** frozen for the v0.2 line once tagged
-**Runtime:** Panda cockpit + REPL + headless run, over the OpenCode Console provider
+**Runtime:** Panda cockpit + REPL + headless run, over the OpenCode Go provider
 **License:** MIT
 
 This document is the contract for v0.2. Anything not listed here is out of scope.
@@ -35,7 +35,7 @@ the action.
 |---|---|
 | Python | 3.12 or newer |
 | Node.js | 20 or newer, only for the corpus validator |
-| OpenCode Console | `https://opencode.ai/inference` by default |
+| OpenCode Go | `https://opencode.ai/inference/go` by default |
 | API key | `OPENCODE_API_KEY` (name configurable via `provider.api_key_env`) |
 | Git | optional, used for provenance metadata |
 | OpenCode CLI | **not required and not used** |
@@ -101,9 +101,9 @@ enabled legacy export both produce a warning line.
 | Key | Default |
 |---|---|
 | `schema_version` | `2` (v1 files still load and are rewritten as v2) |
-| `model` | `opencode/deepseek-v4.1-flash` |
-| `provider.name` | `opencode` |
-| `provider.base_url` | `https://opencode.ai/inference` |
+| `model` | `opencode-go/deepseek-v4.1-flash` |
+| `provider.name` | `opencode-go` |
+| `provider.base_url` | `https://opencode.ai/inference/go` |
 | `provider.api_key_env` | `OPENCODE_API_KEY` |
 | `provider.timeout_seconds` | `120` |
 | `provider.context_window` | `131072` |
@@ -176,14 +176,14 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
 
 ### 4.2 `panda models`
 
-The catalogue has two sources: the live provider (`GET /v1/models`) and a
-captured snapshot shipped with Panda. `--refresh` refuses the snapshot and exits
-non-zero when the live call fails.
+The catalogue has two sources: the live provider (`GET {base_url}/v1/models`,
+38 models on Go at capture time) and a captured snapshot shipped with Panda.
+`--refresh` refuses the snapshot and exits non-zero when the live call fails.
 
 Each row reports:
 
 - `protocol` — `openai-chat`, `anthropic`, `responses`, or `google`;
-- `callable` — the protocol Panda implements (only `openai-chat`);
+- `callable` — the protocol Panda implements (`openai-chat` and `anthropic`);
 - `ready` — callable **and** the API key env is present in this process.
 
 The human table shows `callable` in green only when the key is present; otherwise
@@ -208,17 +208,30 @@ payload carries `ok: false` and a stable `code`.
 
 ## 6. Provider and model routing
 
-The provider speaks the OpenAI-compatible chat completions protocol
-(`POST {base_url}/openai/v1/chat/completions`, streaming by default). The model
-id decides the wire protocol:
+The provider is OpenCode Go, with two implemented adapters under one key:
+
+- OpenAI-compatible chat: `POST {base_url}/openai/v1/chat/completions`;
+- Anthropic Messages: `POST {base_url}/anthropic/v1/messages`, with
+  `anthropic-version: 2023-06-01`, `system` from the system messages, and
+  OpenAI tool calls converted to `tool_use`/`tool_result` blocks.
+
+Every request carries `User-Agent: panda-harness/<version>` and a stable
+`x-opencode-session` id (the Panda session id when one exists). Go answers
+`400 MissingSessionID` without that pair. Both adapters stream SSE and normalize
+into the same events and usage fields (`input_tokens`/`output_tokens`/cache
+counters, cost from `usage.opencode.list_cost`).
+
+The model id decides the wire protocol:
 
 | Prefix | Protocol | Supported |
 |---|---|---|
-| everything not listed below | `openai-chat` | yes |
-| `claude-*` | `anthropic` | no |
-| `gpt-*`, `o1*`, `o3*` | `responses` | no |
+| `claude-*` | `anthropic` | yes |
+| `gpt-*`, `o1*`, `o3*`, `grok-*`, `muse-*` | `responses` | no |
 | `gemini-*` | `google` | no |
+| everything not listed above | `openai-chat` | yes |
 
+`opencode-go/<id>` is the canonical form; the legacy `opencode/<id>` prefix is
+accepted as an alias when the base URL is Go and is rewritten to `opencode-go/`.
 Selecting an unsupported model is a configuration error (exit `2`) and the
 message names the protocol. Panda never calls a model with the wrong adapter and
 never silently falls back to another model.
@@ -346,8 +359,8 @@ Schemas are validated in CI against valid and invalid fixtures in
 - A real provider stream produces text deltas and a `run.end` ledger event; a
   missing key exits `4` naming `OPENCODE_API_KEY` and never prints a value.
 - `panda models` reports protocol, callable, and key state honestly; `ready` is
-  false without the key and the catalogue counts match the snapshot (85 models,
-  38 OpenAI-compatible at capture time).
+  false without the key and the catalogue counts match the snapshot (38 models,
+  31 callable at capture time: OpenAI-chat plus `claude-haiku-5-5` via Anthropic).
 - Policy decisions are last-match-wins; traversal cannot escape scopes; `ask` is
   denied non-interactively and approved explicitly interactively.
 - Session edits, reordering, truncation, and tail rewrites are detected.
@@ -355,13 +368,13 @@ Schemas are validated in CI against valid and invalid fixtures in
   read-only and writes go through policy.
 - `ruff check src tests` passes and `pytest` passes on the supported Python
   versions, with and without the MCP extra.
-- Unsupported protocols (`claude-*`, `gpt-*`, `gemini-*`) fail with a clear
-  configuration error before any request is made.
+- Unsupported protocols (`gpt-*`, `grok-*`, `muse-*`, `gemini-*`) fail with a
+  clear configuration error before any request is made.
 
 ## 13. Out of scope for v0.2
 
-- Anthropic, Responses, and Google adapters. The routing is classified and
-  refused, not emulated.
+- Responses (GPT/Grok/Muse) and Google (Gemini) adapters. The routing is
+  classified and refused, not emulated.
 - Provider/model fallback, token accounting dashboards, cost optimisation.
 - Multi-user server mode, remote MCP transport, authentication, tenancy.
 - GitHub App, automatic commits, pushes, or releases.

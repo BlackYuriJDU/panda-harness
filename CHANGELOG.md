@@ -6,13 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased] — target 0.2.0a1
 
-The autonomous runtime pivot. OpenCode is no longer in the runtime path.
+The autonomous runtime pivot. OpenCode is no longer in the runtime path; the
+provider is OpenCode Go, with OpenAI-chat and Anthropic Messages adapters.
 
 ### Added
 
-- Direct OpenCode Console provider (`provider.py`): OpenAI-compatible streaming
-  chat completions, model catalogue, protocol classification, usage accounting,
-  and no-secret-in-error guarantees.
+- Direct OpenCode Go provider (`provider.py`): OpenAI-compatible streaming chat
+  completions, model catalogue, protocol classification, usage accounting, and
+  no-secret-in-error guarantees.
+- Anthropic Messages adapter for Claude (`POST /anthropic/v1/messages`): system
+  prompt, `tool_use`/`tool_result` conversion, SSE text/JSON deltas, stop
+  reasons, and usage normalized to the OpenAI-chat event shape. `claude-haiku-5-5`
+  is callable on Go.
+- Go request identity: every call sends `User-Agent: panda-harness/<version>` and
+  a stable `x-opencode-session` id (the Panda session id when available), which
+  Go requires to avoid `400 MissingSessionID`.
 - Agent loop (`agent.py`): system prompt built from corpus rules, tool dispatch,
   step limit, context trimming, approval events, and per-turn usage.
 - Tool registry (`tools.py`): `workspace_info`, `read_file`, `list_files`,
@@ -26,7 +34,7 @@ The autonomous runtime pivot. OpenCode is no longer in the runtime path.
 - Line REPL (`panda_cli/repl.py`) via `panda chat --plain`.
 - `panda chat`, `panda models`, and a rewritten `panda run` with `--json`,
   `--dry-run`, `--max-steps`, and `--timeout`.
-- Offline model snapshot (`model_catalog.py`, 85 models) with `--refresh` to
+- Offline model snapshot (`model_catalog.py`, 38 Go models) with `--refresh` to
   require the live catalogue.
 - `docs/DESIGN.md`: visual system, cockpit layout, mascot state machine,
   animation gates, telemetry semantics, and approval UX.
@@ -35,8 +43,13 @@ The autonomous runtime pivot. OpenCode is no longer in the runtime path.
 
 - `panda init` no longer writes `opencode.json`; the legacy export is opt-in via
   `--opencode`.
-- Default model is `opencode/deepseek-v4.1-flash`; the runtime authenticates with
-  `OPENCODE_API_KEY`.
+- Default provider is `opencode-go` at `https://opencode.ai/inference/go`; the
+  default model is `opencode-go/deepseek-v4.1-flash` and the runtime
+  authenticates with `OPENCODE_API_KEY`. The Console/Zen base
+  (`https://opencode.ai/inference`) is no longer the default: it answers `402
+  Insufficient funds` for Go keys.
+- The legacy `opencode/<id>` model prefix is accepted as an alias for
+  `opencode-go/<id>` when the base URL is Go.
 - Config schema is v2 (v1 files still load). Provider settings replace the
   OpenRouter/OpenCode runtime assumptions.
 - `panda doctor` reports the provider key and model protocol; a present
@@ -56,8 +69,9 @@ The autonomous runtime pivot. OpenCode is no longer in the runtime path.
 
 - Supported-protocol models are no longer advertised as `ready` without an API
   key.
-- Unsupported protocols (`claude-*`, `gpt-*`, `gemini-*`) fail with a clear
-  configuration error instead of a wrong-adapter request.
+- Unsupported protocols (`gpt-*`/`grok-*`/`muse-*` = Responses, `gemini-*` =
+  Google) fail with a clear configuration error instead of a wrong-adapter
+  request.
 
 ### Verified
 
