@@ -32,7 +32,17 @@ class CommandResult:
 def split_command(value: str | Sequence[str]) -> list[str]:
     if isinstance(value, str):
         # POSIX parsing would eat backslashes in Windows paths.
-        return shlex.split(value, posix=(os.name != "nt"))
+        if os.name != "nt":
+            return shlex.split(value, posix=True)
+        parts = shlex.split(value, posix=False)
+        # shlex keeps the surrounding quotes in non-POSIX mode, which breaks
+        # executable resolution for paths such as `C:\Program Files\...`.
+        return [
+            part[1:-1]
+            if len(part) >= 2 and part[0] == part[-1] and part[0] in {'"', "'"}
+            else part
+            for part in parts
+        ]
     return [str(part) for part in value]
 
 
