@@ -76,3 +76,22 @@ def test_approval_modal_allow_and_deny(workspace) -> None:
             assert decisions == [True, False]
 
     asyncio.run(scenario())
+
+
+def test_timers_stay_silent_after_teardown(workspace) -> None:
+    """Regression: the 2s status timer must not crash while the app unmounts.
+
+    Textual removes the screen's children before the message loop stops, so a
+    timer that fires late queries widgets that no longer exist (`NoMatches`).
+    """
+
+    async def scenario() -> None:
+        app = PandaCockpit(workspace)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+        app._poll_status()
+        app._refresh_header()
+        app._refresh_sidebar()
+        app._refresh_hints()
+
+    asyncio.run(scenario())

@@ -19,6 +19,7 @@ from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static
 
@@ -385,7 +386,7 @@ class PandaCockpit(App[None]):
         text.append(__version__, style=GREEN)
         text.append("  autonomous evidence harness", style=SHADOW)
         text.append(f"\n{status.get('root', '')}", style=SHADOW)
-        text.append(f"\n{status.get('provider', 'opencode')} · {model}", style=GREEN_DIM)
+        text.append(f"\n{status.get('provider', 'opencode-go')} · {model}", style=GREEN_DIM)
         text.append("  ·  ", style=SHADOW)
         text.append(str(status.get("session_id", "")), style=SHADOW)
         text.append('\n"Evidence or it did not happen."  /help for commands', style=SHADOW)
@@ -416,6 +417,18 @@ class PandaCockpit(App[None]):
         self._refresh_hints()
 
     # ---- chrome ----
+    def _chrome_update(self, selector: str, renderable: Any) -> None:
+        """Update a chrome widget, silently skipping it after teardown.
+
+        Timers can fire while the app is being torn down, at which point the
+        screen still exists but its children are already removed. Querying a
+        gone widget raises `NoMatches`; a renderer must never crash on that.
+        """
+        try:
+            self.query_one(selector, Static).update(renderable)
+        except NoMatches:
+            return
+
     def _refresh_header(self) -> None:
         status = self._status
         model = str(status.get("model", "")).split("/", 1)[-1]
@@ -437,14 +450,14 @@ class PandaCockpit(App[None]):
             line.append(f"  git:{branch}", style=GREEN_DIM)
             if status.get("dirty"):
                 line.append("*", style=AMBER)
-        line.append(f"  {status.get('provider', 'opencode')}/{model}", style=WHITE)
+        line.append(f"  {status.get('provider', 'opencode-go')}/{model}", style=WHITE)
         if self._width >= 100:
             line.append(f"  study:{study}", style=SHADOW)
             line.append("  ", style=SHADOW)
             line.append(validation_text, style=validation_style)
         state_style = GREEN if self._state not in {"blocked", "alert"} else AMBER
         line.append(f"  {icon} {self._state}", style=state_style)
-        self.query_one("#header", Static).update(line)
+        self._chrome_update("#header", line)
 
     def _refresh_hints(self) -> None:
         if self._width < 80:
@@ -452,7 +465,7 @@ class PandaCockpit(App[None]):
         hint = "Enter send · /help commands · Ctrl+L clear · Ctrl+Q quit"
         if self._busy:
             hint = "streaming · input stays live · Ctrl+Q quit"
-        self.query_one("#hints", Static).update(_dim(hint))
+        self._chrome_update("#hints", _dim(hint))
 
     def _refresh_sidebar(self) -> None:
         if self.runtime is None:
@@ -469,8 +482,8 @@ class PandaCockpit(App[None]):
             if index:
                 block.append("\n")
             block.append_text(line)
-        self.query_one("#mascot", Static).update(block)
-        self.query_one("#metrics", Static).update(self._metrics_text())
+        self._chrome_update("#mascot", block)
+        self._chrome_update("#metrics", self._metrics_text())
 
     def _metrics_text(self) -> Text:
         status = self._status
@@ -531,7 +544,8 @@ class PandaCockpit(App[None]):
         self._refresh_sidebar()
 
     def _poll_status(self) -> None:
-        if self.runtime is None:
+        # The 2s timer may fire while the app is tearing down.
+        if not self.is_running or self.runtime is None:
             return
         self._status = self.runtime.status()
         self._refresh_header()

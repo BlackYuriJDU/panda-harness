@@ -17,7 +17,7 @@ import typer
 from panda_cli import render
 from panda_cli.runtime import ChatRuntime
 from panda_core.agent import DEFAULT_MAX_STEPS
-from panda_core.config import split_model
+from panda_core.config import accepted_providers, canonical_model, split_model
 from panda_core.doctor import run_doctor
 from panda_core.errors import ConfigError, ExecutionTimeout, PandaError, UsageError
 from panda_core.init import initialize_workspace
@@ -41,7 +41,7 @@ app = typer.Typer(
     rich_markup_mode="rich",
     help=(
         "Fail-closed autonomous harness for evidence-heavy research corpora. "
-        "Runtime: Panda cockpit + OpenCode Console models."
+        "Runtime: Panda cockpit + OpenCode Go models."
     ),
 )
 session_app = typer.Typer(help="Hash-chained session ledger", no_args_is_help=True)
@@ -145,7 +145,7 @@ def _main(
         is_eager=True,
     ),
     model: str | None = typer.Option(
-        None, "--model", help="Model id for the cockpit (opencode/<model>)."
+        None, "--model", help="Model id for the cockpit (opencode-go/<model>)."
     ),
     auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
     max_steps: int = typer.Option(
@@ -176,7 +176,7 @@ def _main(
 def init_command(
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
     model: str | None = typer.Option(
-        None, "--model", help="Provider model id (opencode/<model>)."
+        None, "--model", help="Provider model id (opencode-go/<model>)."
     ),
     validator: str | None = typer.Option(
         None, "--validator", help="Validator path relative to the root."
@@ -307,7 +307,7 @@ def validate_command(
 def run_command(
     task: list[str] | None = typer.Argument(None, help="Task for the autonomous Panda agent."),
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
-    model: str | None = typer.Option(None, "--model", help="Model id (opencode/<model>)."),
+    model: str | None = typer.Option(None, "--model", help="Model id (opencode-go/<model>)."),
     auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
     json_output: bool = typer.Option(False, "--json", help="Emit a JSON result."),
     session: str | None = typer.Option(None, "--session", help="Continue an existing session."),
@@ -452,22 +452,27 @@ def _runtime(
 
 
 def _validate_model(workspace: Workspace, model: str | None) -> str:
+    settings = workspace.config.provider
     selected = model or workspace.config.model
     provider, name = split_model(selected)
     if not name:
         raise ConfigError("model must use the provider/model form")
-    if provider != workspace.config.provider.name:
+    if provider not in accepted_providers(settings):
         raise ConfigError(
             f"model provider {provider!r} is not configured",
             hint=(
-                f"the workspace provider is {workspace.config.provider.name!r}; "
-                "run `panda models` and pass --model opencode/<id>"
+                f"the workspace provider is {settings.name!r}; "
+                f"run `panda models` and pass --model {settings.name}/<id>"
             ),
         )
+    selected = canonical_model(selected, settings)
     if not is_supported_model(selected):
         raise ConfigError(
             f"model {selected!r} uses a protocol this build does not implement",
-            hint="choose an OpenAI-compatible model; `panda models` marks the rest unsupported",
+            hint=(
+                "OpenAI-chat and Anthropic (Claude) models are callable; "
+                "GPT/Grok/Muse (responses) and Gemini (google) are not"
+            ),
         )
     return selected
 
@@ -477,7 +482,7 @@ def _validate_model(workspace: Workspace, model: str | None) -> str:
 def chat_command(
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
     plain: bool = typer.Option(False, "--plain", help="Line REPL instead of the cockpit."),
-    model: str | None = typer.Option(None, "--model", help="Model id (opencode/<model>)."),
+    model: str | None = typer.Option(None, "--model", help="Model id (opencode-go/<model>)."),
     auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps."

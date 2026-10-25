@@ -467,7 +467,7 @@ def models_table(
         output.print(Text(f"live catalogue unavailable: {error}", style=AMBER))
     output.print(
         Text(
-            "only openai-chat is implemented · claude=anthropic · gpt=responses · gemini=google",
+            "openai-chat + anthropic implemented · gpt/grok/muse=responses · gemini=google",
             style=WHITE_SHADOW,
         )
     )

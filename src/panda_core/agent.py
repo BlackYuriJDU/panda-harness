@@ -129,6 +129,7 @@ def _usage_sum(left: Usage, right: Usage) -> Usage:
         completion_tokens=left.completion_tokens + right.completion_tokens,
         total_tokens=left.total_tokens + right.total_tokens,
         cached_tokens=left.cached_tokens + right.cached_tokens,
+        cache_write_tokens=left.cache_write_tokens + right.cache_write_tokens,
         cost_usd=(
             None
             if left.cost_usd is None and right.cost_usd is None
@@ -326,7 +327,10 @@ class Agent:
                 calls = []
                 usage_box: list[Usage] = [Usage()]
                 async for event in self.provider.stream(
-                    self.messages, self.tools.to_openai(), model=self.model
+                    self.messages,
+                    self.tools.to_openai(),
+                    model=self.model,
+                    session_id=self.session_id,
                 ):
                     self._handle_provider_event(event, step_parts, usage_box, calls)
                 step_usage = usage_box[0]

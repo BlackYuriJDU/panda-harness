@@ -1,8 +1,8 @@
 """Typed workspace configuration (`.panda/config.json`).
 
-Schema v2 replaces the OpenCode runtime with a direct provider (OpenCode
-Console). The legacy `opencode` section is still parsed so old workspace files
-load without migration, but the runtime never reads it.
+Schema v2 replaces the OpenCode runtime with a direct provider (OpenCode Go).
+The legacy `opencode` section is still parsed so old workspace files load
+without migration, but the runtime never reads it.
 """
 
 from __future__ import annotations
@@ -18,9 +18,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from panda_core.errors import ConfigError
 from panda_core.version import __version__
 
-DEFAULT_MODEL = "opencode/deepseek-v4.1-flash"
-DEFAULT_PROVIDER = "opencode"
-DEFAULT_BASE_URL = "https://opencode.ai/inference"
+DEFAULT_MODEL = "opencode-go/deepseek-v4.1-flash"
+DEFAULT_PROVIDER = "opencode-go"
+DEFAULT_BASE_URL = "https://opencode.ai/inference/go"
+# The Go key is not a Console/Zen key: the legacy base URL answers 402.
+# `opencode/` stays accepted as a model prefix alias when the base is Go.
+LEGACY_PROVIDER = "opencode"
+GO_BASE_SUFFIX = "/inference/go"
 DEFAULT_API_KEY_ENV = "OPENCODE_API_KEY"
 DEFAULT_CONTEXT_WINDOW = 131_072
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
@@ -61,7 +65,7 @@ def _relative_posix_path(value: str) -> str:
 
 
 class ProviderSettings(BaseModel):
-    """OpenCode Console provider settings.
+    """OpenCode Go provider settings.
 
     Only `base_url`, `api_key_env`, and decoding limits are configured here.
     The API key itself is never stored in the workspace.
@@ -98,6 +102,40 @@ class ProviderSettings(BaseModel):
         if not _ENV_NAME_RE.match(value):
             raise ValueError("provider.api_key_env must be an environment variable name")
         return value
+
+
+def is_go_base_url(base_url: str) -> bool:
+    """True when the provider points at the OpenCode Go endpoint."""
+
+    return base_url.rstrip("/").endswith(GO_BASE_SUFFIX)
+
+
+def accepted_providers(settings: ProviderSettings) -> frozenset[str]:
+    """Provider names a model ref may use, including the legacy Go alias."""
+
+    names = {settings.name}
+    if is_go_base_url(settings.base_url):
+        names.add(LEGACY_PROVIDER)
+    return frozenset(names)
+
+
+def canonical_model(model: str, settings: ProviderSettings) -> str:
+    """Return `provider/model`, mapping the legacy `opencode/` prefix onto Go.
+
+    Only the prefix changes; the model id after the slash is preserved. Other
+    provider names are returned untouched so callers can reject them.
+    """
+
+    provider, name = split_model(model)
+    if not name:
+        return model
+    if (
+        provider == LEGACY_PROVIDER
+        and settings.name != LEGACY_PROVIDER
+        and is_go_base_url(settings.base_url)
+    ):
+        return f"{settings.name}/{name}"
+    return model
 
 
 class OpencodeSettings(BaseModel):

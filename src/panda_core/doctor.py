@@ -12,7 +12,7 @@ from typing import Any
 from panda_core.config import split_model
 from panda_core.errors import PandaError
 from panda_core.policy import load_policy
-from panda_core.provider import classify_protocol
+from panda_core.provider import SUPPORTED_PROTOCOLS, classify_protocol
 from panda_core.validator import Validator
 from panda_core.version import __version__
 from panda_core.workspace import Workspace
@@ -249,9 +249,10 @@ def run_doctor(workspace: Workspace, *, run_validation: bool = False) -> DoctorR
         checks,
         "model",
         f"Model ({protocol})",
-        "ok" if protocol == "openai-chat" else "warn",
+        "ok" if protocol in SUPPORTED_PROTOCOLS else "warn",
         workspace.config.model,
-        "only openai-chat is implemented; pick a supported id with `panda models`",
+        "openai-chat and anthropic (Claude) are implemented; "
+        "pick a supported id with `panda models`",
         required=False,
     )
     if workspace.opencode_config_path.is_file():

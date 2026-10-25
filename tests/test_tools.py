@@ -191,7 +191,7 @@ def test_workspace_info_reports_provider_without_secret(workspace, monkeypatch) 
     assert result.ok
     assert result.data["provider"]["api_key_present"] is True
     assert "sk-should-never-appear" not in result.content
-    assert result.data["provider"]["base_url"] == "https://opencode.ai/inference"
+    assert result.data["provider"]["base_url"] == "https://opencode.ai/inference/go"
 
 
 def test_grep_skips_vcs_and_reports_lines(workspace) -> None:

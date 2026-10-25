@@ -14,6 +14,9 @@ from panda_core.config import (
     OpencodeSettings,
     PandaConfig,
     ProviderSettings,
+    accepted_providers,
+    canonical_model,
+    is_go_base_url,
     load_config,
 )
 from panda_core.errors import ConfigError
@@ -22,9 +25,9 @@ from panda_core.errors import ConfigError
 def test_default_config_is_valid() -> None:
     config = PandaConfig()
     assert config.schema_version == 2
-    assert config.model == DEFAULT_MODEL == "opencode/deepseek-v4.1-flash"
-    assert config.provider.name == DEFAULT_PROVIDER
-    assert config.provider.base_url == "https://opencode.ai/inference"
+    assert config.model == DEFAULT_MODEL == "opencode-go/deepseek-v4.1-flash"
+    assert config.provider.name == DEFAULT_PROVIDER == "opencode-go"
+    assert config.provider.base_url == "https://opencode.ai/inference/go"
     assert config.provider.api_key_env == "OPENCODE_API_KEY"
     assert config.validator == "corpus/validation/validate.mjs"
     assert config.opencode.standalone is True
@@ -134,6 +137,23 @@ def test_schema_v1_config_loads_and_is_migrated(tmp_path: Path) -> None:
     )
     loaded = load_config(path)
     assert loaded.schema_version == 2
-    assert loaded.provider.name == "opencode"
+    assert loaded.provider.name == "opencode-go"
     assert loaded.model == "openrouter/anthropic/claude-sonnet-5.5"
     assert loaded.opencode.standalone is False
+
+
+def test_go_base_url_and_legacy_prefix_alias() -> None:
+    settings = ProviderSettings()
+    assert is_go_base_url(settings.base_url) is True
+    assert is_go_base_url("https://opencode.ai/inference") is False
+    assert accepted_providers(settings) == {"opencode-go", "opencode"}
+    assert canonical_model("opencode/deepseek-v4.1-flash", settings) == (
+        "opencode-go/deepseek-v4.1-flash"
+    )
+    assert canonical_model("opencode-go/claude-haiku-5-5", settings) == (
+        "opencode-go/claude-haiku-5-5"
+    )
+    assert canonical_model("openrouter/x", settings) == "openrouter/x"
+    bare = ProviderSettings(name="console-local", base_url="https://opencode.ai/inference")
+    assert accepted_providers(bare) == {"console-local"}
+    assert canonical_model("opencode/x", bare) == "opencode/x"

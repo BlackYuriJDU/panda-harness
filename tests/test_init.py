@@ -25,7 +25,7 @@ def test_init_creates_contract(fake_corpus: Path) -> None:
     assert "sessions/" in gitignore
     workspace = Workspace.from_root(fake_corpus)
     assert workspace.initialized
-    assert workspace.config.model == "opencode/deepseek-v4.1-flash"
+    assert workspace.config.model == "opencode-go/deepseek-v4.1-flash"
     assert workspace.config.provider.api_key_env == "OPENCODE_API_KEY"
 
 

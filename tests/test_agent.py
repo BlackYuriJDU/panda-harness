@@ -20,9 +20,11 @@ class FakeProvider:
     def __init__(self, script: list[list[Any]]) -> None:
         self.script = list(script)
         self.calls: list[list[dict[str, Any]]] = []
+        self.sessions: list[str | None] = []
 
-    async def stream(self, messages, tools=None, model=None):
+    async def stream(self, messages, tools=None, model=None, session_id=None):
         self.calls.append([dict(message) for message in messages])
+        self.sessions.append(session_id)
         events = self.script.pop(0) if self.script else [DoneEvent(finish_reason="stop")]
         for event in events:
             if isinstance(event, Exception):
@@ -80,6 +82,15 @@ def test_text_turn_logs_the_contract(tmp_path, workspace) -> None:
         assert expected in types
     payload = json.loads(session.path.read_text(encoding="utf-8").splitlines()[0])
     assert payload["type"] == "session.start"
+
+
+def test_provider_receives_the_panda_session_id(workspace) -> None:
+    agent, session, provider = make_agent(
+        workspace,
+        [[TextDelta("ok"), DoneEvent(finish_reason="stop")]],
+    )
+    asyncio.run(agent.run_turn("hi"))
+    assert provider.sessions == [session.session_id]
 
 
 def test_tool_call_round_trip(workspace) -> None:
@@ -228,7 +239,7 @@ def test_provider_error_is_logged_and_reraised(workspace) -> None:
     assert "turn.end" not in types
 def test_cancellation_is_logged_and_bounded(workspace) -> None:
     class HangingProvider:
-        async def stream(self, messages, tools=None, model=None):
+        async def stream(self, messages, tools=None, model=None, session_id=None):
             await asyncio.sleep(10)
             yield DoneEvent()
 
