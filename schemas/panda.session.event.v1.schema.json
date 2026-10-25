@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://panda-harness.dev/schemas/panda.session.event.v1.schema.json",
+  "title": "Panda session event v1",
+  "description": "One line in a hash-chained Panda session ledger.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "seq", "ts", "session_id", "type", "data", "prev", "hash"],
+  "properties": {
+    "schema": { "const": "panda.session.event.v1" },
+    "seq": { "type": "integer", "minimum": 1 },
+    "ts": { "type": "string", "format": "date-time" },
+    "session_id": { "type": "string", "pattern": "^s_[A-Za-z0-9_]{6,80}$" },
+    "type": { "type": "string", "pattern": "^[a-z][a-z0-9_.]{2,63}$" },
+    "data": { "type": "object" },
+    "prev": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

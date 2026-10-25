@@ -1,0 +1,31 @@
+{
+  "schema": "panda.metric.v1",
+  "run_id": "run_20261025_ab12cd",
+  "session_id": "s_20261025T120000Z_ab12cd",
+  "model": "openrouter/anthropic/claude-sonnet-5.5",
+  "provider": "openrouter",
+  "status": "success",
+  "started_at": "2026-10-25T12:00:00.000Z",
+  "ended_at": "2026-10-25T12:01:30.000Z",
+  "duration_ms": 90000,
+  "usage": {
+    "input_tokens": 12000,
+    "output_tokens": 3400,
+    "cache_read_tokens": 8000,
+    "cache_write_tokens": 1200,
+    "reasoning_tokens": 900,
+    "total_tokens": 15400
+  },
+  "context": {
+    "window_tokens": 200000,
+    "used_tokens": 15400,
+    "used_pct": 0.077
+  },
+  "tools": {
+    "calls": 12,
+    "failures": 1
+  },
+  "cost_usd": 0.042,
+  "cache_hit_rate": 0.4,
+  "steps": 9
+}

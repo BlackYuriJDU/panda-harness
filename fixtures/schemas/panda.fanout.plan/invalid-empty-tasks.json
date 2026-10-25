@@ -1,0 +1,19 @@
+{
+  "schema": "panda.fanout.plan.v1",
+  "plan_id": "fo_empty-001",
+  "created_at": "2026-10-25T12:00:00.000Z",
+  "objective": "A plan with no tasks must not be accepted by the scheduler.",
+  "max_parallel": 1,
+  "tasks": [],
+  "merge": {
+    "strategy": "manual",
+    "verifier": "human",
+    "conflict_policy": "manual"
+  },
+  "budget": {
+    "max_runs": 1,
+    "max_tokens": 1000,
+    "max_cost_usd": 0
+  },
+  "status": "draft"
+}

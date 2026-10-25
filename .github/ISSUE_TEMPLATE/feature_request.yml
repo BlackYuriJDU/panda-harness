@@ -1,0 +1,58 @@
+name: Feature request
+description: Propose a change that fits the v0.1 contract, or argue for a revision.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read `docs/CONTRACT.md` first. v0.1 is frozen; new surface area needs an
+        explicit contract revision, not just a patch.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can a collaborator not do today, and why does it matter?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: The smallest change that solves the problem.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface affected
+      options:
+        - CLI command or flag
+        - Policy rule
+        - Session ledger
+        - Validator adapter
+        - OpenCode integration
+        - MCP tool or resource
+        - JSON Schema
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including doing nothing.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Commands, outputs, or a corpus example that shows the gap.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: This does not require weakening a hard deny or bypassing the validator.
+          required: true
+        - label: I am willing to open a pull request for this.

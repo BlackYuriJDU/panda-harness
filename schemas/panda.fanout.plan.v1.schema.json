@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://panda-harness.dev/schemas/panda.fanout.plan.v1.schema.json",
+  "title": "Panda fan-out plan v1",
+  "description": "Parallel task plan with write scopes, dependencies, merge policy, and a budget.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "plan_id",
+    "created_at",
+    "objective",
+    "max_parallel",
+    "tasks",
+    "merge",
+    "budget",
+    "status"
+  ],
+  "properties": {
+    "schema": { "const": "panda.fanout.plan.v1" },
+    "plan_id": { "type": "string", "pattern": "^fo_[a-z0-9][a-z0-9-]{5,63}$" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "objective": { "type": "string", "minLength": 20 },
+    "max_parallel": { "type": "integer", "minimum": 1, "maximum": 16 },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/task" }
+    },
+    "merge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "verifier", "conflict_policy"],
+      "properties": {
+        "strategy": { "enum": ["union", "sequential", "manual"] },
+        "verifier": { "type": "string", "minLength": 1 },
+        "conflict_policy": { "enum": ["fail", "prefer_first", "manual"] }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_runs", "max_tokens", "max_cost_usd"],
+      "properties": {
+        "max_runs": { "type": ["integer", "null"], "minimum": 1 },
+        "max_tokens": { "type": ["integer", "null"], "minimum": 1 },
+        "max_cost_usd": { "type": ["number", "null"], "minimum": 0 }
+      }
+    },
+    "status": { "enum": ["draft", "approved", "running", "done", "failed"] }
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "role",
+        "objective",
+        "inputs",
+        "outputs",
+        "write_scope",
+        "depends_on",
+        "acceptance",
+        "status"
+      ],
+      "properties": {
+        "task_id": { "type": "string", "pattern": "^t_[a-z0-9][a-z0-9-]{2,63}$" },
+        "role": { "type": "string", "minLength": 2 },
+        "objective": { "type": "string", "minLength": 10 },
+        "inputs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "write_scope": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "acceptance": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "status": { "enum": ["pending", "running", "done", "failed", "blocked"] }
+      }
+    }
+  }
+}

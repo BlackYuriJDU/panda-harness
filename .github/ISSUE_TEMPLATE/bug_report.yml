@@ -1,0 +1,62 @@
+name: Bug report
+description: Something failed, crashed, or produced the wrong exit code.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste secrets, `.env` contents, API keys, or restricted corpus data.
+        For security vulnerabilities, use the private advisory link instead.
+  - type: input
+    id: version
+    attributes:
+      label: Panda version
+      description: Output of `panda --version`.
+      placeholder: panda 0.1.0a1
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, architecture, Python, Node, and OpenCode versions.
+      placeholder: Windows 11 ARM64, Python 3.14.0, Node 24.22.1, OpenCode 2.1.4
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and task
+      description: The exact command that failed. Redact paths or data if needed.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: Include the exit code and stderr. Do not paste secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Diagnostics
+      description: Output of `panda doctor --json`, with secrets removed.
+      render: json
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I removed secrets, tokens, and restricted data from this report.
+          required: true
+        - label: I searched existing issues before opening this one.
+          required: true

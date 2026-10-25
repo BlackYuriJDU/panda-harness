@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "panda-harness"
+version = "0.1.0a1"
+description = "A fail-closed terminal harness for evidence-heavy research corpora."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Arthur Araújo da Silva" }]
+keywords = ["research", "evidence", "reproducibility", "mcp", "opencode", "cli"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+dependencies = [
+  "typer>=0.12,<1",
+  "rich>=13.9,<15",
+  "pydantic>=2.8,<3",
+]
+
+[project.optional-dependencies]
+mcp = [
+  "mcp>=1.9,<2",
+]
+dev = [
+  "build>=1.2",
+  "jsonschema>=4.23",
+  "pytest>=8.3",
+  "pytest-cov>=5",
+  "ruff>=0.7",
+]
+
+[project.scripts]
+panda = "panda_cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/BlackYuriJDU/panda-harness"
+Documentation = "https://github.com/BlackYuriJDU/panda-harness/blob/main/docs/CONTRACT.md"
+Issues = "https://github.com/BlackYuriJDU/panda-harness/issues"
+Security = "https://github.com/BlackYuriJDU/panda-harness/security/advisories/new"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/panda_core", "src/panda_cli"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/schemas",
+  "/docs",
+  "/assets",
+  "/tools",
+  "/.github",
+  "/tests",
+  "/LICENSE",
+  "/README.md",
+  "/CHANGELOG.md",
+  "/SECURITY.md",
+  "/CONTRIBUTING.md",
+  "/NOTICE",
+  "/pyproject.toml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106", "S603", "S607"]
+"tests/test_assets.py" = ["S314"]  # parses committed SVG assets, not untrusted input
+"src/panda_cli/main.py" = ["B008"]
+"src/panda_core/process.py" = ["S603"]
+"src/panda_core/opencode.py" = ["S603"]
+"src/panda_core/workspace.py" = ["S607"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "integration: requires a real corpus and external tools (skipped by default)",
+]
+filterwarnings = ["error::DeprecationWarning"]

@@ -1,0 +1,21 @@
+{
+  "schema": "panda.harness.proposal.v1",
+  "proposal_id": "hp_no-evidence-001",
+  "created_at": "2026-10-25T12:00:00.000Z",
+  "title": "Change a default without evidence",
+  "rationale": "This should be rejected because every harness change must cite evidence.",
+  "evidence": [],
+  "change": {
+    "files": ["src/panda_core/config.py"],
+    "diff": "- 180\n+ 300",
+    "risk": "low",
+    "rollback": "Revert."
+  },
+  "expected_effect": "None proven.",
+  "verification": {
+    "commands": ["pytest -q"],
+    "expected": "Tests pass."
+  },
+  "status": "proposed",
+  "approvals": []
+}

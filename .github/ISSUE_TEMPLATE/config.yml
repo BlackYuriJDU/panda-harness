@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/BlackYuriJDU/panda-harness/security/advisories/new
+    about: Report policy bypass, secret exposure, or code execution privately.
+  - name: Contract and scope
+    url: https://github.com/BlackYuriJDU/panda-harness/blob/main/docs/CONTRACT.md
+    about: Read the frozen v0.1 scope before proposing new surface area.

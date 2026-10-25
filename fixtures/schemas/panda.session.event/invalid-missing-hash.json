@@ -1,0 +1,8 @@
+{
+  "schema": "panda.session.event.v1",
+  "seq": 1,
+  "ts": "2026-10-25T12:00:00.000Z",
+  "session_id": "s_20261025T120000Z_ab12cd",
+  "type": "session.start",
+  "data": {}
+}

@@ -1,0 +1,32 @@
+{
+  "schema": "panda.harness.proposal.v1",
+  "proposal_id": "hp_validate-timeout-001",
+  "created_at": "2026-10-25T12:00:00.000Z",
+  "title": "Raise validator timeout for large corpora",
+  "rationale": "A real corpus run timed out at 180s while the validator was still checking evidence resolution. The default should be 300s, with a hard cap.",
+  "evidence": [
+    {
+      "kind": "command",
+      "ref": "panda validate --root ../DCJ - Lito",
+      "summary": "Exited 4 after 180s with no report"
+    },
+    {
+      "kind": "file",
+      "ref": "src/panda_core/config.py:77",
+      "summary": "validate_seconds defaults to 180"
+    }
+  ],
+  "change": {
+    "files": ["src/panda_core/config.py"],
+    "diff": "- validate_seconds: int = 180\n+ validate_seconds: int = 300",
+    "risk": "low",
+    "rollback": "Revert the default to 180 and rerun the validator test."
+  },
+  "expected_effect": "Large corpora complete validation without a timeout while the upper bound stays bounded.",
+  "verification": {
+    "commands": ["pytest -q tests/test_validator.py", "panda validate --json"],
+    "expected": "All tests pass and the real corpus produces a report under 300s."
+  },
+  "status": "proposed",
+  "approvals": []
+}

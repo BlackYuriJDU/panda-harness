@@ -1,0 +1,22 @@
+Panda Harness
+Copyright (c) 2026 Arthur Araújo da Silva
+
+This product is licensed under the MIT License. See LICENSE.
+
+Third-party components
+----------------------
+
+Panda depends on open-source packages installed separately by the user,
+including Typer, Rich, Pydantic, pytest, Ruff, and the Model Context Protocol
+Python SDK. Those packages remain under their own licenses and are not bundled
+in this repository.
+
+Panda integrates with OpenCode and OpenRouter as external runtimes. They are not
+part of this repository and are governed by their own terms and privacy policies.
+
+Corpus content
+--------------
+
+This repository contains no corpus data. Test fixtures are synthetic. The Panda
+name, the Panda Spark mark, and the Panda mascot are project identifiers; no
+trademark registration is claimed.
