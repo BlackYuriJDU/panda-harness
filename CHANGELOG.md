@@ -4,6 +4,67 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — target 0.2.0a1
+
+The autonomous runtime pivot. OpenCode is no longer in the runtime path.
+
+### Added
+
+- Direct OpenCode Console provider (`provider.py`): OpenAI-compatible streaming
+  chat completions, model catalogue, protocol classification, usage accounting,
+  and no-secret-in-error guarantees.
+- Agent loop (`agent.py`): system prompt built from corpus rules, tool dispatch,
+  step limit, context trimming, approval events, and per-turn usage.
+- Tool registry (`tools.py`): `workspace_info`, `read_file`, `list_files`,
+  `grep`, `validate`, `policy_check`, `study_list`, `study_show`,
+  `evidence_list`, `evidence_show`, `claim_list`, `claim_show`, `number_list`,
+  `number_show`, `write_file`, `edit_file`, `run_shell`, `session_note`.
+- `ChatRuntime` (`panda_cli/runtime.py`) shared by the cockpit, the REPL, and
+  headless `run`.
+- Textual cockpit (`panda_cli/cockpit.py`): responsive layout, streaming
+  transcript, tool cards, approval modal, mascot, telemetry sidebar.
+- Line REPL (`panda_cli/repl.py`) via `panda chat --plain`.
+- `panda chat`, `panda models`, and a rewritten `panda run` with `--json`,
+  `--dry-run`, `--max-steps`, and `--timeout`.
+- Offline model snapshot (`model_catalog.py`, 85 models) with `--refresh` to
+  require the live catalogue.
+- `docs/DESIGN.md`: visual system, cockpit layout, mascot state machine,
+  animation gates, telemetry semantics, and approval UX.
+
+### Changed
+
+- `panda init` no longer writes `opencode.json`; the legacy export is opt-in via
+  `--opencode`.
+- Default model is `opencode/deepseek-v4.1-flash`; the runtime authenticates with
+  `OPENCODE_API_KEY`.
+- Config schema is v2 (v1 files still load). Provider settings replace the
+  OpenRouter/OpenCode runtime assumptions.
+- `panda doctor` reports the provider key and model protocol; a present
+  `opencode.json` is informational only.
+- `panda models` marks a model `callable` for a supported protocol and only
+  `ready` when the key is present; the JSON adds `callable`, `ready`,
+  `api_key_env`, and `api_key_present`.
+- Exit code `4` now explicitly covers provider errors (auth, rate limit,
+  transport, protocol).
+
+### Removed
+
+- OpenCode CLI and OpenRouter as runtime dependencies. `opencode.py` remains as
+  an opt-in export and is not imported by the runtime.
+
+### Fixed
+
+- Supported-protocol models are no longer advertised as `ready` without an API
+  key.
+- Unsupported protocols (`claude-*`, `gpt-*`, `gemini-*`) fail with a clear
+  configuration error instead of a wrong-adapter request.
+
+### Verified
+
+- `ruff check src tests` passes.
+- `pytest` passes with and without the MCP extra; the suite does not touch the
+  network or a real corpus.
+
 ## [0.1.0a1] — 2026-10-25
 
 Initial alpha. The contract is frozen in [`docs/CONTRACT.md`](docs/CONTRACT.md).

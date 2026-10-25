@@ -4,13 +4,14 @@
 
 > A fail-closed terminal harness for evidence-heavy research corpora.
 
-**Status:** alpha (`0.1.0a1`). The v0.1 surface is frozen in
+**Status:** alpha. `0.1.0a1` is the last tagged release; the autonomous runtime
+in `main` is the unreleased `0.2.0a1` line, described in
 [`docs/CONTRACT.md`](docs/CONTRACT.md).
 
-Panda is a CLI and MCP server that keeps an AI agent inside an evidence
-discipline: approved write scopes, canonical validation, a verifiable provenance
-ledger, and an OpenCode + OpenRouter runtime. The guarantee lives in the tool,
-not in the prompt.
+Panda is a terminal agent and optional MCP server that keeps an AI model inside
+an evidence discipline: approved write scopes, canonical validation, a verifiable
+provenance ledger, and explicit approvals. The guarantee lives in the tool, not
+in the prompt.
 
 ```text
 If it does not resolve to a line, a script, a run, and a license, it does not ship.
@@ -31,13 +32,14 @@ bypass.
 
 ## What it is
 
-- A terminal-first harness for a corpus with a canonical validator and a study
-  registry.
+- An autonomous terminal agent (cockpit, line REPL, or headless `panda run`) for a
+  corpus with a canonical validator and a study registry.
+- A provider client for OpenCode Console's OpenAI-compatible endpoint, with
+  honest protocol classification for everything else.
 - A policy engine: ordered rules, last-match-wins, hard denies, `ask` treated as
   deny when nobody can answer.
 - A hash-chained session ledger with a tail anchor and redaction.
-- An OpenCode v2 launcher with the Panda MCP server wired in.
-- A read-only study registry and validation surface for agents.
+- An optional MCP server for other clients; the Panda runtime does not need it.
 
 ## What it is not
 
@@ -46,15 +48,18 @@ bypass.
 - Not a generic coding agent.
 - Not an electronic lab notebook.
 - Not a replacement for the corpus validator. Panda calls it.
+- Not an OpenCode wrapper. The OpenCode CLI is not required.
 
 ## Requirements
 
 | Component | Version |
 |---|---|
 | Python | 3.12+ |
-| Node.js | 20+ |
-| OpenCode | v2, `opencode` on `PATH` |
-| OpenRouter | `OPENROUTER_API_KEY` or `opencode auth login` |
+| Node.js | 20+, only for `panda validate` |
+| OpenCode Console key | `OPENCODE_API_KEY` in the environment |
+
+Windows is supported. The MCP extra is optional. There is no OpenCode CLI
+dependency and no OpenRouter account requirement.
 
 ## Install
 
@@ -68,9 +73,9 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[mcp]"
 ```
 
-The MCP extra is optional so the core can install on platforms where the SDK's
-native dependencies have no wheel. Without it, `panda run` and `panda mcp serve`
-cannot start; the rest of the CLI works.
+Omit `[mcp]` if you do not need `panda mcp serve`; the CLI, cockpit, and agent
+work without it. The MCP extra is separate because the SDK's native dependencies
+may not have a wheel on every platform.
 
 ## Quickstart
 
@@ -78,39 +83,54 @@ Run inside a corpus root — a directory containing
 `corpus/validation/validate.mjs`:
 
 ```bash
+export OPENCODE_API_KEY=...      # Windows: $env:OPENCODE_API_KEY = "..."
 panda init
-panda doctor
-panda validate
-panda run "Review corpus/studies/INDEX.md and list unresolved evidence gaps"
+panda models
+panda
+```
+
+`panda` opens the cockpit. `panda --plain` opens the line REPL, for terminals
+without full-screen support or for scripting. Headless tasks:
+
+```bash
+panda run "List the registered studies and validate the corpus."
 ```
 
 `panda init` writes `.panda/config.json`, `.panda/policy.json`,
-`.panda/instructions.md`, the session directory, and merges the Panda MCP server
-into `opencode.json`. It backs up anything it replaces and refuses to rewrite
-JSONC. Existing model and permission choices are preserved.
+`.panda/instructions.md`, and the session directory. It does **not** write
+`opencode.json`; pass `--opencode` only if you want the legacy export for an
+OpenCode client. It backs up anything it replaces and refuses to rewrite JSONC in
+legacy mode. Existing model choices are preserved.
 
-Start with `--dry-run` if you want to see the writes:
+`panda models` lists the catalogue (85 models at capture time, live when the
+network is available). Each row shows the protocol and whether it is callable;
+`callable, needs key` means the protocol is implemented but the API key is not
+exported in this shell.
 
-```bash
-panda init --dry-run
-```
+The default model is `opencode/deepseek-v4.1-flash`. Only the `openai-chat`
+protocol is implemented: `claude-*` (Anthropic), `gpt-*`/`o1*`/`o3*` (Responses),
+and `gemini-*` (Google) are classified, reported as unsupported, and refused
+instead of being called with the wrong adapter. There is no silent fallback.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `panda` / `panda status` | Workspace and last-session summary. |
-| `panda init` | Initialize or update the workspace. |
+| `panda` / `panda chat` | Cockpit (`--plain` for the line REPL). |
+| `panda status` | Workspace, provider, model, and last-session summary. |
+| `panda init` | Initialize or update the workspace (`--opencode` for the legacy export). |
+| `panda models` | Catalogue with protocol, callable state, and key state. |
 | `panda doctor` | Read-only diagnostics (`--validate` to also validate). |
 | `panda validate` | Run the canonical validator (`--release`, `--record`). |
-| `panda run "<task>"` | Launch OpenCode with the Panda MCP server. |
+| `panda run "<task>"` | One headless agent turn (`--json`, `--dry-run`, `--max-steps`). |
 | `panda session start/list/show/verify/close` | Manage the provenance ledger. |
 | `panda policy check/explain/show` | Inspect and evaluate policy. |
 | `panda study list/show` | Read the study registry. |
-| `panda mcp serve/tools` | Run the MCP server or print its contract. |
+| `panda mcp serve/tools` | Run the optional MCP server or print its contract. |
 
 Add `--json` for machine-readable output. Exit codes are stable and documented in
-[`docs/CONTRACT.md`](docs/CONTRACT.md#5-exit-codes).
+[`docs/CONTRACT.md`](docs/CONTRACT.md#5-exit-codes). A provider failure exits `4`;
+a policy denial exits `5`.
 
 ### Example: policy
 
@@ -132,47 +152,35 @@ A session is a JSONL file plus an anchor. Every event commits to the previous
 hash; the anchor pins the tail. Edits, reordering, truncation, and coordinated
 tail rewrites are detected.
 
+## Tools
+
+The agent can call: `workspace_info`, `read_file`, `list_files`, `grep`,
+`validate`, `policy_check`, `study_list`, `study_show`, `evidence_list`,
+`evidence_show`, `claim_list`, `claim_show`, `number_list`, `number_show`,
+`write_file`, `edit_file`, `run_shell`, and `session_note`.
+
+Reads resolve inside the workspace. Writes and shell commands go through policy
+and, when the rule is `ask`, through an explicit approval in the cockpit or REPL.
+`run_shell` takes an argv array, never a shell string. In headless `run`, an
+unanswered `ask` is a denial.
+
 ## MCP
 
-`panda mcp serve` exposes exactly six read-only tools to OpenCode:
+MCP is optional and not part of the runtime path. With the extra installed,
+`panda mcp serve` exposes six read-only tools (`workspace_info`, `validate`,
+`policy_check`, `study_list`, `study_show`, `session_note`) and two resources
+(`panda://workspace`, `panda://studies`). Without the extra, `panda mcp serve`
+exits `3` and everything else still works.
 
-| Tool | Purpose |
-|---|---|
-| `panda_workspace_info` | Workspace, model, policy, and session state. |
-| `panda_validate` | Run the canonical validator. |
-| `panda_policy_check` | Evaluate an action/resource pair. |
-| `panda_study_list` | List registered studies. |
-| `panda_study_show` | Show one study card. |
-| `panda_session_note` | Append a durable note to the ledger. |
-
-Resources: `panda://workspace` and `panda://studies`.
-
-The MCP layer never writes evidence or claims in v0.1. Notes go to the provenance
-ledger only.
-
-For a console that connects to a URL instead of launching a command:
+For a client that connects to a URL:
 
 ```bash
 panda mcp serve --root <corpus-root> --transport streamable-http --port 8765
 # endpoint: http://127.0.0.1:8765/mcp
 ```
 
-The HTTP transport is loopback-only and has no authentication. Non-loopback
-hosts are refused on purpose. A remote MCP client entry looks like:
-
-```json
-{
-  "mcp": {
-    "servers": {
-      "panda": {
-        "type": "remote",
-        "url": "http://127.0.0.1:8765/mcp",
-        "oauth": false
-      }
-    }
-  }
-}
-```
+The HTTP transport is loopback-only and has no authentication. Non-loopback hosts
+are refused on purpose.
 
 ## Workspace layout
 
@@ -187,25 +195,26 @@ hosts are refused on purpose. A remote MCP client entry looks like:
 ├── corpus/
 │   ├── validation/validate.mjs
 │   └── studies/INDEX.md
-└── opencode.json
+└── opencode.json        # only with `init --opencode`
 ```
 
 ## Design choices
 
 - **Delegate validation.** The corpus owns its checks; Panda maps the report to
   exit codes.
-- **Fail closed.** Missing dependency, unanswerable approval, unsupported JSONC,
-  and missing MCP wiring are errors.
-- **No shell.** Commands are argv arrays; Windows npm shims resolve to native
+- **Fail closed.** Missing dependency, unanswerable approval, unsupported model
+  protocol, and missing key are errors — not silent workarounds.
+- **No shell.** `run_shell` takes argv arrays; Windows npm shims resolve to native
   executables instead of `cmd.exe`.
-- **Preserve user config.** Merge, back up, and keep restrictive rules last.
+- **Preserve user config.** Legacy export merges, backs up, and keeps restrictive
+  rules last.
 - **Provenance before convenience.** Redaction happens before hashing; task text
   can be omitted with `--private`.
-- **Boring core.** Python 3.12, Typer, Rich, Pydantic; Node only for the corpus
-  validator.
+- **Boring core.** Python 3.12, Typer, Rich, Pydantic, Textual; Node only for the
+  corpus validator.
 
-More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
-[`SECURITY.md`](SECURITY.md).
+More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+[`docs/DESIGN.md`](docs/DESIGN.md), and [`SECURITY.md`](SECURITY.md).
 
 ## Brand
 
@@ -224,7 +233,7 @@ trademark registration.
 
 ```bash
 pip install -e ".[dev,mcp]"
-ruff check .
+ruff check src tests
 pytest -q
 ```
 
