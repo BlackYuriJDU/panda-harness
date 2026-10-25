@@ -27,6 +27,9 @@ Initial alpha. The contract is frozen in [`docs/CONTRACT.md`](docs/CONTRACT.md).
 - OpenCode v2 launcher: private server by default, OpenRouter model selection,
   six explicit Panda tool permissions, provenance around each run.
 - MCP stdio server with six tools and two resources.
+- Loopback-only `streamable-http` MCP transport (`--transport
+  streamable-http`), so a console can connect to `http://127.0.0.1:8765/mcp`
+  without launching a stdio process.
 - Four Draft 2020-12 JSON Schemas with valid/invalid fixtures.
 - Read-only `panda doctor` with Python, Node, OpenCode, validator, policy,
   session, and writability checks.
@@ -47,6 +50,8 @@ Initial alpha. The contract is frozen in [`docs/CONTRACT.md`](docs/CONTRACT.md).
   remain effective after a merge.
 - Workspace path validation rejects Windows drive and UNC paths on every
   platform and normalizes both path separators before matching.
+- Quoted Windows commands with spaces (for example an absolute `panda.exe` path)
+  are parsed without leaving quote characters in the executable name.
 
 ### Verified
 
@@ -54,5 +59,5 @@ Initial alpha. The contract is frozen in [`docs/CONTRACT.md`](docs/CONTRACT.md).
   writes to the corpus.
 - `panda init --root "DCJ - Lito" --dry-run` reports no writes.
 - `ruff check .` passes.
-- `pytest` passes (201 passed, 3 skipped without the MCP extra; MCP tests pass in
-  an environment with the extra installed).
+- `pytest` passes (207 passed, 4 skipped without the MCP extra; 211 passed with
+  the extra installed).

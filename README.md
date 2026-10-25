@@ -150,6 +150,30 @@ Resources: `panda://workspace` and `panda://studies`.
 The MCP layer never writes evidence or claims in v0.1. Notes go to the provenance
 ledger only.
 
+For a console that connects to a URL instead of launching a command:
+
+```bash
+panda mcp serve --root <corpus-root> --transport streamable-http --port 8765
+# endpoint: http://127.0.0.1:8765/mcp
+```
+
+The HTTP transport is loopback-only and has no authentication. Non-loopback
+hosts are refused on purpose. A remote MCP client entry looks like:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "panda": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8765/mcp",
+        "oauth": false
+      }
+    }
+  }
+}
+```
+
 ## Workspace layout
 
 ```text

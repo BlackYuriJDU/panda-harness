@@ -702,10 +702,27 @@ def mcp_serve(
     session: Path | None = typer.Option(
         None, "--session", help="Append MCP tool calls to this session file."
     ),
+    transport: str = typer.Option(
+        "stdio",
+        "--transport",
+        help="stdio or streamable-http (loopback only).",
+    ),
+    host: str = typer.Option(
+        "127.0.0.1", "--host", help="Loopback host for streamable-http."
+    ),
+    port: int = typer.Option(
+        8765, "--port", min=1, max=65535, help="Port for streamable-http."
+    ),
 ) -> None:
     from panda_core.mcp_server import serve
 
-    serve(_root_value(root), session_file=session)
+    serve(
+        _root_value(root),
+        session_file=session,
+        transport=transport,
+        host=host,
+        port=port,
+    )
 
 
 @mcp_app.command("tools")
@@ -729,6 +746,8 @@ def mcp_tools() -> None:
                 "panda_study_show",
                 "panda_session_note",
             ],
+            "transports": ["stdio", "streamable-http"],
+            "http_path": "/mcp",
             "resources": ["panda://workspace", "panda://studies"],
         }
     )

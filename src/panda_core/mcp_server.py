@@ -8,10 +8,11 @@ them `<server>_<tool>`; with the server named `panda` they become
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
-from panda_core.errors import DependencyError, PandaError
+from panda_core.errors import ConfigError, DependencyError, PandaError
 from panda_core.service import PandaService
 from panda_core.session import SessionLog
 from panda_core.workspace import Workspace
@@ -31,8 +32,35 @@ metadata-only. Never push, publish, or rewrite history. If a rule cannot be
 satisfied, return a blocked result with the exact missing evidence.
 """
 
+TRANSPORTS = ("stdio", "streamable-http")
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
-def create_server(service: PandaService) -> Any:
+
+def validate_transport(transport: str, host: str, port: int) -> None:
+    """Keep the HTTP surface loopback-only; it has no authentication layer."""
+
+    if transport not in TRANSPORTS:
+        raise ConfigError(
+            f"unsupported MCP transport: {transport}",
+            hint=f"use one of: {', '.join(TRANSPORTS)}",
+        )
+    if transport == "stdio":
+        return
+    if host not in LOOPBACK_HOSTS:
+        raise ConfigError(
+            f"MCP HTTP transport is loopback-only, refusing host: {host}",
+            hint="bind 127.0.0.1 or localhost; use an authenticated proxy for remote access",
+        )
+    if not 1 <= port <= 65535:
+        raise ConfigError(f"MCP HTTP port is out of range: {port}")
+
+
+def create_server(
+    service: PandaService,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+) -> Any:
     try:
         from mcp.server.fastmcp import FastMCP
     except ImportError as exc:
@@ -41,7 +69,7 @@ def create_server(service: PandaService) -> Any:
             hint="install it with `pip install 'panda-harness[mcp]'`",
         ) from exc
 
-    server = FastMCP("panda", instructions=INSTRUCTIONS)
+    server = FastMCP("panda", instructions=INSTRUCTIONS, host=host, port=port)
 
     @server.tool()
     def workspace_info() -> dict[str, Any]:
@@ -110,7 +138,11 @@ def serve(
     root: Path,
     *,
     session_file: Path | None = None,
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8765,
 ) -> None:
+    validate_transport(transport, host, port)
     workspace = Workspace.from_root(root)
     session = None
     if session_file and session_file.is_file():
@@ -123,11 +155,25 @@ def serve(
         autocreate_session=session is None,
         session_label="mcp",
     )
-    server = create_server(service)
+    server = create_server(service, host=host, port=port)
+    if transport != "stdio":
+        print(
+            f"panda mcp: http://{host}:{port}/mcp (loopback only, no auth)",
+            file=sys.stderr,
+            flush=True,
+        )
     try:
-        server.run(transport="stdio")
+        server.run(transport=transport)
     finally:
         service.close()
 
 
-__all__ = ["INSTRUCTIONS", "create_server", "serve", "PandaError"]
+__all__ = [
+    "INSTRUCTIONS",
+    "LOOPBACK_HOSTS",
+    "TRANSPORTS",
+    "create_server",
+    "serve",
+    "validate_transport",
+    "PandaError",
+]

@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from panda_core.errors import ConfigError
-from panda_core.mcp_server import create_server
+from panda_core.mcp_server import create_server, validate_transport
 from panda_core.service import PandaService
 from panda_core.session import SessionLog
 from panda_core.workspace import Workspace
@@ -198,3 +198,33 @@ def test_mcp_resources_are_json(workspace: Workspace) -> None:
 def test_service_rejects_missing_root(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         PandaService.from_env(tmp_path)
+
+
+def test_transport_validation_is_fail_closed() -> None:
+    validate_transport("stdio", "0.0.0.0", 0)
+    validate_transport("streamable-http", "127.0.0.1", 8765)
+    validate_transport("streamable-http", "localhost", 8765)
+    validate_transport("streamable-http", "::1", 8765)
+
+    with pytest.raises(ConfigError):
+        validate_transport("sse", "127.0.0.1", 8765)
+    with pytest.raises(ConfigError):
+        validate_transport("streamable-http", "0.0.0.0", 8765)
+    with pytest.raises(ConfigError):
+        validate_transport("streamable-http", "example.com", 8765)
+    with pytest.raises(ConfigError):
+        validate_transport("streamable-http", "127.0.0.1", 0)
+    with pytest.raises(ConfigError):
+        validate_transport("streamable-http", "127.0.0.1", 70000)
+
+
+def test_http_server_keeps_loopback_settings(workspace: Workspace) -> None:
+    pytest.importorskip("mcp.server.fastmcp")
+    server = create_server(
+        PandaService(workspace, autocreate_session=False),
+        host="127.0.0.1",
+        port=8799,
+    )
+    assert server.settings.host == "127.0.0.1"
+    assert server.settings.port == 8799
+    assert server.streamable_http_app() is not None

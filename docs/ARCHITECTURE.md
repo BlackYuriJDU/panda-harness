@@ -161,6 +161,11 @@ safer than one unverified pattern.
 `--standalone` asks OpenCode for a private server, so concurrent Panda runs do not
 share mutable state. `--shared` is the explicit opt-out.
 
+The MCP adapter supports stdio (the default, launched by OpenCode) and a
+loopback-only streamable HTTP transport for consoles that connect to a URL. The
+HTTP transport is refused on non-loopback hosts and has no authentication; it is
+a local convenience, not a network service.
+
 ### Windows
 
 `opencode` from npm is a `.cmd` shim. `process.resolve_command_prefix()` reads the

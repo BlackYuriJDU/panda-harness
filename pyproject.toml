@@ -83,7 +83,8 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S"]
 ignore = ["S101"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S105", "S106", "S603", "S607"]
+# Tests intentionally reference loopback-only rejection and fake commands.
+"tests/*" = ["S104", "S105", "S106", "S603", "S607"]
 "tests/test_assets.py" = ["S314"]  # parses committed SVG assets, not untrusted input
 "src/panda_cli/main.py" = ["B008"]
 "src/panda_core/process.py" = ["S603"]

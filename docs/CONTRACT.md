@@ -211,8 +211,11 @@ disabled in config, but the default is on.
 
 ## 8. MCP surface
 
-Server name: `panda`. Transport: stdio. Direct tool names are unprefixed; OpenCode
-exposes them as `panda_<tool>`.
+Server name: `panda`. Transport: stdio by default. `panda mcp serve
+--transport streamable-http` exposes `/mcp` on a loopback host
+(`127.0.0.1`, `localhost`, or `::1`). Non-loopback hosts are refused; the HTTP
+transport has no authentication and must not be exposed to a network. Direct
+tool names are unprefixed; OpenCode exposes them as `panda_<tool>`.
 
 | Tool | Purpose |
 |---|---|

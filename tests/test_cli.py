@@ -252,4 +252,19 @@ def test_mcp_tools_lists_contract() -> None:
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert "panda_validate" in payload["opencode_tools"]
+    assert payload["transports"] == ["stdio", "streamable-http"]
     assert payload["resources"] == ["panda://workspace", "panda://studies"]
+
+
+def test_mcp_serve_rejects_unknown_transport() -> None:
+    result = invoke("mcp", "serve", "--transport", "sse")
+    assert result.exit_code == 2
+    assert "unsupported MCP transport" in result.output
+
+
+def test_mcp_serve_refuses_non_loopback_binding() -> None:
+    result = invoke(
+        "mcp", "serve", "--transport", "streamable-http", "--host", "0.0.0.0"
+    )
+    assert result.exit_code == 2
+    assert "loopback-only" in result.output

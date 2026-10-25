@@ -79,6 +79,16 @@ Panda does **not** protect against:
 - The validator is executed with a bounded timeout and a checked Node version.
 - `panda run` requires the Panda MCP server to be present in the OpenCode config.
 
+### MCP transport
+
+- The default transport is stdio and is launched by the client.
+- `--transport streamable-http` binds only to loopback (`127.0.0.1`,
+  `localhost`, `::1`) and refuses any other host.
+- The HTTP transport has no authentication, no TLS, and no authorization layer.
+  It is for a local console on the same machine. Use an authenticated proxy if
+  you ever need remote access; do not expose the port directly.
+- Tool calls still go through the same policy and provenance code as the CLI.
+
 ## Known limitations
 
 - The session anchor is stored beside the log. A local attacker who can rewrite
