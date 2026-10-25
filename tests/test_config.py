@@ -38,6 +38,21 @@ def test_validator_must_stay_inside_workspace() -> None:
         PandaConfig(validator="../outside/validate.mjs")
     with pytest.raises(ValidationError):
         PandaConfig(validator="C:/absolute/validate.mjs")
+    with pytest.raises(ValidationError):
+        PandaConfig(validator=r"C:\absolute\validate.mjs")
+    with pytest.raises(ValidationError):
+        PandaConfig(validator="//server/share/validate.mjs")
+    with pytest.raises(ValidationError):
+        PandaConfig(validator="")
+
+
+def test_validator_and_instructions_normalize_separators() -> None:
+    config = PandaConfig(
+        validator=r"corpus\validation\validate.mjs",
+        instructions=r".panda\instructions.md",
+    )
+    assert config.validator == "corpus/validation/validate.mjs"
+    assert config.instructions == ".panda/instructions.md"
 
 
 def test_unknown_field_is_rejected() -> None:
@@ -48,7 +63,12 @@ def test_unknown_field_is_rejected() -> None:
 def test_opencode_config_path_must_stay_inside_workspace() -> None:
     with pytest.raises(ValidationError):
         OpencodeSettings(config_path="../opencode.json")
+    with pytest.raises(ValidationError):
+        OpencodeSettings(config_path=r"C:\opencode.json")
     assert OpencodeSettings(config_path=".opencode/opencode.json").config_path == (
+        ".opencode/opencode.json"
+    )
+    assert OpencodeSettings(config_path=r".opencode\opencode.json").config_path == (
         ".opencode/opencode.json"
     )
 

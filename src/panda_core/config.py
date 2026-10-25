@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path, PurePath
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -16,6 +16,25 @@ DEFAULT_POLICY = ".panda/policy.json"
 DEFAULT_SESSIONS = ".panda/sessions"
 DEFAULT_INSTRUCTIONS = ".panda/instructions.md"
 DEFAULT_OPENCODE_CONFIG = "opencode.json"
+
+
+def _relative_posix_path(value: str) -> str:
+    """Normalize a configured path and reject anything outside the workspace.
+
+    ``PurePath`` is platform-dependent: on POSIX, ``C:/tmp/x`` is a relative
+    path. Workspace configs must be portable, so accept both separators, reject
+    drive-qualified and UNC paths, and reject any ``..`` segment.
+    """
+
+    text = value.replace("\\", "/")
+    if not text.strip():
+        raise ValueError("path must not be empty")
+    if len(text) >= 2 and text[1] == ":":
+        raise ValueError("path must be relative and stay inside the workspace")
+    candidate = PurePosixPath(text)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("path must be relative and stay inside the workspace")
+    return candidate.as_posix()
 
 
 class OpencodeSettings(BaseModel):
@@ -39,10 +58,7 @@ class OpencodeSettings(BaseModel):
     @field_validator("config_path")
     @classmethod
     def _config_path_relative(cls, value: str) -> str:
-        candidate = PurePath(value)
-        if candidate.is_absolute() or ".." in candidate.parts:
-            raise ValueError("opencode.config_path must be relative and stay inside the workspace")
-        return candidate.as_posix()
+        return _relative_posix_path(value)
 
     @field_validator("panda_command")
     @classmethod
@@ -90,10 +106,7 @@ class PandaConfig(BaseModel):
     @field_validator("validator", "instructions")
     @classmethod
     def _relative_inside_workspace(cls, value: str) -> str:
-        candidate = PurePath(value)
-        if candidate.is_absolute() or ".." in candidate.parts:
-            raise ValueError("path must be relative and stay inside the workspace")
-        return candidate.as_posix()
+        return _relative_posix_path(value)
 
     def to_jsonable(self) -> dict:
         return self.model_dump(mode="json")

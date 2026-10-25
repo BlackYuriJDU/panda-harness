@@ -45,6 +45,8 @@ Initial alpha. The contract is frozen in [`docs/CONTRACT.md`](docs/CONTRACT.md).
 - `doctor` no longer creates `.panda/sessions` in a read-only corpus.
 - Permission deduplication keeps the last occurrence, so restrictive user rules
   remain effective after a merge.
+- Workspace path validation rejects Windows drive and UNC paths on every
+  platform and normalizes both path separators before matching.
 
 ### Verified
 
@@ -52,5 +54,5 @@ Initial alpha. The contract is frozen in [`docs/CONTRACT.md`](docs/CONTRACT.md).
   writes to the corpus.
 - `panda init --root "DCJ - Lito" --dry-run` reports no writes.
 - `ruff check .` passes.
-- `pytest` passes (200 passed, 3 skipped without the MCP extra; MCP tests pass in
+- `pytest` passes (201 passed, 3 skipped without the MCP extra; MCP tests pass in
   an environment with the extra installed).
