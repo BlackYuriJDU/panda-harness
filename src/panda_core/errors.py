@@ -61,6 +61,17 @@ class ProtocolError(PandaError):
     exit_code = 4
 
 
+class ProviderError(PandaError):
+    """Model provider failure: auth, rate limit, protocol, or transport.
+
+    The message never includes the API key or request headers. Exit code 4 is
+    shared with the other protocol-level failures on purpose.
+    """
+
+    code = "provider_error"
+    exit_code = 4
+
+
 class ValidationFailed(PandaError):
     code = "validation_failed"
     exit_code = 1

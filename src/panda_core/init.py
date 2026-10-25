@@ -1,13 +1,13 @@
-"""`panda init`: create the workspace contract and wire OpenCode.
+"""`panda init`: create the workspace contract.
 
-The operation is idempotent and non-destructive by default. Existing config,
-policy, instructions, and OpenCode files are preserved unless `--force` is used;
-with `--force`, every overwritten file is backed up under `.panda/backups/`.
+The operation is idempotent and non-destructive by default. The OpenCode export
+is legacy and opt-in (`opencode=True`); the runtime never depends on it.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -128,7 +128,7 @@ def initialize_workspace(
     allow_missing_validator: bool = False,
     force: bool = False,
     dry_run: bool = False,
-    no_opencode: bool = False,
+    opencode: bool = False,
     panda_command: Sequence[str] | None = None,
     force_model: bool = False,
 ) -> InitResult:
@@ -165,18 +165,29 @@ def initialize_workspace(
             ),
         )
 
-    command = list(panda_command) if panda_command else list(config.opencode.panda_command)
-    if not command or command == ["panda"]:
-        command = default_panda_command()
-    config.opencode.panda_command = command
+    if opencode:
+        command = list(panda_command) if panda_command else list(config.opencode.panda_command)
+        if not command or command == ["panda"]:
+            command = default_panda_command()
+        config.opencode.panda_command = command
+    else:
+        command = list(config.opencode.panda_command)
 
     result = InitResult(root=root, dry_run=dry_run, config=config)
     if dry_run:
         result.warnings.append("dry run: no files were written")
+    if not os.environ.get(config.provider.api_key_env):
+        result.warnings.append(
+            f"{config.provider.api_key_env} is not set; model calls fail until it is exported"
+        )
+    if opencode:
+        result.warnings.append(
+            "legacy OpenCode export is enabled; the Panda runtime does not use opencode.json"
+        )
 
     # Resolve the OpenCode target before writing anything so an unsupported
     # existing config fails without leaving partial state behind.
-    if not no_opencode:
+    if opencode:
         probe = Workspace(root=root, config=config, initialized=False)
         target = resolve_config_target(probe)
         try:
@@ -232,7 +243,7 @@ def initialize_workspace(
         action = "would update" if dry_run else "updated"
         result.warnings.append(f"{action} {gitignore}")
 
-    if not no_opencode:
+    if opencode:
         if dry_run:
             try:
                 existing = (

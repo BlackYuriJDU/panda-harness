@@ -345,10 +345,28 @@ def init_panel(result: Any) -> None:
 def status_panel(info: dict[str, Any], last_session: Any = None) -> None:
     output = console()
     root = info.get("root", "")
-    model = info.get("model", "")
+    provider = info.get("provider", {})
+    git = info.get("git", {})
+    branch = git.get("branch") or ("detached" if git.get("repo") else "no git")
+    model = provider.get("model") or info.get("model", "")
     lines: list[Text] = [
         Text.assemble(("root   ", WHITE_SHADOW), (str(root), WHITE)),
-        Text.assemble(("model  ", WHITE_SHADOW), (str(model), GREEN)),
+        Text.assemble(
+            ("provider", WHITE_SHADOW),
+            ("  ", ""),
+            (str(provider.get("name", "opencode")), GREEN),
+            ("  ", ""),
+            (str(provider.get("base_url", "")), WHITE_SHADOW),
+        ),
+        Text.assemble(("model  ", WHITE_SHADOW), (str(model), WHITE)),
+        Text.assemble(
+            ("key    ", WHITE_SHADOW),
+            (
+                f"{provider.get('api_key_env', 'OPENCODE_API_KEY')} "
+                f"{'set' if provider.get('api_key_present') else 'not set'}",
+                GREEN if provider.get("api_key_present") else AMBER,
+            ),
+        ),
         Text.assemble(
             ("validator", WHITE_SHADOW),
             ("  ", ""),
@@ -358,11 +376,12 @@ def status_panel(info: dict[str, Any], last_session: Any = None) -> None:
             ),
         ),
         Text.assemble(
-            ("opencode", WHITE_SHADOW),
+            ("git    ", WHITE_SHADOW),
+            (str(branch), WHITE),
             ("  ", ""),
             (
-                "wired" if info.get("opencode", {}).get("ok") else "not wired",
-                GREEN if info.get("opencode", {}).get("ok") else AMBER,
+                "dirty" if git.get("dirty") else "clean",
+                AMBER if git.get("dirty") else GREEN,
             ),
         ),
     ]
@@ -371,8 +390,7 @@ def status_panel(info: dict[str, Any], last_session: Any = None) -> None:
         Text.assemble(
             ("tools  ", WHITE_SHADOW),
             (
-                f"python {tools.get('python', '?')} · node {tools.get('node') or 'missing'} · "
-                f"opencode {tools.get('opencode') or 'missing'}",
+                f"python {tools.get('python', '?')} · node {tools.get('node') or 'missing'}",
                 WHITE_SHADOW,
             ),
         )
@@ -392,7 +410,53 @@ def status_panel(info: dict[str, Any], last_session: Any = None) -> None:
     output.print(Panel(Group(*lines), border_style=GREEN, title="panda", title_align="left"))
     output.print(
         Text(
-            "panda doctor · panda validate · panda study list · panda run \"<task>\"",
+            'panda · panda run "<task>" · panda models · panda doctor · panda validate',
+            style=WHITE_SHADOW,
+        )
+    )
+
+
+def models_table(
+    rows: Iterable[dict[str, Any]],
+    *,
+    source: str,
+    captured_at: str = "",
+    error: str | None = None,
+) -> None:
+    output = console()
+    table = Table(show_header=True, header_style=f"bold {WHITE_SHADOW}", box=None, pad_edge=False)
+    table.add_column("Model", style=WHITE)
+    table.add_column("Protocol", style=WHITE_SHADOW)
+    table.add_column("", width=11)
+    table.add_column("Free", style=WHITE_SHADOW, width=4)
+    count = 0
+    ready = 0
+    for row in rows:
+        count += 1
+        supported = bool(row.get("supported"))
+        ready += int(supported)
+        table.add_row(
+            str(row.get("id", "")),
+            str(row.get("protocol", "")),
+            Text("ready", style=GREEN) if supported else Text("unsupported", style=AMBER),
+            "free" if row.get("free") else "",
+        )
+    output.print(table if count else Text("no models returned", style=WHITE_SHADOW))
+    origin = f"source: {source}"
+    if source == "snapshot" and captured_at:
+        origin += f" (captured {captured_at})"
+    output.print(Text(f"{count} models · {ready} callable · {origin}", style=WHITE_SHADOW))
+    if error:
+        output.print(Text(f"live catalogue unavailable: {error}", style=AMBER))
+    output.print(
+        Text(
+            "only openai-chat is implemented · claude=anthropic · gpt=responses · gemini=google",
+            style=WHITE_SHADOW,
+        )
+    )
+    output.print(
+        Text(
+            "free models share a small quota; 429 is expected under load",
             style=WHITE_SHADOW,
         )
     )

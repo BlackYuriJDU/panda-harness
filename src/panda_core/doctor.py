@@ -9,9 +9,10 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
+from panda_core.config import split_model
 from panda_core.errors import PandaError
-from panda_core.opencode import config_status, opencode_available
 from panda_core.policy import load_policy
+from panda_core.provider import classify_protocol
 from panda_core.validator import Validator
 from panda_core.version import __version__
 from panda_core.workspace import Workspace
@@ -222,60 +223,47 @@ def run_doctor(workspace: Workspace, *, run_validation: bool = False) -> DoctorR
         required=False,
     )
 
-    available, version = opencode_available(workspace)
+    provider = workspace.config.provider
     _check(
         checks,
-        "opencode",
-        "OpenCode v2",
-        "ok" if available else "warn",
-        version or "not found",
-        "install OpenCode v2: https://opencode.ai/docs/",
-        required=False,
+        "provider",
+        "Model provider",
+        "ok",
+        f"{provider.name} · {provider.base_url}",
+        required=True,
     )
-
-    status = config_status(workspace)
-    if status.get("ok"):
-        _check(
-            checks,
-            "opencode_config",
-            "OpenCode config + Panda MCP",
-            "ok",
-            str(status.get("path", "")),
-        )
-        command = (
-            status.get("panda_mcp")
-            and status.get("model")
-            and status.get("default_agent") == workspace.config.opencode.agent
-        )
-        if not command:
-            _check(
-                checks,
-                "opencode_agent",
-                "OpenCode model/agent",
-                "warn",
-                f"model={status.get('model')} agent={status.get('default_agent')}",
-                "run `panda init` to align the model and Panda agent",
-            )
-    else:
-        _check(
-            checks,
-            "opencode_config",
-            "OpenCode config + Panda MCP",
-            "warn",
-            str(status.get("path", workspace.opencode_config_path)),
-            "run `panda init` to wire the Panda MCP server and permissions",
-        )
-
-    key_present = bool(os.environ.get("OPENROUTER_API_KEY"))
+    key_present = bool(os.environ.get(provider.api_key_env))
     _check(
         checks,
-        "openrouter",
-        "OPENROUTER_API_KEY",
+        "provider_key",
+        provider.api_key_env,
         "ok" if key_present else "warn",
         "set" if key_present else "not set in this process",
-        "export OPENROUTER_API_KEY or run `opencode auth login` for OpenRouter",
+        f"export {provider.api_key_env} before `panda run` or `panda`; "
+        "Panda records the name only",
         required=False,
     )
+    _, model_name = split_model(workspace.config.model)
+    protocol = classify_protocol(model_name or workspace.config.model)
+    _check(
+        checks,
+        "model",
+        f"Model ({protocol})",
+        "ok" if protocol == "openai-chat" else "warn",
+        workspace.config.model,
+        "only openai-chat is implemented; pick a supported id with `panda models`",
+        required=False,
+    )
+    if workspace.opencode_config_path.is_file():
+        _check(
+            checks,
+            "opencode_legacy",
+            "Legacy opencode.json",
+            "warn",
+            str(workspace.opencode_config_path),
+            "present but unused by the Panda runtime; `panda init --opencode` maintains it",
+            required=False,
+        )
 
     git = workspace.git_state()
     if git.get("repo"):

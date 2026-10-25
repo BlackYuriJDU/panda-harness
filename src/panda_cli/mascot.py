@@ -19,6 +19,8 @@ from panda_cli.brand import PALETTE, half_block_lines
 
 WIDTH = 28
 HEIGHT = 24
+ANIMATION_FPS = 12
+BLINK_PERIOD = 16
 FRAMES = (
     "idle",
     "thinking",
@@ -244,7 +246,7 @@ def _z(grid: list[list[str]], x: int, y: int, size: int, char: str) -> None:
         _plot(grid, x + size - 1 - step, y + step, char)
 
 
-def _panda(state: str) -> list[list[str]]:
+def _panda(state: str, tick: int = 0) -> list[list[str]]:
     grid = _grid()
 
     # Feet, then body: the body hides the top of the feet.
@@ -331,37 +333,69 @@ def _panda(state: str) -> list[list[str]]:
             "sleeping": "zzz",
         }[state],
     )
+
+    # Animation is opt-in through `tick`; tick=0 is byte-identical to the
+    # static frame that the golden tests pin.
+    if tick > 0 and tick % BLINK_PERIOD in (0, 1) and state not in {"sleeping", "blocked"}:
+        _eye_closed(grid, 9.8, 9.9)
+        _eye_closed(grid, 18.2, 9.9)
+    if tick > 0 and state in {"thinking", "working", "verifying"}:
+        phase = tick % 8
+        for index, (x, y) in enumerate(((24, 6), (26, 8), (25, 10))):
+            if (tick + index) % 4 == 0:
+                continue
+            _plot(grid, x + (phase % 2), y - (phase // 4), "A")
+    if tick > 0 and tick % 4 in (1, 3):
+        grid = [["." for _ in range(WIDTH)], *grid[:-1]]
     return grid
 
 
-def frame_grid(state: str = "idle") -> list[str]:
-    """Return the raw 28x24 character grid for one frame."""
+def frame_grid(state: str = "idle", tick: int = 0) -> list[str]:
+    """Return the raw 28x24 character grid for one frame.
+
+    `tick=0` (the default) is the static frame. Positive ticks add a fixed-
+    timestep bob, blink, and particle animation for the cockpit.
+    """
 
     if state not in FRAMES:
         raise ValueError(f"unknown mascot state: {state}")
-    return ["".join(row) for row in _panda(state)]
+    return ["".join(row) for row in _panda(state, tick=max(0, int(tick)))]
 
 
-def mascot_lines(state: str = "idle") -> list[Text]:
-    return half_block_lines(frame_grid(state), _CHAR_STYLE)
+def mascot_lines(state: str = "idle", tick: int = 0) -> list[Text]:
+    return half_block_lines(frame_grid(state, tick), _CHAR_STYLE)
+
+
+STATE_ICON = {
+    "idle": "·",
+    "thinking": "…",
+    "working": "▸",
+    "verifying": "◎",
+    "success": "✓",
+    "blocked": "×",
+    "alert": "!",
+    "sleeping": "z",
+}
 
 
 @dataclass(frozen=True)
 class MascotMetrics:
     state: str = "idle"
-    effort: float = 0.0
+    effort: float | None = None
     model: str = ""
-    cache: float = 0.0
-    context: float = 0.0
-    tokens: int = 0
+    cache: float | None = None
+    context: float | None = None
+    tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.state not in FRAMES:
             raise ValueError(f"unknown mascot state: {self.state}")
 
     def clamped(self, field: str) -> float:
-        value = float(getattr(self, field))
-        return max(0.0, min(1.0, value))
+        value = getattr(self, field)
+        if value is None:
+            return 0.0
+        return max(0.0, min(1.0, float(value)))
 
 
 def bar(value: float, width: int = 10) -> str:
@@ -392,53 +426,38 @@ def _metric_line(label: str, value: Text) -> Text:
 
 def metrics_lines(metrics: MascotMetrics) -> list[Text]:
     state_style = _AMBER if metrics.state in {"blocked", "alert"} else _GREEN
+    icon = STATE_ICON.get(metrics.state, "·")
     lines = [
         Text.assemble(
             ("PANDA", f"bold {_WHITE}"),
             ("  ", ""),
-            (metrics.state, state_style),
+            (f"{icon} {metrics.state}", state_style),
         )
     ]
 
-    effort = metrics.clamped("effort")
-    lines.append(
-        _metric_line(
-            "effort",
-            Text.assemble(
-                (bar(effort), _bar_style("effort", effort)),
-                (f"  {round(effort * 100):>3}%", _SHADOW),
-            ),
+    for label in ("effort", "cache", "context"):
+        value = getattr(metrics, label)
+        if value is None:
+            lines.append(_metric_line(label, Text("—", style=_SHADOW)))
+            continue
+        clamped = metrics.clamped(label)
+        lines.append(
+            _metric_line(
+                label,
+                Text.assemble(
+                    (bar(clamped), _bar_style(label, clamped)),
+                    (f"  {round(clamped * 100):>3}%", _SHADOW),
+                ),
+            )
         )
-    )
 
     model = metrics.model or "not selected"
     if len(model) > 20:
         model = model[:19] + "…"
-    lines.append(_metric_line("model", Text(model, style=_WHITE)))
+    lines.insert(2, _metric_line("model", Text(model, style=_WHITE)))
 
-    cache = metrics.clamped("cache")
-    lines.append(
-        _metric_line(
-            "cache",
-            Text.assemble(
-                (bar(cache), _bar_style("cache", cache)),
-                (f"  {round(cache * 100):>3}%", _SHADOW),
-            ),
-        )
-    )
-
-    context = metrics.clamped("context")
-    lines.append(
-        _metric_line(
-            "context",
-            Text.assemble(
-                (bar(context), _bar_style("context", context)),
-                (f"  {round(context * 100):>3}%", _SHADOW),
-            ),
-        )
-    )
-
-    lines.append(_metric_line("tokens", Text(format_tokens(metrics.tokens), style=_WHITE)))
+    tokens = "—" if metrics.tokens is None else format_tokens(metrics.tokens)
+    lines.append(_metric_line("tokens", Text(tokens, style=_WHITE)))
     return lines
 
 
@@ -465,6 +484,7 @@ __all__ = [
     "HEIGHT",
     "WIDTH",
     "MascotMetrics",
+    "STATE_ICON",
     "bar",
     "format_tokens",
     "frame_grid",

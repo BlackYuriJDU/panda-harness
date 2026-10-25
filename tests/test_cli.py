@@ -216,22 +216,11 @@ def test_run_dry_run(wired_workspace) -> None:
         "run", "validate the corpus", "--root", str(wired_workspace.root), "--dry-run"
     )
     assert result.exit_code == 0
-    assert "dry-run:" in result.output
-    assert "--standalone" in result.output
+    assert "model:" in result.output
+    assert "opencode/" in result.output
+    assert "tools:" in result.output
+    assert "run_shell" in result.output
     assert "session:" in result.output
-
-
-def test_run_shared_dry_run(wired_workspace) -> None:
-    result = invoke(
-        "run",
-        "validate the corpus",
-        "--root",
-        str(wired_workspace.root),
-        "--dry-run",
-        "--shared",
-    )
-    assert result.exit_code == 0
-    assert "--standalone" not in result.output
 
 
 def test_run_requires_task(wired_workspace) -> None:
@@ -240,11 +229,61 @@ def test_run_requires_task(wired_workspace) -> None:
     assert "task is required" in result.output
 
 
-def test_run_rejects_standalone_and_shared(wired_workspace) -> None:
+def test_run_rejects_unsupported_protocol(wired_workspace) -> None:
     result = invoke(
-        "run", "x", "--root", str(wired_workspace.root), "--standalone", "--shared"
+        "run",
+        "x",
+        "--root",
+        str(wired_workspace.root),
+        "--model",
+        "opencode/claude-opus-5",
+        "--dry-run",
     )
     assert result.exit_code == 2
+    assert "protocol" in result.output
+
+
+def test_run_rejects_foreign_provider(wired_workspace) -> None:
+    result = invoke(
+        "run",
+        "x",
+        "--root",
+        str(wired_workspace.root),
+        "--model",
+        "openrouter/anthropic/claude-sonnet-5.5",
+        "--dry-run",
+    )
+    assert result.exit_code == 2
+    assert "not configured" in result.output
+
+
+def test_models_falls_back_to_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    from panda_core.errors import ProviderError
+    from panda_core.provider import OpenCodeProvider
+
+    async def unavailable(self):
+        raise ProviderError("offline")
+
+    monkeypatch.setattr(OpenCodeProvider, "list_models", unavailable)
+    result = invoke("models", "--json")
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["source"] == "snapshot"
+    assert payload["count"] == 85
+    assert sum(1 for model in payload["models"] if model["supported"]) == 38
+    assert any(model["free"] for model in payload["models"])
+
+
+def test_models_refresh_hard_fails_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from panda_core.errors import ProviderError
+    from panda_core.provider import OpenCodeProvider
+
+    async def unavailable(self):
+        raise ProviderError("offline")
+
+    monkeypatch.setattr(OpenCodeProvider, "list_models", unavailable)
+    result = invoke("models", "--refresh", "--json")
+    assert result.exit_code == 4
 
 
 def test_mcp_tools_lists_contract() -> None:

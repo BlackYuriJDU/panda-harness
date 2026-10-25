@@ -93,7 +93,7 @@ def fake_corpus(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def workspace(fake_corpus: Path) -> Workspace:
-    initialize_workspace(fake_corpus, no_opencode=True)
+    initialize_workspace(fake_corpus)
     return Workspace.from_root(fake_corpus)
 
 
@@ -101,6 +101,7 @@ def workspace(fake_corpus: Path) -> Workspace:
 def wired_workspace(fake_corpus: Path) -> Workspace:
     initialize_workspace(
         fake_corpus,
+        opencode=True,
         panda_command=[sys.executable, "-m", "panda_cli"],
     )
     return Workspace.from_root(fake_corpus)

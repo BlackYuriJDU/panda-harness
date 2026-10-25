@@ -10,8 +10,10 @@ from pydantic import ValidationError
 
 from panda_core.config import (
     DEFAULT_MODEL,
+    DEFAULT_PROVIDER,
     OpencodeSettings,
     PandaConfig,
+    ProviderSettings,
     load_config,
 )
 from panda_core.errors import ConfigError
@@ -19,7 +21,11 @@ from panda_core.errors import ConfigError
 
 def test_default_config_is_valid() -> None:
     config = PandaConfig()
-    assert config.model == DEFAULT_MODEL
+    assert config.schema_version == 2
+    assert config.model == DEFAULT_MODEL == "opencode/deepseek-v4.1-flash"
+    assert config.provider.name == DEFAULT_PROVIDER
+    assert config.provider.base_url == "https://opencode.ai/inference"
+    assert config.provider.api_key_env == "OPENCODE_API_KEY"
     assert config.validator == "corpus/validation/validate.mjs"
     assert config.opencode.standalone is True
     assert config.timeouts.validate_seconds == 180
@@ -104,3 +110,30 @@ def test_timeouts_are_bounded() -> None:
         PandaConfig.model_validate({"timeouts": {"validate_seconds": 0}})
     with pytest.raises(ValidationError):
         PandaConfig.model_validate({"timeouts": {"validate_seconds": 99999}})
+
+
+def test_provider_settings_reject_remote_http() -> None:
+    with pytest.raises(ValidationError):
+        ProviderSettings(base_url="http://example.com/inference")
+    assert ProviderSettings(base_url="http://127.0.0.1:9999/v1").base_url.endswith("/v1")
+    with pytest.raises(ValidationError):
+        ProviderSettings(api_key_env="not a name")
+
+
+def test_schema_v1_config_loads_and_is_migrated(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model": "openrouter/anthropic/claude-sonnet-5.5",
+                "opencode": {"standalone": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_config(path)
+    assert loaded.schema_version == 2
+    assert loaded.provider.name == "opencode"
+    assert loaded.model == "openrouter/anthropic/claude-sonnet-5.5"
+    assert loaded.opencode.standalone is False

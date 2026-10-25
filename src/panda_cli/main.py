@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import functools
 import hashlib
 import os
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -13,17 +15,20 @@ from typing import Any
 import typer
 
 from panda_cli import render
+from panda_cli.runtime import ChatRuntime
+from panda_core.agent import DEFAULT_MAX_STEPS
+from panda_core.config import split_model
 from panda_core.doctor import run_doctor
-from panda_core.errors import ConfigError, PandaError, UsageError
+from panda_core.errors import ConfigError, ExecutionTimeout, PandaError, UsageError
 from panda_core.init import initialize_workspace
-from panda_core.opencode import (
-    build_run_command,
-    config_status,
-    dry_run_text,
-    launch_opencode,
-)
+from panda_core.model_catalog import CAPTURED_AT, snapshot_models
 from panda_core.policy import PolicyEngine, load_policy_or_default
 from panda_core.process import split_command
+from panda_core.provider import (
+    is_supported_model,
+    provider_for_config,
+    status_snapshot,
+)
 from panda_core.registry import find_study, load_registry, load_study_card
 from panda_core.session import SessionLog, list_sessions
 from panda_core.validator import Validator
@@ -35,14 +40,14 @@ app = typer.Typer(
     no_args_is_help=False,
     rich_markup_mode="rich",
     help=(
-        "Fail-closed terminal harness for evidence-heavy research corpora. "
-        "Runtime: OpenCode v2 + OpenRouter."
+        "Fail-closed autonomous harness for evidence-heavy research corpora. "
+        "Runtime: Panda cockpit + OpenCode Console models."
     ),
 )
 session_app = typer.Typer(help="Hash-chained session ledger", no_args_is_help=True)
 policy_app = typer.Typer(help="Policy evaluation and explanation", no_args_is_help=True)
 study_app = typer.Typer(help="Read-only study registry", no_args_is_help=True)
-mcp_app = typer.Typer(help="MCP server for OpenCode and other clients", no_args_is_help=True)
+mcp_app = typer.Typer(help="Optional MCP export for other clients", no_args_is_help=True)
 
 app.add_typer(session_app, name="session")
 app.add_typer(policy_app, name="policy")
@@ -136,8 +141,18 @@ def _main(
         False, "--version", "-V", help="Print the Panda version and exit.", is_eager=True
     ),
     plain: bool = typer.Option(
-        False, "--plain", help="Disable color and brand art for this invocation.", is_eager=True
+        False, "--plain", help="Use the line REPL instead of the full-screen cockpit.",
+        is_eager=True,
     ),
+    model: str | None = typer.Option(
+        None, "--model", help="Model id for the cockpit (opencode/<model>)."
+    ),
+    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    max_steps: int = typer.Option(
+        DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps per turn."
+    ),
+    session: str | None = typer.Option(None, "--session", help="Continue a Panda session."),
+    private: bool = typer.Option(False, "--private", help="Never persist task text."),
 ) -> None:
     if plain:
         os.environ["NO_COLOR"] = "1"
@@ -145,14 +160,24 @@ def _main(
         typer.echo(f"panda {__version__}")
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
-        _status(root=None, json_output=False)
+        _start_chat(
+            root=None,
+            plain=plain,
+            model=model,
+            auto=auto,
+            max_steps=max_steps,
+            session=session,
+            private=private,
+        )
 
 
 @app.command("init")
 @handle
 def init_command(
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
-    model: str | None = typer.Option(None, "--model", help="OpenRouter model id."),
+    model: str | None = typer.Option(
+        None, "--model", help="Provider model id (opencode/<model>)."
+    ),
     validator: str | None = typer.Option(
         None, "--validator", help="Validator path relative to the root."
     ),
@@ -162,13 +187,15 @@ def init_command(
     force: bool = typer.Option(False, "--force", help="Rewrite generated files after a backup."),
     force_model: bool = typer.Option(False, "--force-model", help="Overwrite an existing model."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show planned writes without writing."),
-    no_opencode: bool = typer.Option(
-        False, "--no-opencode", help="Do not create or merge an OpenCode config."
+    opencode: bool = typer.Option(
+        False,
+        "--opencode",
+        help="Legacy: also write/merge opencode.json and wire the Panda MCP server.",
     ),
     panda_command: str | None = typer.Option(
         None,
         "--panda-command",
-        help="Command OpenCode uses to launch Panda (e.g. 'panda' or 'python -m panda_cli').",
+        help="Legacy OpenCode launcher command (only with --opencode).",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
@@ -180,7 +207,7 @@ def init_command(
         allow_missing_validator=allow_missing_validator,
         force=force,
         dry_run=dry_run,
-        no_opencode=no_opencode,
+        opencode=opencode,
         panda_command=command,
         force_model=force_model,
     )
@@ -278,63 +305,27 @@ def validate_command(
 @app.command("run")
 @handle
 def run_command(
-    task: list[str] | None = typer.Argument(None, help="Task for the OpenCode agent."),
+    task: list[str] | None = typer.Argument(None, help="Task for the autonomous Panda agent."),
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
-    model: str | None = typer.Option(None, "--model", help="OpenRouter model id."),
-    agent: str | None = typer.Option(None, "--agent", help="OpenCode agent id."),
-    output_format: str | None = typer.Option(
-        None, "--format", help="OpenCode output format: default or json."
-    ),
-    title: str | None = typer.Option(None, "--title", help="OpenCode session title."),
-    standalone: bool = typer.Option(
-        False, "--standalone", help="Force a private OpenCode server (default from config)."
-    ),
-    shared: bool = typer.Option(
-        False, "--shared", help="Use the shared OpenCode server instead of a private one."
-    ),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Print the command; do not launch."),
+    model: str | None = typer.Option(None, "--model", help="Model id (opencode/<model>)."),
+    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    json_output: bool = typer.Option(False, "--json", help="Emit a JSON result."),
+    session: str | None = typer.Option(None, "--session", help="Continue an existing session."),
     private: bool = typer.Option(
-        False, "--private", help="Record only a hash of the task, never its text."
+        False, "--private", help="Persist only a hash of the task, never its text."
     ),
-    session: str | None = typer.Option(
-        None, "--session", help="Continue an existing Panda session."
+    max_steps: int = typer.Option(
+        DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps."
     ),
     timeout: int | None = typer.Option(None, "--timeout", help="Run timeout in seconds."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print the plan; do not call the model."),
     quiet: bool = typer.Option(False, "--quiet", help="Do not print the session id."),
 ) -> None:
-    if standalone and shared:
-        raise UsageError("--standalone and --shared are mutually exclusive")
     task_text = " ".join(task or []).strip()
     if not task_text:
         raise UsageError("a task is required", hint='example: panda run "validate the corpus"')
-
     workspace = _load_workspace(root, require_init=True)
-    status = config_status(workspace)
-    if not status.get("ok"):
-        raise ConfigError(
-            "OpenCode is not wired to the Panda MCP server",
-            hint="run `panda init` in the corpus root",
-        )
-    if not os.environ.get("OPENROUTER_API_KEY") and workspace.config.model.startswith(
-        "openrouter/"
-    ):
-        typer.echo(
-            "warning: OPENROUTER_API_KEY is not set; use `opencode auth login` or export it",
-            err=True,
-        )
-
-    standalone_mode = (
-        True if standalone else (False if shared else workspace.config.opencode.standalone)
-    )
-    command = build_run_command(
-        workspace,
-        task_text,
-        model=model,
-        agent=agent,
-        output_format=output_format,
-        title=title,
-        standalone=standalone_mode,
-    )
+    selected_model = _validate_model(workspace, model)
     log = _active_session(workspace, session)
     if log is not None and log.is_closed():
         raise ConfigError(f"session already closed: {log.session_id}")
@@ -342,49 +333,286 @@ def run_command(
         label = "run: " + (task_text[:60] if not private else "[private task]")
         log = _create_session(workspace, label, private=private)
 
-    task_sha = hashlib.sha256(task_text.encode("utf-8")).hexdigest()
-    safe_command = list(command)
-    if safe_command:
-        safe_command[-1] = "[private]" if private else task_text
-    log_task = workspace.config.logging.log_tasks and not private
-    start_data = {
-        "task": task_text if log_task else None,
-        "task_sha256": task_sha,
+    run_data = {
+        "task": None if private or not workspace.config.logging.log_tasks else task_text,
+        "task_sha256": hashlib.sha256(task_text.encode("utf-8")).hexdigest(),
         "task_chars": len(task_text),
         "private": private,
-        "command": safe_command,
-        "model": model or workspace.config.model,
-        "agent": agent or workspace.config.opencode.agent,
+        "model": selected_model,
+        "provider": workspace.config.provider.name,
+        "max_steps": max_steps,
         "cwd": str(workspace.root),
         "git": workspace.git_state(),
     }
 
     if dry_run:
-        log.append("run.plan", start_data)
+        runtime = _runtime(workspace, log, selected_model, max_steps, private, auto)
+        log.append("run.plan", {**run_data, "tools": runtime.tools.names()})
         _close_quietly(log, "planned")
-        typer.echo(f"dry-run: {dry_run_text(command)}")
+        typer.echo(f"model: {selected_model}")
+        provider = workspace.config.provider
+        typer.echo(f"provider: {provider.name} ({provider.base_url})")
+        typer.echo(f"tools: {', '.join(runtime.tools.names())}")
         typer.echo(f"session: {log.session_id}")
+        runtime.close("planned")
         return
 
-    log.append("run.start", start_data)
+    log.append("run.start", run_data)
     if not quiet:
         typer.echo(f"session: {log.session_id}", err=True)
-    try:
-        exit_code = launch_opencode(
-            workspace,
-            command,
-            session_id=log.session_id,
-            session_path=log.path,
-            timeout=timeout or workspace.config.timeouts.run_seconds,
+    streamed = {"any": False}
+
+    def on_event(event: Any) -> None:
+        if json_output:
+            return
+        if event.kind == "text_delta":
+            typer.echo(event.data.get("text", ""), nl=False)
+            streamed["any"] = True
+        elif event.kind == "tool_call":
+            typer.echo(f"\n[tool] {event.data.get('name')}", err=True)
+        elif event.kind == "tool_result":
+            state = "blocked" if event.data.get("blocked") else "ok"
+            typer.echo(f"[tool] {event.data.get('name')}: {state}", err=True)
+
+    async def _execute() -> Any:
+        runtime = _runtime(
+            workspace, log, selected_model, max_steps, private, auto, on_event=on_event
         )
+        try:
+            return await runtime.ask(task_text)
+        finally:
+            await runtime.provider.aclose()
+
+    try:
+        result = asyncio.run(
+            asyncio.wait_for(
+                _execute(),
+                timeout=timeout or workspace.config.timeouts.run_seconds,
+            )
+        )
+    except TimeoutError as exc:
+        log.append("run.error", {"code": "execution_timeout", "message": "run timed out"})
+        _close_quietly(log, "error")
+        raise ExecutionTimeout(
+            "run exceeded the timeout",
+            hint="raise --timeout or narrow the task",
+        ) from exc
     except PandaError as exc:
         log.append("run.error", {"code": exc.code, "message": exc.message})
         _close_quietly(log, "error")
         raise
-    log.append("run.end", {"exit_code": exit_code, "command": safe_command})
-    _close_quietly(log, "ok" if exit_code == 0 else "failed", {"exit_code": exit_code})
-    if exit_code != 0:
-        raise typer.Exit(exit_code)
+
+    log.append(
+        "run.end",
+        {
+            "status": result.status,
+            "steps": result.steps,
+            "tool_calls": result.tool_calls,
+            "usage": result.usage.to_dict(),
+        },
+    )
+    _close_quietly(log, "ok" if result.status == "completed" else result.status)
+    if not json_output and streamed["any"]:
+        typer.echo()
+    payload = {
+        "ok": result.status == "completed",
+        "model": selected_model,
+        "provider": workspace.config.provider.name,
+        **result.to_dict(),
+    }
+    if json_output:
+        render.print_json(payload)
+    if result.status == "cancelled":
+        raise typer.Exit(130)
+    if result.status != "completed":
+        raise typer.Exit(1)
+
+
+def _runtime(
+    workspace: Workspace,
+    log: SessionLog,
+    model: str,
+    max_steps: int,
+    private: bool,
+    auto: bool,
+    *,
+    on_event: Any = None,
+    approver: Any = None,
+) -> ChatRuntime:
+    return ChatRuntime(
+        workspace,
+        model=model,
+        max_steps=max_steps,
+        private=private,
+        auto=auto,
+        session=log,
+        approver=approver,
+        on_event=on_event,
+    )
+
+
+def _validate_model(workspace: Workspace, model: str | None) -> str:
+    selected = model or workspace.config.model
+    provider, name = split_model(selected)
+    if not name:
+        raise ConfigError("model must use the provider/model form")
+    if provider != workspace.config.provider.name:
+        raise ConfigError(
+            f"model provider {provider!r} is not configured",
+            hint=(
+                f"the workspace provider is {workspace.config.provider.name!r}; "
+                "run `panda models` and pass --model opencode/<id>"
+            ),
+        )
+    if not is_supported_model(selected):
+        raise ConfigError(
+            f"model {selected!r} uses a protocol this build does not implement",
+            hint="choose an OpenAI-compatible model; `panda models` marks the rest unsupported",
+        )
+    return selected
+
+
+@app.command("chat")
+@handle
+def chat_command(
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    plain: bool = typer.Option(False, "--plain", help="Line REPL instead of the cockpit."),
+    model: str | None = typer.Option(None, "--model", help="Model id (opencode/<model>)."),
+    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    max_steps: int = typer.Option(
+        DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps."
+    ),
+    session: str | None = typer.Option(None, "--session", help="Continue an existing session."),
+    private: bool = typer.Option(False, "--private", help="Never persist task text."),
+) -> None:
+    _start_chat(
+        root=root,
+        plain=plain,
+        model=model,
+        auto=auto,
+        max_steps=max_steps,
+        session=session,
+        private=private,
+    )
+
+
+def _start_chat(
+    *,
+    root: Path | None,
+    plain: bool,
+    model: str | None,
+    auto: bool,
+    max_steps: int,
+    session: str | None,
+    private: bool,
+) -> None:
+    if plain:
+        os.environ["NO_COLOR"] = "1"
+    try:
+        workspace = _load_workspace(root, require_init=True)
+    except ConfigError as exc:
+        if not sys.stdout.isatty():
+            _status(root=root, json_output=False)
+            return
+        render.print_error(exc)
+        raise typer.Exit(exc.exit_code) from None
+    selected = _validate_model(workspace, model)
+    if not plain and not sys.stdout.isatty():
+        _status(root=root, json_output=False)
+        return
+    log = _active_session(workspace, session)
+    if log is not None and log.is_closed():
+        raise ConfigError(f"session already closed: {log.session_id}")
+    if log is None:
+        log = _create_session(workspace, "cockpit", private=private)
+    if plain:
+        from panda_cli.repl import run_plain_chat
+
+        run_plain_chat(
+            workspace,
+            log,
+            model=selected,
+            max_steps=max_steps,
+            private=private,
+            auto=auto,
+        )
+        return
+    try:
+        from panda_cli.cockpit import PandaCockpit
+    except ImportError as exc:
+        raise PandaError(
+            "the cockpit dependency (textual) is not installed",
+            hint="install textual or run `panda --plain`",
+        ) from exc
+    PandaCockpit(
+        workspace,
+        session=log,
+        model=selected,
+        max_steps=max_steps,
+        private=private,
+        auto=auto,
+    ).run()
+
+
+@app.command("models")
+@handle
+def models_command(
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Require the live catalogue; do not fall back to the snapshot."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    try:
+        workspace = _load_workspace(root)
+    except ConfigError:
+        workspace = Workspace.from_root(_root_value(root))
+    try:
+        models, source, error, captured_at = asyncio.run(
+            _collect_models(workspace, refresh=refresh)
+        )
+    except PandaError as exc:
+        if not json_output:
+            render.print_error(exc)
+        raise typer.Exit(exc.exit_code) from None
+    rows = [
+        {
+            "id": model.qualified(workspace.config.provider.name),
+            "protocol": model.protocol,
+            "supported": model.supported,
+            "free": model.free,
+        }
+        for model in models
+    ]
+    if json_output:
+        render.print_json(
+            {
+                "ok": True,
+                "provider": workspace.config.provider.name,
+                "source": source,
+                "captured_at": captured_at,
+                "count": len(rows),
+                "models": rows,
+                "error": error,
+            }
+        )
+        return
+    render.models_table(rows, source=source, captured_at=captured_at, error=error)
+
+
+async def _collect_models(
+    workspace: Workspace, *, refresh: bool
+) -> tuple[list[Any], str, str | None, str]:
+    provider = provider_for_config(workspace.config)
+    try:
+        models = await provider.list_models()
+        return models, "live", None, ""
+    except PandaError as exc:
+        if refresh:
+            raise
+        return snapshot_models(), "snapshot", exc.message, CAPTURED_AT
+    finally:
+        await provider.aclose()
 
 
 @app.command("status")
@@ -419,6 +647,8 @@ def _status(root: Path | None, *, json_output: bool) -> None:
     )
     last_summary = last.summary() if last else None
     info = workspace.describe()
+    info["provider"] = status_snapshot()
+    info["provider"]["model"] = workspace.config.model
     if json_output:
         render.print_json(
             {

@@ -167,6 +167,16 @@ class Workspace:
                 timeout=5,
                 check=False,
             )
+            branch = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
             status = subprocess.run(
                 ["git", "status", "--porcelain"],
                 cwd=self.root,
@@ -178,10 +188,11 @@ class Workspace:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
-            return {"repo": True, "commit": None, "dirty": None}
+            return {"repo": True, "commit": None, "branch": None, "dirty": None}
         return {
             "repo": True,
             "commit": commit.stdout.strip() or None,
+            "branch": branch.stdout.strip() or None,
             "dirty": bool(status.stdout.strip()),
         }
 
@@ -190,7 +201,6 @@ class Workspace:
             "python": platform.python_version(),
             "platform": platform.platform(),
             "node": command_version(self.config.node),
-            "opencode": command_version(self.config.opencode.binary),
         }
 
     def describe(self) -> dict:

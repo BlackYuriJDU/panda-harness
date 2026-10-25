@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from panda_core.errors import PandaError
-from panda_core.opencode import config_status
 from panda_core.policy import PolicyEngine, load_policy_or_default
+from panda_core.provider import status_snapshot
 from panda_core.registry import find_study, load_registry, load_study_card
 from panda_core.session import SessionLog, list_sessions
 from panda_core.validator import Validator
@@ -101,7 +101,8 @@ class PandaService:
             "source": "file" if policy_from_file else "built-in default",
             "rules": len(policy.rules),
         }
-        info["opencode"] = config_status(self.workspace)
+        info["provider"] = status_snapshot()
+        info["provider"]["model"] = self.workspace.config.model
         info["instructions"] = {
             "path": str(self.workspace.instructions_path),
             "exists": self.workspace.instructions_path.is_file(),
