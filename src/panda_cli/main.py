@@ -575,11 +575,15 @@ def models_command(
         if not json_output:
             render.print_error(exc)
         raise typer.Exit(exc.exit_code) from None
+    api_key_env = workspace.config.provider.api_key_env
+    key_present = bool(os.environ.get(api_key_env))
     rows = [
         {
             "id": model.qualified(workspace.config.provider.name),
             "protocol": model.protocol,
             "supported": model.supported,
+            "callable": model.supported,
+            "ready": model.supported and key_present,
             "free": model.free,
         }
         for model in models
@@ -592,12 +596,21 @@ def models_command(
                 "source": source,
                 "captured_at": captured_at,
                 "count": len(rows),
+                "api_key_env": api_key_env,
+                "api_key_present": key_present,
                 "models": rows,
                 "error": error,
             }
         )
         return
-    render.models_table(rows, source=source, captured_at=captured_at, error=error)
+    render.models_table(
+        rows,
+        source=source,
+        captured_at=captured_at,
+        error=error,
+        api_key_env=api_key_env,
+        key_present=key_present,
+    )
 
 
 async def _collect_models(

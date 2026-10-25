@@ -422,30 +422,47 @@ def models_table(
     source: str,
     captured_at: str = "",
     error: str | None = None,
+    api_key_env: str = "OPENCODE_API_KEY",
+    key_present: bool = True,
 ) -> None:
     output = console()
     table = Table(show_header=True, header_style=f"bold {WHITE_SHADOW}", box=None, pad_edge=False)
     table.add_column("Model", style=WHITE)
     table.add_column("Protocol", style=WHITE_SHADOW)
-    table.add_column("", width=11)
+    table.add_column("", width=20)
     table.add_column("Free", style=WHITE_SHADOW, width=4)
     count = 0
-    ready = 0
+    callable_count = 0
+    missing_key = 0
     for row in rows:
         count += 1
         supported = bool(row.get("supported"))
-        ready += int(supported)
+        callable_count += int(supported)
+        if not supported:
+            status = Text("unsupported", style=AMBER)
+        elif key_present:
+            status = Text("callable", style=GREEN)
+        else:
+            missing_key += 1
+            status = Text("callable, needs key", style=AMBER)
         table.add_row(
             str(row.get("id", "")),
             str(row.get("protocol", "")),
-            Text("ready", style=GREEN) if supported else Text("unsupported", style=AMBER),
+            status,
             "free" if row.get("free") else "",
         )
     output.print(table if count else Text("no models returned", style=WHITE_SHADOW))
     origin = f"source: {source}"
     if source == "snapshot" and captured_at:
         origin += f" (captured {captured_at})"
-    output.print(Text(f"{count} models · {ready} callable · {origin}", style=WHITE_SHADOW))
+    output.print(Text(f"{count} models · {callable_count} callable · {origin}", style=WHITE_SHADOW))
+    if missing_key:
+        output.print(
+            Text(
+                f"{missing_key} callable model(s) need {api_key_env} exported in this shell",
+                style=AMBER,
+            )
+        )
     if error:
         output.print(Text(f"live catalogue unavailable: {error}", style=AMBER))
     output.print(
