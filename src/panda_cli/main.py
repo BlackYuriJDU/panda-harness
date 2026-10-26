@@ -78,6 +78,38 @@ def _load_workspace(root: Path | None, *, require_init: bool = False) -> Workspa
     return Workspace.load(_root_value(root), require_init=require_init)
 
 
+# Restore the terminal even when Textual's own teardown is skipped by a crash:
+# mouse tracking off, leave the alt screen, show the cursor.
+TERMINAL_RESET = (
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+    "\x1b[?1049l"
+    "\x1b[?25h"
+)
+
+
+def _reset_terminal() -> None:
+    if not sys.stdout.isatty():
+        return
+    try:
+        sys.stdout.write(TERMINAL_RESET)
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _chat_workspace(root: Path | None) -> tuple[Workspace, ConfigError | None]:
+    """Resolve the chat workspace, falling back when the root is not initialized.
+
+    `panda` is a global command: outside a corpus it still opens the cockpit,
+    with a notice and the default policy, instead of exiting. Only the normal
+    session directory is written on startup.
+    """
+    try:
+        return _load_workspace(root, require_init=True), None
+    except ConfigError as exc:
+        return Workspace.from_root(_root_value(root)), exc
+
+
 def _session_metadata(workspace: Workspace) -> dict[str, Any]:
     env_names = sorted(
         name
@@ -513,14 +545,10 @@ def _start_chat(
 ) -> None:
     if plain:
         os.environ["NO_COLOR"] = "1"
-    try:
-        workspace = _load_workspace(root, require_init=True)
-    except ConfigError as exc:
-        if not sys.stdout.isatty():
-            _status(root=root, json_output=False)
-            return
-        render.print_error(exc)
-        raise typer.Exit(exc.exit_code) from None
+    workspace, load_error = _chat_workspace(root)
+    if load_error is not None and not sys.stdout.isatty():
+        _status(root=root, json_output=False)
+        return
     selected = _validate_model(workspace, model)
     if not plain and not sys.stdout.isatty():
         _status(root=root, json_output=False)
@@ -529,7 +557,13 @@ def _start_chat(
     if log is not None and log.is_closed():
         raise ConfigError(f"session already closed: {log.session_id}")
     if log is None:
-        log = _create_session(workspace, "cockpit", private=private)
+        try:
+            log = _create_session(workspace, "cockpit", private=private)
+        except OSError as exc:
+            raise PandaError(
+                f"cannot write the session ledger under {workspace.sessions_dir}",
+                hint="run `panda init` in a writable directory, or pass --root",
+            ) from exc
     if plain:
         from panda_cli.repl import run_plain_chat
 
@@ -549,14 +583,18 @@ def _start_chat(
             "the cockpit dependency (textual) is not installed",
             hint="install textual or run `panda --plain`",
         ) from exc
-    PandaCockpit(
+    cockpit = PandaCockpit(
         workspace,
         session=log,
         model=selected,
         max_steps=max_steps,
         private=private,
         auto=auto,
-    ).run()
+    )
+    try:
+        cockpit.run()
+    finally:
+        _reset_terminal()
 
 
 @app.command("models")

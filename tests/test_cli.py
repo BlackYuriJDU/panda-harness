@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
-from panda_cli.main import app
+from panda_cli.main import _chat_workspace, _reset_terminal, app
 from panda_core.session import SessionLog
 
 runner = CliRunner()
@@ -39,6 +40,37 @@ def test_status_inside_workspace(workspace) -> None:
     assert payload["ok"] is True
     assert payload["workspace"]["root"] == str(workspace.root)
     assert payload["last_session"] is None
+
+
+def test_chat_workspace_falls_back_outside_a_corpus(tmp_path: Path) -> None:
+    workspace, error = _chat_workspace(tmp_path)
+    assert error is not None
+    assert error.code == "config_error"
+    assert workspace.initialized is False
+    assert workspace.root == tmp_path.resolve()
+
+
+def test_reset_terminal_restores_mouse_and_alt_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = Tty()
+    monkeypatch.setattr("sys.stdout", stream)
+    _reset_terminal()
+    output = stream.getvalue()
+    assert "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" in output
+    assert "\x1b[?1049l" in output
+    assert "\x1b[?25h" in output
+
+
+def test_chat_workspace_prefers_an_initialized_corpus(workspace) -> None:
+    loaded, error = _chat_workspace(workspace.root)
+    assert error is None
+    assert loaded.initialized is True
+    assert loaded.root == workspace.root
 
 
 def test_study_list(workspace) -> None:
