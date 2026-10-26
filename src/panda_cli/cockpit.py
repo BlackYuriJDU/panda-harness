@@ -9,6 +9,7 @@ fixed timestep, and input stays available while the model streams.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -17,11 +18,13 @@ from typing import Any
 from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text
 from textual import events, work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Static
+from textual.worker import Worker
 
 from panda_cli import mascot
 from panda_cli.brand import PALETTE, spark_lines
@@ -40,6 +43,7 @@ AMBER = PALETTE["amber"]
 WHITE = PALETTE["white"]
 SHADOW = PALETTE["white.shadow"]
 INK = PALETTE["ink"]
+MOUSE_OFF = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
 
 HELP_TEXT = """Panda cockpit commands
 
@@ -56,7 +60,9 @@ HELP_TEXT = """Panda cockpit commands
 /quit                 close the session and exit
 !<argv>               run a command through policy and approval
 
-Enter sends. Input is never blocked by a running turn.
+panda init            initialize a corpus in the current directory
+Enter sends · Ctrl+C cancels the running turn · Ctrl+Q quits.
+Input is never blocked by a running turn.
 """
 
 
@@ -230,6 +236,7 @@ class PandaCockpit(App[None]):
     Screen {
         background: #141414;
         color: #F2F2F2;
+        overflow: hidden;
     }
     #header {
         height: 3;
@@ -237,6 +244,7 @@ class PandaCockpit(App[None]):
         padding: 0 1;
         content-align: left middle;
         color: #F2F2F2;
+        overflow: hidden;
     }
     #header.tight {
         height: 1;
@@ -245,17 +253,20 @@ class PandaCockpit(App[None]):
     }
     #body {
         height: 1fr;
+        overflow: hidden;
     }
     #transcript {
         width: 1fr;
         padding: 0 1;
         scrollbar-size: 1 1;
+        overflow-x: hidden;
     }
     #sidebar {
         width: 44;
         border-left: solid #2A2A2A;
         padding: 0 1;
         overflow-y: auto;
+        overflow-x: hidden;
     }
     #sidebar.compact {
         width: 20;
@@ -281,6 +292,7 @@ class PandaCockpit(App[None]):
         height: 1;
         color: #C9C9D9;
         padding: 0 1;
+        overflow: hidden;
     }
     ToolCard {
         border: round #2A2A2A;
@@ -310,6 +322,7 @@ class PandaCockpit(App[None]):
     """
 
     BINDINGS = [
+        Binding("ctrl+c", "cancel_turn", "Cancel", priority=True, show=False),
         ("ctrl+q", "quit_app", "Quit"),
         ("ctrl+l", "clear_transcript", "Clear"),
     ]
@@ -345,6 +358,7 @@ class PandaCockpit(App[None]):
         self._tool_cards: dict[str, ToolCard] = {}
         self._last_markdown = 0.0
         self._width = 140
+        self._turn_worker: Worker[Any] | None = None
     # ---- layout ----
     def compose(self) -> ComposeResult:
         yield Static(id="header")
@@ -389,17 +403,42 @@ class PandaCockpit(App[None]):
         text.append(f"\n{status.get('provider', 'opencode-go')} · {model}", style=GREEN_DIM)
         text.append("  ·  ", style=SHADOW)
         text.append(str(status.get("session_id", "")), style=SHADOW)
+        if not status.get("initialized", True):
+            text.append(
+                "\nworkspace not initialized · run `panda init` · writes follow the default policy",
+                style=AMBER,
+            )
+        if not status.get("validator_exists", True):
+            text.append(
+                f"\nvalidator missing: {status.get('validator', 'corpus/validation/validate.mjs')}"
+                " · /validate fails until it exists",
+                style=AMBER,
+            )
         text.append('\n"Evidence or it did not happen."  /help for commands', style=SHADOW)
         await self.query_one("#transcript", VerticalScroll).mount(
             Static(text, classes="block")
         )
 
     def on_resize(self, event: Any) -> None:
+        if not self.is_running:
+            return
         self._apply_breakpoint(event.size.width)
 
     def _apply_breakpoint(self, width: int) -> None:
+        """Re-apply the responsive layout, tolerating a resize during teardown.
+
+        A terminal resize arrives when the window is maximized or restored,
+        and may also arrive while the app is shutting down, when the screen
+        stack is empty and the chrome is already unmounted. Querying then
+        raises `ScreenStackError` / `NoMatches`; a renderer must not crash.
+        """
+        if not self.is_running:
+            return
         self._width = max(20, int(width))
-        screen = self.screen
+        try:
+            screen = self.screen
+        except ScreenStackError:
+            return
         wide = self._width >= 120
         medium = 100 <= self._width < 120
         narrow = 80 <= self._width < 100
@@ -407,16 +446,28 @@ class PandaCockpit(App[None]):
         screen.set_class(medium, "medium")
         screen.set_class(narrow, "narrow")
         screen.set_class(self._width < 80, "tiny")
-        sidebar = self.query_one("#sidebar", Vertical)
-        sidebar.display = self._width >= 100
-        sidebar.set_class(not wide, "compact")
-        self.query_one("#header", Static).set_class(self._width < 80, "tight")
-        self.query_one("#hints", Static).display = self._width >= 80
+        sidebar = self._chrome("#sidebar", Vertical)
+        if sidebar is not None:
+            sidebar.display = self._width >= 100
+            sidebar.set_class(not wide, "compact")
+        header = self._chrome("#header", Static)
+        if header is not None:
+            header.set_class(self._width < 80, "tight")
+        hints = self._chrome("#hints", Static)
+        if hints is not None:
+            hints.display = self._width >= 80
         self._refresh_header()
         self._refresh_sidebar()
         self._refresh_hints()
 
     # ---- chrome ----
+    def _chrome(self, selector: str, widget_type: type[Any]) -> Any | None:
+        """Query a chrome widget, returning None instead of raising after teardown."""
+        try:
+            return self.query_one(selector, widget_type)
+        except (NoMatches, ScreenStackError):
+            return None
+
     def _chrome_update(self, selector: str, renderable: Any) -> None:
         """Update a chrome widget, silently skipping it after teardown.
 
@@ -424,10 +475,9 @@ class PandaCockpit(App[None]):
         screen still exists but its children are already removed. Querying a
         gone widget raises `NoMatches`; a renderer must never crash on that.
         """
-        try:
-            self.query_one(selector, Static).update(renderable)
-        except NoMatches:
-            return
+        widget = self._chrome(selector, Static)
+        if widget is not None:
+            widget.update(renderable)
 
     def _refresh_header(self) -> None:
         status = self._status
@@ -457,15 +507,20 @@ class PandaCockpit(App[None]):
             line.append(validation_text, style=validation_style)
         state_style = GREEN if self._state not in {"blocked", "alert"} else AMBER
         line.append(f"  {icon} {self._state}", style=state_style)
+        line.truncate(max(8, self._width - 4), overflow="ellipsis")
         self._chrome_update("#header", line)
 
     def _refresh_hints(self) -> None:
         if self._width < 80:
             return
-        hint = "Enter send · /help commands · Ctrl+L clear · Ctrl+Q quit"
+        hint = (
+            "Enter send · /help commands · Ctrl+C cancel · Ctrl+L clear · Ctrl+Q quit"
+        )
         if self._busy:
-            hint = "streaming · input stays live · Ctrl+Q quit"
-        self._chrome_update("#hints", _dim(hint))
+            hint = "streaming · input stays live · Ctrl+C cancel · Ctrl+Q quit"
+        line = _dim(hint)
+        line.truncate(max(8, self._width - 4), overflow="ellipsis")
+        self._chrome_update("#hints", line)
 
     def _refresh_sidebar(self) -> None:
         if self.runtime is None:
@@ -531,7 +586,7 @@ class PandaCockpit(App[None]):
         return compact
     # ---- animation and events ----
     def _advance_frame(self) -> None:
-        if self._reduced_motion or not self._focused:
+        if not self.is_running or self._reduced_motion or not self._focused:
             return
         now = time.monotonic()
         elapsed = now - self._last_anim
@@ -643,10 +698,14 @@ class PandaCockpit(App[None]):
             self._set_state("success" if data.get("status") == "completed" else "blocked")
     # ---- input ----
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
+        self._handle_input(event.value)
+
+    def _handle_input(self, value: str) -> None:
+        text = value.strip()
         if not text:
             return
-        self.query_one("#composer", Input).value = ""
+        composer = self.query_one("#composer", Input)
+        composer.value = ""
         if text.startswith("/"):
             self._run_command(text)
             return
@@ -654,9 +713,9 @@ class PandaCockpit(App[None]):
             self._run_shell(text[1:].strip())
             return
         if self._busy:
-            self._notice("a turn is already running; wait for it to finish")
+            self._notice("a turn is already running; Ctrl+C cancels it")
             return
-        self._turn(text)
+        self._turn_worker = self._turn(text)
 
     async def _append_user(self, text: str) -> None:
         block = Text()
@@ -861,6 +920,19 @@ class PandaCockpit(App[None]):
         self._set_state("blocked" if result.blocked else "success")
 
     # ---- lifecycle ----
+    def action_cancel_turn(self) -> None:
+        """Ctrl+C cancels the running turn; it never exits the cockpit."""
+        worker = self._turn_worker
+        if worker is None or not worker.is_running:
+            self._notice("nothing to cancel · Ctrl+Q quits")
+            return
+        with contextlib.suppress(Exception):
+            if isinstance(self.screen, ApprovalScreen):
+                self.screen.dismiss(False)
+        worker.cancel()
+        self._set_state("blocked")
+        self._notice("cancelling…")
+
     async def action_clear_transcript(self) -> None:
         transcript = self.query_one("#transcript", VerticalScroll)
         await transcript.remove_children()
@@ -878,6 +950,16 @@ class PandaCockpit(App[None]):
     def on_unmount(self) -> None:
         if self.runtime is not None:
             self.runtime.close("completed")
+        # Safety net: a crash can skip the driver's own restore, leaving the
+        # terminal in the alt screen with mouse tracking enabled.
+        driver = getattr(self, "_driver", None)
+        if driver is None:
+            return
+        with contextlib.suppress(Exception):
+            driver.write(MOUSE_OFF)
+            driver.flush()
+        with contextlib.suppress(Exception):
+            driver.stop_application_mode()
 
 
 __all__ = ["ApprovalScreen", "PandaCockpit", "ToolCard", "ValidationPanel"]
