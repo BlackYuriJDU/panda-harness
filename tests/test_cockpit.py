@@ -9,7 +9,7 @@ import pytest
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static
 
-from panda_cli.cockpit import ApprovalScreen, PandaCockpit
+from panda_cli.cockpit import ApprovalScreen, PandaCockpit, ToolCard, ValidationPanel
 from panda_core.tools import ApprovalRequest
 from panda_core.workspace import Workspace
 
@@ -294,3 +294,41 @@ def test_terminal_reset_disables_mouse_and_leaves_alt_screen(monkeypatch) -> Non
     assert "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" in output
     assert "\x1b[?1049l" in output
     assert "\x1b[?25h" in output
+
+
+def test_tool_card_and_validation_panel_render_without_textual_errors(workspace) -> None:
+    """Regression: overriding Widget._render fed a bare Text into Textual's layout.
+
+    Textual calls get_height() on the render result, so the override killed the
+    app right after the first tool card with AttributeError: 'Text' object has
+    no attribute 'get_height'.
+    """
+
+    async def scenario() -> None:
+        app = PandaCockpit(workspace)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            transcript = app.query_one("#transcript", VerticalScroll)
+            card = ToolCard("workspace_info", "{}")
+            await transcript.mount(card)
+            card.finish(ok=True, blocked=False, detail="2 files")
+            panel = ValidationPanel(
+                {
+                    "ok": False,
+                    "summary": {"passed": 3, "failed": 1, "skipped": 0},
+                    "checks": [
+                        {"name": "ruff", "ok": False, "errors": ["E501 line too long"]},
+                        {"name": "pytest", "ok": True},
+                    ],
+                }
+            )
+            await transcript.mount(panel)
+            await pilot.pause()
+            await pilot.pause()
+            assert card in transcript.children
+            assert panel in transcript.children
+            assert card.size.height > 0
+            assert panel.size.height > 0
+            assert app.is_running is True
+
+    asyncio.run(scenario())

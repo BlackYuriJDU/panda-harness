@@ -92,9 +92,9 @@ class ToolCard(Static):
         self.arguments = arguments
         self.state = "running"
         self.detail = ""
-        super().__init__(self._render(), classes="block")
+        super().__init__(self._build_text(), classes="block")
 
-    def _render(self) -> Text:
+    def _build_text(self) -> Text:
         icon, style = {
             "running": ("▸", SHADOW),
             "ok": ("✓", GREEN),
@@ -116,18 +116,18 @@ class ToolCard(Static):
         for name in ("ok", "blocked", "failed"):
             self.remove_class(name)
         self.add_class(self.state)
-        self.update(self._render())
+        self.update(self._build_text())
 
 
 class ValidationPanel(Static):
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
-        super().__init__(self._render(payload), classes="block")
+        super().__init__(self._build_text(payload), classes="block")
         if not payload.get("ok"):
             self.add_class("failed")
 
     @staticmethod
-    def _render(payload: dict[str, Any]) -> Text:
+    def _build_text(payload: dict[str, Any]) -> Text:
         summary = payload.get("summary", {})
         ok = bool(payload.get("ok"))
         line = Text()
