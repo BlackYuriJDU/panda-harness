@@ -12,7 +12,10 @@ import asyncio
 import contextlib
 import json
 import os
+import tempfile
 import time
+import traceback
+from pathlib import Path
 from typing import Any
 
 from rich.markdown import Markdown as RichMarkdown
@@ -359,6 +362,10 @@ class PandaCockpit(App[None]):
         self._last_markdown = 0.0
         self._width = 140
         self._turn_worker: Worker[Any] | None = None
+        self.crash_log: Path | None = None
+        self._reporting = False
+        self._status_failed = False
+
     # ---- layout ----
     def compose(self) -> ComposeResult:
         yield Static(id="header")
@@ -371,28 +378,66 @@ class PandaCockpit(App[None]):
         yield Static(id="hints")
 
     async def on_mount(self) -> None:
-        self.runtime = ChatRuntime(
-            self.workspace,
-            model=self.model_override,
-            max_steps=self.max_steps,
-            private=self.private,
-            auto=self.auto,
-            session=self.session,
-            approver=self._approve,
-            on_event=self._on_agent_event,
-            label="cockpit",
+        self._open_runtime()
+        try:
+            self._apply_breakpoint(self.size.width)
+            self._refresh_header()
+            self._refresh_sidebar()
+            self._refresh_hints()
+            self.set_interval(1 / mascot.ANIMATION_FPS, self._advance_frame)
+            self.set_interval(2.0, self._poll_status)
+            self.query_one("#composer", Input).focus()
+            if self.runtime is not None:
+                await self._welcome()
+        except Exception as exc:
+            self._report_exception(exc, "mount")
+
+    def _open_runtime(self) -> None:
+        # Build the runtime, or keep the cockpit open with a setup panel.
+        try:
+            self.runtime = ChatRuntime(
+                self.workspace,
+                model=self.model_override,
+                max_steps=self.max_steps,
+                private=self.private,
+                auto=self.auto,
+                session=self.session,
+                approver=self._approve,
+                on_event=self._on_agent_event,
+                label="cockpit",
+            )
+        except Exception as exc:
+            self.runtime = None
+            self._report_exception(exc, "setup")
+            self._mount_setup_error(exc)
+            return
+        try:
+            self._status = self.runtime.status()
+        except Exception as exc:
+            self._report_exception(exc, "setup")
+
+    def _mount_setup_error(self, exc: BaseException) -> None:
+        block = Text()
+        block.append("SETUP ERROR ", style=f"bold {AMBER}")
+        block.append(f"{type(exc).__name__}: {_short(str(exc), 160)}", style=WHITE)
+        block.append(
+            "\n  the cockpit stays open without a runtime; fix the error and restart",
+            style=SHADOW,
         )
-        self._status = self.runtime.status()
-        self._apply_breakpoint(self.size.width)
-        self._refresh_header()
-        self._refresh_sidebar()
-        self._refresh_hints()
-        self.set_interval(1 / mascot.ANIMATION_FPS, self._advance_frame)
-        self.set_interval(2.0, self._poll_status)
-        self.query_one("#composer", Input).focus()
-        await self._welcome()
+        block.append(
+            "\n  log: " + (str(self.crash_log) if self.crash_log else "-"),
+            style=SHADOW,
+        )
+        with contextlib.suppress(Exception):
+            self._mount_widget(Static(block, classes="block"))
 
     async def _welcome(self) -> None:
+        try:
+            await self._write_welcome()
+        except Exception as exc:
+            self._report_exception(exc, "welcome")
+
+    async def _write_welcome(self) -> None:
         status = self._status
         model = str(status.get("model", "")).split("/", 1)[-1]
         text = Text()
@@ -422,7 +467,10 @@ class PandaCockpit(App[None]):
     def on_resize(self, event: Any) -> None:
         if not self.is_running:
             return
-        self._apply_breakpoint(event.size.width)
+        try:
+            self._apply_breakpoint(event.size.width)
+        except Exception as exc:
+            self._report_exception(exc, "resize")
 
     def _apply_breakpoint(self, width: int) -> None:
         """Re-apply the responsive layout, tolerating a resize during teardown.
@@ -588,28 +636,44 @@ class PandaCockpit(App[None]):
     def _advance_frame(self) -> None:
         if not self.is_running or self._reduced_motion or not self._focused:
             return
-        now = time.monotonic()
-        elapsed = now - self._last_anim
-        steps = int(elapsed * mascot.ANIMATION_FPS)
-        if steps <= 0:
-            return
-        steps = min(steps, 4)
-        self._tick = (self._tick + steps) % 1_000_000
-        self._last_anim += steps / mascot.ANIMATION_FPS
-        self._refresh_sidebar()
+        try:
+            now = time.monotonic()
+            elapsed = now - self._last_anim
+            steps = int(elapsed * mascot.ANIMATION_FPS)
+            if steps <= 0:
+                return
+            steps = min(steps, 4)
+            self._tick = (self._tick + steps) % 1_000_000
+            self._last_anim += steps / mascot.ANIMATION_FPS
+            self._refresh_sidebar()
+        except Exception as exc:
+            self._report_exception(exc, "animation")
 
     def _poll_status(self) -> None:
         # The 2s timer may fire while the app is tearing down.
         if not self.is_running or self.runtime is None:
             return
-        self._status = self.runtime.status()
-        self._refresh_header()
-        self._refresh_sidebar()
+        try:
+            self._status = self.runtime.status()
+        except Exception as exc:
+            if not self._status_failed:
+                self._status_failed = True
+                self._report_exception(exc, "status")
+            return
+        self._status_failed = False
+        try:
+            self._refresh_header()
+            self._refresh_sidebar()
+        except Exception as exc:
+            self._report_exception(exc, "status")
 
     def on_app_blur(self, event: events.AppBlur) -> None:
-        self._focused = False
-        self._rest_state = self._state
-        self._set_state("sleeping")
+        try:
+            self._focused = False
+            self._rest_state = self._state
+            self._set_state("sleeping")
+        except Exception as exc:
+            self._report_exception(exc, "blur")
 
     def on_app_focus(self, event: events.AppFocus) -> None:
         self._focused = True
@@ -625,9 +689,13 @@ class PandaCockpit(App[None]):
 
     def _mount_widget(self, widget: Any) -> None:
         async def _mount() -> None:
-            transcript = self.query_one("#transcript", VerticalScroll)
-            await transcript.mount(widget)
-            transcript.scroll_end(animate=False)
+            try:
+                transcript = self.query_one("#transcript", VerticalScroll)
+                await transcript.mount(widget)
+                transcript.scroll_end(animate=False)
+            except Exception as exc:
+                # Log only: mounting a notice here would retry the same failure.
+                self._report_exception(exc, "mount", notify=False)
 
         self.run_worker(_mount(), group="ui", exit_on_error=False)
 
@@ -637,12 +705,64 @@ class PandaCockpit(App[None]):
         block.append(text, style=SHADOW)
         self._mount_widget(Static(block, classes="block"))
 
-    async def _approve(self, request: ApprovalRequest) -> bool:
-        self._set_state("verifying")
+    # ---- crash containment ----
+    def _log_targets(self) -> list[Path]:
+        temp = os.environ.get("TEMP") or os.environ.get("TMP") or tempfile.gettempdir()
+        return [
+            self.workspace.config_dir / "logs" / "cockpit.log",
+            Path(temp) / "panda-cockpit.log",
+        ]
+
+    def _write_crash_log(self, exc: BaseException, where: str) -> Path | None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        entry = f"[{stamp}] {where}: {type(exc).__name__}: {exc}\n{body}\n"
+        for path in self._log_targets():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(entry)
+            except OSError:
+                continue
+            return path
+        return None
+
+    def _report_exception(
+        self, exc: BaseException, where: str, *, notify: bool = True
+    ) -> Path | None:
+        # Log a UI failure and keep the cockpit alive: never re-raise from here.
+        if self._reporting:
+            return self.crash_log
+        self._reporting = True
         try:
-            return bool(await self.push_screen_wait(ApprovalScreen(request)))
+            with contextlib.suppress(Exception):
+                self._set_state("alert")
+            try:
+                path = self._write_crash_log(exc, where)
+            except Exception:
+                path = None
+            if path is not None:
+                self.crash_log = path
+            if notify:
+                message = f"{where}: {type(exc).__name__}: {_short(str(exc), 120)}"
+                message += " (logged)" if path is not None else " (log unavailable)"
+                with contextlib.suppress(Exception):
+                    self._notice(message)
+            return path
         finally:
-            self._set_state("working" if self._busy else "idle")
+            self._reporting = False
+
+    async def _approve(self, request: ApprovalRequest) -> bool:
+        try:
+            self._set_state("verifying")
+            try:
+                return bool(await self.push_screen_wait(ApprovalScreen(request)))
+            finally:
+                self._set_state("working" if self._busy else "idle")
+        except Exception as exc:
+            # Fail closed: an approval that cannot be shown denies the action.
+            self._report_exception(exc, "approval")
+            return False
 
     def _on_agent_event(self, event: Any) -> None:
         kind = event.kind
@@ -701,11 +821,20 @@ class PandaCockpit(App[None]):
         self._handle_input(event.value)
 
     def _handle_input(self, value: str) -> None:
+        try:
+            self._submit_input(value)
+        except Exception as exc:
+            self._report_exception(exc, "input")
+
+    def _submit_input(self, value: str) -> None:
         text = value.strip()
         if not text:
             return
         composer = self.query_one("#composer", Input)
         composer.value = ""
+        if self.runtime is None:
+            self._notice("runtime unavailable; restart panda to build it")
+            return
         if text.startswith("/"):
             self._run_command(text)
             return
@@ -734,8 +863,24 @@ class PandaCockpit(App[None]):
         else:
             self._assistant_widget.remove()
 
-    @work(exclusive=True, group="turn")
+    @work(exclusive=True, group="turn", exit_on_error=False)
     async def _turn(self, text: str) -> None:
+        try:
+            await self._run_turn(text)
+        except asyncio.CancelledError:
+            self._set_state("blocked")
+            self._notice("turn cancelled")
+            raise
+        except PandaError as exc:
+            self._set_state("alert")
+            self._notice(f"{exc.code}: {exc.message}")
+        except Exception as exc:
+            self._report_exception(exc, "turn")
+        finally:
+            self._busy = False
+            self._refresh_after_turn()
+
+    async def _run_turn(self, text: str) -> None:
         if self.runtime is None:
             return
         self._busy = True
@@ -746,29 +891,34 @@ class PandaCockpit(App[None]):
         self._last_markdown = 0.0
         self._assistant_widget = Static(RichMarkdown("…"), classes="block")
         await self.query_one("#transcript", VerticalScroll).mount(self._assistant_widget)
-        try:
-            result = await self.runtime.ask(text)
-            self._finalize_assistant()
-            self._set_state("success" if result.status == "completed" else "blocked")
-            if result.status == "max_steps":
-                self._notice("max steps reached; the turn stopped without a final answer")
-        except asyncio.CancelledError:
-            self._set_state("blocked")
-            self._notice("turn cancelled")
-            raise
-        except PandaError as exc:
-            self._set_state("alert")
-            self._notice(f"{exc.code}: {exc.message}")
-        finally:
-            self._busy = False
-            self._status = self.runtime.status()
-            self._refresh_header()
-            self._refresh_sidebar()
-            self._refresh_hints()
+        result = await self.runtime.ask(text)
+        self._finalize_assistant()
+        self._set_state("success" if result.status == "completed" else "blocked")
+        if result.status == "max_steps":
+            self._notice("max steps reached; the turn stopped without a final answer")
+
+    def _refresh_after_turn(self) -> None:
+        # Refresh after a turn; a failing status or refresh must not exit.
+        if self.runtime is not None:
+            try:
+                self._status = self.runtime.status()
+            except Exception as exc:
+                self._report_exception(exc, "status")
+        for refresh in (self._refresh_header, self._refresh_sidebar, self._refresh_hints):
+            try:
+                refresh()
+            except Exception as exc:
+                self._report_exception(exc, "refresh")
 
     # ---- commands ----
-    @work(exclusive=False, group="command")
+    @work(exclusive=False, group="command", exit_on_error=False)
     async def _run_command(self, text: str) -> None:
+        try:
+            await self._dispatch_command(text)
+        except Exception as exc:
+            self._report_exception(exc, "command")
+
+    async def _dispatch_command(self, text: str) -> None:
         if self.runtime is None:
             return
         parts = text.split()
@@ -896,8 +1046,14 @@ class PandaCockpit(App[None]):
             return
         self._notice("unknown command; try /help")
 
-    @work(exclusive=False, group="shell")
+    @work(exclusive=False, group="shell", exit_on_error=False)
     async def _run_shell(self, text: str) -> None:
+        try:
+            await self._dispatch_shell(text)
+        except Exception as exc:
+            self._report_exception(exc, "shell")
+
+    async def _dispatch_shell(self, text: str) -> None:
         if self.runtime is None:
             return
         from panda_core.process import split_command
@@ -949,7 +1105,8 @@ class PandaCockpit(App[None]):
 
     def on_unmount(self) -> None:
         if self.runtime is not None:
-            self.runtime.close("completed")
+            with contextlib.suppress(Exception):
+                self.runtime.close("completed")
         # Safety net: a crash can skip the driver's own restore, leaving the
         # terminal in the alt screen with mouse tracking enabled.
         driver = getattr(self, "_driver", None)

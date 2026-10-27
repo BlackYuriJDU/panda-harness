@@ -16,6 +16,8 @@ import typer
 
 from panda_cli import render
 from panda_cli.runtime import ChatRuntime
+from panda_cli.terminal import reset_terminal as _reset_terminal
+from panda_cli.terminal import snapshot_console_mode
 from panda_core.agent import DEFAULT_MAX_STEPS
 from panda_core.config import accepted_providers, canonical_model, split_model
 from panda_core.doctor import run_doctor
@@ -78,23 +80,9 @@ def _load_workspace(root: Path | None, *, require_init: bool = False) -> Workspa
     return Workspace.load(_root_value(root), require_init=require_init)
 
 
-# Restore the terminal even when Textual's own teardown is skipped by a crash:
-# mouse tracking off, leave the alt screen, show the cursor.
-TERMINAL_RESET = (
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
-    "\x1b[?1049l"
-    "\x1b[?25h"
-)
-
-
-def _reset_terminal() -> None:
-    if not sys.stdout.isatty():
-        return
-    try:
-        sys.stdout.write(TERMINAL_RESET)
-        sys.stdout.flush()
-    except (OSError, ValueError):
-        pass
+def _mouse_enabled() -> bool:
+    # Mouse reporting is opt-in: a stray SGR report types into the shell.
+    return os.environ.get("PANDA_MOUSE", "").strip() == "1"
 
 
 def _chat_workspace(root: Path | None) -> tuple[Workspace, ConfigError | None]:
@@ -591,10 +579,17 @@ def _start_chat(
         private=private,
         auto=auto,
     )
+    console_mode = snapshot_console_mode()
     try:
-        cockpit.run()
+        cockpit.run(mouse=_mouse_enabled())
     finally:
-        _reset_terminal()
+        _reset_terminal(console_mode)
+        if cockpit.crash_log is not None:
+            with contextlib.suppress(OSError, ValueError):
+                print(
+                    f"panda: cockpit error logged to {cockpit.crash_log}",
+                    file=sys.stderr,
+                )
 
 
 @app.command("models")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from textual.containers import VerticalScroll
@@ -117,6 +118,16 @@ def transcript_text(app: PandaCockpit) -> str:
     )
 
 
+async def wait_for(pilot, predicate, timeout: float = 10.0) -> None:
+    # Wait for a UI condition; workers finish off the message-pump clock.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await pilot.pause(0.02)
+    raise AssertionError("condition not reached before the timeout")
+
+
 def test_fullscreen_resize_keeps_chrome_inside_the_viewport(workspace) -> None:
     """Regression: maximizing must not raise NoMatches nor overflow the header."""
 
@@ -196,3 +207,90 @@ def test_cockpit_boots_outside_an_initialized_workspace(tmp_path) -> None:
 
     asyncio.run(scenario())
 
+
+def test_turn_failure_is_contained_and_logged(workspace) -> None:
+    """A runtime crash must not exit: state alert, notice, traceback on disk."""
+
+    async def scenario() -> None:
+        app = PandaCockpit(workspace)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+
+            async def boom(_text: str) -> None:
+                raise RuntimeError("provider exploded")
+
+            assert app.runtime is not None
+            app.runtime.ask = boom
+            app._handle_input("hello")
+            await wait_for(pilot, lambda: app._state == "alert" and not app._busy)
+            await wait_for(pilot, lambda: "(logged)" in transcript_text(app))
+
+            assert app.is_running is True
+            assert app._busy is False
+            assert app._state == "alert"
+            assert app.crash_log is not None
+            text = transcript_text(app)
+            assert "turn: RuntimeError" in text
+            assert "(logged)" in text
+
+        log = workspace.config_dir / "logs" / "cockpit.log"
+        body = log.read_text(encoding="utf-8")
+        assert "RuntimeError: provider exploded" in body
+        assert "Traceback (most recent call last)" in body
+
+    asyncio.run(scenario())
+
+
+def test_status_failure_does_not_kill_the_app(workspace) -> None:
+    """The 2s status poll must absorb a failing runtime.status()."""
+
+    async def scenario() -> None:
+        app = PandaCockpit(workspace)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            assert app.runtime is not None
+
+            def boom() -> dict:
+                raise RuntimeError("status exploded")
+
+            app.runtime.status = boom
+            app._poll_status()
+            app._poll_status()  # a second tick must not crash or spam
+            await wait_for(pilot, lambda: "status: RuntimeError" in transcript_text(app))
+
+            assert app.is_running is True
+            assert app._state == "alert"
+            assert app.crash_log is not None
+            assert "status: RuntimeError" in transcript_text(app)
+
+    asyncio.run(scenario())
+
+
+def test_mouse_is_opt_in(monkeypatch) -> None:
+    from panda_cli.main import _mouse_enabled
+
+    monkeypatch.delenv("PANDA_MOUSE", raising=False)
+    assert _mouse_enabled() is False
+    monkeypatch.setenv("PANDA_MOUSE", "1")
+    assert _mouse_enabled() is True
+    monkeypatch.setenv("PANDA_MOUSE", "0")
+    assert _mouse_enabled() is False
+
+
+def test_terminal_reset_disables_mouse_and_leaves_alt_screen(monkeypatch) -> None:
+    import io
+
+    from panda_cli import terminal
+
+    class Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    stream = Tty()
+    monkeypatch.setattr("sys.stdout", stream)
+    monkeypatch.setattr(terminal, "_kernel32", lambda: None)
+    terminal.reset_terminal()
+    output = stream.getvalue()
+    assert "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l" in output
+    assert "\x1b[?1049l" in output
+    assert "\x1b[?25h" in output
