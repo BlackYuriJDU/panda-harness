@@ -35,7 +35,7 @@ from panda_core.registry import find_study, load_registry, load_study_card
 from panda_core.session import SessionLog, list_sessions
 from panda_core.validator import Validator
 from panda_core.version import __version__
-from panda_core.workspace import Workspace
+from panda_core.workspace import Workspace, resolve_chat_workspace
 
 app = typer.Typer(
     add_completion=False,
@@ -66,6 +66,13 @@ def handle[F: Callable[..., Any]](fn: F) -> F:
         except PandaError as exc:
             render.print_error(exc)
             raise typer.Exit(exc.exit_code) from None
+        except OSError as exc:
+            error = PandaError(
+                f"filesystem error: {exc}",
+                hint="use a writable workspace with --root, or set PANDA_HOME",
+            )
+            render.print_error(error)
+            raise typer.Exit(error.exit_code) from None
         except KeyboardInterrupt:
             raise typer.Exit(130) from None
 
@@ -88,14 +95,11 @@ def _mouse_enabled() -> bool:
 def _chat_workspace(root: Path | None) -> tuple[Workspace, ConfigError | None]:
     """Resolve the chat workspace, falling back when the root is not initialized.
 
-    `panda` is a global command: outside a corpus it still opens the cockpit,
-    with a notice and the default policy, instead of exiting. Only the normal
-    session directory is written on startup.
+    Delegates to `resolve_chat_workspace`: an unwritable cwd uses the Panda home
+    workspace instead of failing on startup. Only the session directory of the
+    resolved workspace is written.
     """
-    try:
-        return _load_workspace(root, require_init=True), None
-    except ConfigError as exc:
-        return Workspace.from_root(_root_value(root)), exc
+    return resolve_chat_workspace(root)
 
 
 def _session_metadata(workspace: Workspace) -> dict[str, Any]:
@@ -155,6 +159,7 @@ def _close_quietly(session: SessionLog, status: str, data: dict[str, Any] | None
 
 
 @app.callback(invoke_without_command=True)
+@handle
 def _main(
     ctx: typer.Context,
     version: bool = typer.Option(

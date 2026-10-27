@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import platform
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +48,43 @@ def find_workspace_root(start: Path | None = None) -> Path | None:
         if (candidate / DEFAULT_VALIDATOR).is_file():
             return candidate
     return None
+
+
+PANDA_HOME_ENV = "PANDA_HOME"
+HOME_DIR = "panda"
+
+
+def home_workspace_path() -> Path:
+    """Return the user-level workspace used when the cwd is not writable."""
+
+    override = os.environ.get(PANDA_HOME_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA", "").strip()
+        if base:
+            return Path(base) / HOME_DIR / "home"
+        return Path.home() / CONFIG_DIR / "home"
+    data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    if data_home:
+        return Path(data_home) / HOME_DIR / "home"
+    return Path.home() / ".local" / "share" / HOME_DIR / "home"
+
+
+def is_writable_dir(path: Path) -> bool:
+    """Probe real writability by creating and removing a temp file."""
+
+    try:
+        if not path.is_dir():
+            return False
+        descriptor, name = tempfile.mkstemp(prefix=".panda-write-probe-", dir=path)
+    except OSError:
+        return False
+    with contextlib.suppress(OSError):
+        os.close(descriptor)
+    with contextlib.suppress(OSError):
+        os.unlink(name)
+    return True
 
 
 @dataclass(frozen=True)
@@ -132,8 +172,17 @@ class Workspace:
         return self.root / self.config.opencode.config_path
 
     def ensure_runtime_dirs(self) -> None:
-        self.config_dir.mkdir(parents=True, exist_ok=True)
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ConfigError(
+                f"cannot create the runtime directories under {self.root}",
+                hint=(
+                    "use a writable workspace with --root, or set PANDA_HOME "
+                    "to a writable directory"
+                ),
+            ) from exc
 
     def relative_resource(self, value: str | Path) -> str:
         """Normalize a path to the workspace-relative form used by policy rules.
@@ -216,3 +265,78 @@ class Workspace:
             "git": self.git_state(),
             "tools": self.tool_versions(),
         }
+
+
+def resolve_chat_workspace(root: Path | None = None) -> tuple[Workspace, ConfigError | None]:
+    """Resolve the chat workspace without writing to an unwritable cwd.
+
+    `panda` is a global command: outside a corpus it still opens the cockpit,
+    with a notice and the default policy, instead of exiting. When the current
+    directory is not writable the user-level home workspace is used (and
+    initialized on first use), so startup never fails on `PermissionError`.
+    """
+
+    if root is not None:
+        return _resolve_explicit_root(root)
+
+    cwd = Path.cwd().resolve()
+    if find_workspace_root(cwd) is not None:
+        try:
+            return Workspace.load(cwd, require_init=True), None
+        except ConfigError as exc:
+            return Workspace.from_root(cwd), exc
+
+    if is_writable_dir(cwd):
+        return Workspace.from_root(cwd), ConfigError(
+            "no Panda workspace found",
+            hint="run `panda init` in the corpus root, or pass --root",
+        )
+
+    return _home_chat_workspace()
+
+
+def _resolve_explicit_root(root: Path) -> tuple[Workspace, ConfigError | None]:
+    resolved = root.resolve()
+    if not resolved.is_dir():
+        raise ConfigError(
+            f"workspace root does not exist or is not a directory: {resolved}",
+            hint="pass --root pointing at a corpus root or an initialized workspace",
+        )
+    if not is_writable_dir(resolved):
+        raise ConfigError(
+            f"workspace root is not writable: {resolved}",
+            hint="pass --root with a writable directory, or set PANDA_HOME",
+        )
+    try:
+        return Workspace.load(resolved, require_init=True), None
+    except ConfigError as exc:
+        return Workspace.from_root(resolved), exc
+
+
+def _home_chat_workspace() -> tuple[Workspace, ConfigError | None]:
+    from panda_core.init import initialize_workspace
+
+    home = home_workspace_path()
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigError(
+            f"cannot create the Panda home workspace: {home}",
+            hint="set PANDA_HOME to a writable directory, or pass --root",
+        ) from exc
+    if not is_writable_dir(home):
+        raise ConfigError(
+            f"the Panda home workspace is not writable: {home}",
+            hint="set PANDA_HOME to a writable directory, or pass --root",
+        )
+    if not (home / CONFIG_DIR / CONFIG_FILE).is_file():
+        try:
+            initialize_workspace(home, allow_missing_validator=True, opencode=False)
+        except ConfigError:
+            raise
+        except OSError as exc:
+            raise ConfigError(
+                f"cannot initialize the Panda home workspace: {home}",
+                hint="set PANDA_HOME to a writable directory, or pass --root",
+            ) from exc
+    return Workspace.from_root(home, require_init=True), None
