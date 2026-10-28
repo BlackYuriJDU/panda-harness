@@ -100,3 +100,45 @@ def test_console_script_survives_shadowing_cwd(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == f"panda {__version__}"
     assert "Traceback" not in result.stderr
+
+
+class _FakeTty:
+    def __init__(self, tty: bool = True) -> None:
+        self.text = ""
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+    def write(self, value: str) -> None:
+        self.text += value
+
+    def flush(self) -> None:
+        pass
+
+
+def test_boot_banner_for_a_bare_invocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeTty()
+    monkeypatch.setattr(sys, "stderr", fake)
+
+    entry._announce_boot([])
+
+    assert fake.text == f"panda {__version__} · loading cockpit…\n"
+
+
+def test_boot_banner_is_silent_for_subcommands(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeTty()
+    monkeypatch.setattr(sys, "stderr", fake)
+
+    entry._announce_boot(["models"])
+
+    assert fake.text == ""
+
+
+def test_boot_banner_is_silent_without_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeTty(tty=False)
+    monkeypatch.setattr(sys, "stderr", fake)
+
+    entry._announce_boot([])
+
+    assert fake.text == ""

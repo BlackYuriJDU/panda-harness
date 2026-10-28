@@ -66,6 +66,16 @@ Body text with a citation at `corpus/studies/gse160208.md:12`.
 """
 
 
+@pytest.fixture(autouse=True)
+def isolated_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Never read the developer's real credential store or ambient key."""
+
+    path = tmp_path / "credentials.json"
+    monkeypatch.setenv("PANDA_CREDENTIALS_FILE", str(path))
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+    return path
+
+
 @pytest.fixture()
 def fake_corpus(tmp_path: Path) -> Path:
     root = tmp_path / "corpus-root"

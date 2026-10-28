@@ -62,6 +62,26 @@ def _wants_version(argv: Sequence[str]) -> bool:
     return any(argument in _VERSION_FLAGS for argument in argv)
 
 
+def _announce_boot(argv: Sequence[str]) -> None:
+    """Print one line before the heavy imports so the console is never blank.
+
+    Only the bare `panda` invocation: subcommands may emit JSON or line output.
+    stderr keeps stdout clean and is replaced when Textual takes the screen.
+    """
+
+    if argv:
+        return
+    try:
+        if not sys.stderr.isatty():
+            return
+    except (AttributeError, ValueError):
+        return
+    from panda_core.version import __version__
+
+    sys.stderr.write(f"panda {__version__} · loading cockpit…\n")
+    sys.stderr.flush()
+
+
 def main() -> None:
     _sanitize_sys_path()
 
@@ -70,6 +90,8 @@ def main() -> None:
 
         sys.stdout.write(f"panda {__version__}\n")
         raise SystemExit(0)
+
+    _announce_boot(sys.argv[1:])
 
     from panda_cli.main import main as cli_main
 

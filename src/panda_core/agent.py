@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from panda_core.errors import PandaError, ProviderError
+from panda_core.limits import DEFAULT_MAX_STEPS
 from panda_core.provider import (
     DoneEvent,
     OpenCodeProvider,
@@ -31,7 +32,6 @@ from panda_core.session import SessionLog
 from panda_core.tools import ApprovalRequest, ToolRegistry, ToolResult
 from panda_core.workspace import Workspace
 
-DEFAULT_MAX_STEPS = 24
 DEFAULT_SYSTEM_CHARS = 24_000
 LOG_STRING_LIMIT = 8_000
 LOG_LIST_LIMIT = 200

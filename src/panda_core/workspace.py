@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import platform
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from panda_core.atomic import atomic_write_json
 from panda_core.config import (
     DEFAULT_POLICY,
     DEFAULT_SESSIONS,
@@ -236,51 +239,66 @@ class Workspace:
         if not git_dir.exists():
             return {"repo": False}
         try:
-            commit = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
+            # One subprocess instead of three: `--branch` carries oid and head.
+            result = subprocess.run(
+                ["git", "status", "--porcelain=v2", "--branch"],
                 cwd=self.root,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=5,
-                check=False,
-            )
-            branch = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=self.root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-                check=False,
-            )
-            status = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=self.root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
+                timeout=1.5,
                 check=False,
             )
         except (OSError, subprocess.SubprocessError):
             return {"repo": True, "commit": None, "branch": None, "dirty": None}
-        return {
-            "repo": True,
-            "commit": commit.stdout.strip() or None,
-            "branch": branch.stdout.strip() or None,
-            "dirty": bool(status.stdout.strip()),
-        }
+        commit: str | None = None
+        branch: str | None = None
+        dirty = False
+        for line in result.stdout.splitlines():
+            if line.startswith("# branch.oid "):
+                value = line[len("# branch.oid ") :].strip()
+                commit = None if value in {"(initial)", "(unknown)"} else value
+            elif line.startswith("# branch.head "):
+                value = line[len("# branch.head ") :].strip()
+                branch = None if value == "(detached)" else value
+            elif line and not line.startswith("#"):
+                dirty = True
+        return {"repo": True, "commit": commit, "branch": branch, "dirty": dirty}
 
     def tool_versions(self) -> dict:
         return {
             "python": platform.python_version(),
             "platform": platform.platform(),
-            "node": command_version(self.config.node),
+            "node": self._cached_node_version(),
         }
+
+    def _cached_node_version(self) -> str | None:
+        """Avoid spawning node on every boot; refresh at most once a week."""
+
+        command = self.config.node
+        cache_path = home_workspace_path().parent / "cache" / "tool-versions.json"
+        now = int(time.time())
+        try:
+            raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        entry = raw.get("node") if isinstance(raw, dict) else None
+        if (
+            isinstance(entry, dict)
+            and entry.get("command") == command
+            and isinstance(entry.get("checked_at"), int)
+            and 0 <= now - entry["checked_at"] < 7 * 24 * 3600
+        ):
+            version = entry.get("version")
+            return version if isinstance(version, str) else None
+        version = command_version(command, timeout=1.5)
+        with contextlib.suppress(OSError):
+            atomic_write_json(
+                cache_path,
+                {"node": {"command": command, "version": version, "checked_at": now}},
+            )
+        return version
 
     def describe(self) -> dict:
         return {

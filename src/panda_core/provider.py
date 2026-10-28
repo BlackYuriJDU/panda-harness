@@ -10,8 +10,9 @@ Go also requires two non-generic headers on every request: a stable
 `x-opencode-session` id per conversation and a `panda-harness/<version>`
 User-Agent. Without them the endpoint answers 400 `MissingSessionID`.
 
-No secret ever appears in an error message. The API key is read from the
-environment by name and only used in the Authorization header.
+No secret ever appears in an error message. The API key comes from the
+environment or the user-scoped credential store (never the workspace) and is
+only used in the Authorization header.
 """
 
 from __future__ import annotations
@@ -34,16 +35,22 @@ from panda_core.config import (
     accepted_providers,
     split_model,
 )
+from panda_core.credentials import get_api_key
 from panda_core.errors import ConfigError, ProviderError
+from panda_core.protocols import (
+    PROTOCOL_ANTHROPIC,
+    PROTOCOL_GOOGLE,
+    PROTOCOL_OPENAI_CHAT,
+    PROTOCOL_RESPONSES,
+    SUPPORTED_PROTOCOLS,
+    classify_protocol,
+    is_free_model,
+    is_supported_model,
+    model_protocol,
+)
 from panda_core.redact import redact_text
 from panda_core.version import __version__
 
-PROTOCOL_OPENAI_CHAT = "openai-chat"
-PROTOCOL_ANTHROPIC = "anthropic"
-PROTOCOL_RESPONSES = "responses"
-PROTOCOL_GOOGLE = "google"
-SUPPORTED_PROTOCOLS = frozenset({PROTOCOL_OPENAI_CHAT, PROTOCOL_ANTHROPIC})
-FREE_SUFFIX = "-free"
 ANTHROPIC_VERSION = "2023-06-01"
 USER_AGENT = f"panda-harness/{__version__}"
 ANTHROPIC_STOP_REASONS = {
@@ -54,35 +61,6 @@ ANTHROPIC_STOP_REASONS = {
     "pause_turn": "stop",
     "refusal": "content_filter",
 }
-
-
-def classify_protocol(model_id: str) -> str:
-    """Map a model id to the wire protocol it requires on OpenCode Go.
-
-    The prefixes are stable in the public catalogue: `claude-*` uses the
-    Anthropic Messages API, `gpt-*`/`grok-*`/`muse-*` use the Responses API,
-    and `gemini-*` uses the Google generateContent API. Everything else is
-    OpenAI chat compatible.
-    """
-
-    name = model_id.strip().lower()
-    if name.startswith("claude"):
-        return PROTOCOL_ANTHROPIC
-    if (
-        name.startswith("gpt")
-        or name.startswith("o1")
-        or name.startswith("o3")
-        or name.startswith("grok")
-        or name.startswith("muse")
-    ):
-        return PROTOCOL_RESPONSES
-    if name.startswith("gemini"):
-        return PROTOCOL_GOOGLE
-    return PROTOCOL_OPENAI_CHAT
-
-
-def is_free_model(model_id: str) -> bool:
-    return model_id.strip().lower().endswith(FREE_SUFFIX)
 
 
 @dataclass(frozen=True)
@@ -516,7 +494,10 @@ class OpenCodeProvider:
     def api_key(self) -> str | None:
         if self._api_key is not None:
             return self._api_key
-        return os.environ.get(self.settings.api_key_env)
+        from_env = os.environ.get(self.settings.api_key_env)
+        if from_env:
+            return from_env
+        return get_api_key(self.settings.name)
 
     def has_api_key(self) -> bool:
         return bool(self.api_key())
@@ -525,10 +506,11 @@ class OpenCodeProvider:
         key = self.api_key()
         if not key:
             raise ProviderError(
-                f"{self.settings.api_key_env} is not set",
+                f"{self.settings.api_key_env} is not set and no stored key exists "
+                f"for {self.settings.name}",
                 hint=(
-                    f"export {self.settings.api_key_env} in this shell; "
-                    "Panda never reads or stores the value"
+                    f"run `panda auth set` (or export {self.settings.api_key_env}); "
+                    "the key is stored outside the workspace"
                 ),
                 details={"env": self.settings.api_key_env},
             )
@@ -957,20 +939,17 @@ def provider_for_config(config: PandaConfig) -> OpenCodeProvider:
     return OpenCodeProvider(config.provider, model=config.model)
 
 
-def model_protocol(model: str) -> str:
-    provider, name = split_model(model)
-    return classify_protocol(name or provider)
-
-
-def is_supported_model(model: str) -> bool:
-    return model_protocol(model) in SUPPORTED_PROTOCOLS
-
-
 def status_snapshot(provider: OpenCodeProvider | None = None) -> dict[str, Any]:
     """Non-secret provider status for doctor/status. Never returns the key."""
 
     settings = provider.settings if provider else ProviderSettings()
-    present = (provider.has_api_key() if provider else bool(os.environ.get(settings.api_key_env)))
+    present = (
+        provider.has_api_key()
+        if provider
+        else bool(
+            os.environ.get(settings.api_key_env) or get_api_key(settings.name)
+        )
+    )
     return {
         "name": settings.name,
         "base_url": settings.base_url,

@@ -71,6 +71,47 @@ def test_git_state_without_repo(fake_corpus: Path) -> None:
     workspace = Workspace.from_root(fake_corpus)
     assert workspace.git_state()["repo"] is False
 
+
+def test_git_state_uses_one_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    workspace = Workspace.from_root(root)
+    calls: list[list[str]] = []
+
+    class Result:
+        stdout = "# branch.oid abc123\n# branch.head main\n1 .M N... 100644 0 0 x\n"
+
+    def fake_run(args: list[str], **kwargs: object) -> Result:
+        calls.append(args)
+        return Result()
+
+    monkeypatch.setattr("panda_core.workspace.subprocess.run", fake_run)
+
+    state = workspace.git_state()
+
+    assert state == {"repo": True, "commit": "abc123", "branch": "main", "dirty": True}
+    assert calls == [["git", "status", "--porcelain=v2", "--branch"]]
+
+
+def test_node_version_is_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PANDA_HOME", str(tmp_path / "home"))
+    workspace = Workspace.from_root(tmp_path)
+    calls: list[tuple[object, ...]] = []
+
+    def fake_version(*args: object, **kwargs: object) -> str:
+        calls.append(args)
+        return "24.0.0"
+
+    monkeypatch.setattr("panda_core.workspace.command_version", fake_version)
+
+    assert workspace.tool_versions()["node"] == "24.0.0"
+    assert workspace.tool_versions()["node"] == "24.0.0"
+    assert len(calls) == 1
+
 def test_is_writable_dir_skips_protected_windows_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

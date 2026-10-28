@@ -10,6 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from panda_cli.main import _chat_workspace, _reset_terminal, app
+from panda_core import credentials
 from panda_core.session import SessionLog
 
 runner = CliRunner()
@@ -377,3 +378,42 @@ def test_mcp_serve_refuses_non_loopback_binding() -> None:
     )
     assert result.exit_code == 2
     assert "loopback-only" in result.output
+
+
+def test_auth_set_status_clear(tmp_path: Path, isolated_credentials: Path) -> None:
+    result = invoke("auth", "set", "--root", str(tmp_path), "--key", "oc_cli_key", "--json")
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["provider"] == "opencode-go"
+    assert credentials.get_api_key("opencode-go") == "oc_cli_key"
+
+    result = invoke("auth", "status", "--root", str(tmp_path), "--json")
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["source"] == "credential store"
+    assert payload["file_exists"] is True
+    assert "oc_cli_key" not in result.stdout
+
+    result = invoke("auth", "clear", "--root", str(tmp_path), "--json")
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["removed"] is True
+    assert credentials.get_api_key("opencode-go") is None
+
+
+def test_auth_status_reports_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENCODE_API_KEY", "env-secret-value")
+
+    result = invoke("auth", "status", "--root", str(tmp_path), "--json")
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["source"] == "environment"
+    assert "env-secret-value" not in result.stdout
+
+
+def test_auth_set_without_a_key_requires_a_terminal(tmp_path: Path) -> None:
+    result = invoke("auth", "set", "--root", str(tmp_path))
+
+    assert result.exit_code == 2
+    assert "no API key provided" in result.output

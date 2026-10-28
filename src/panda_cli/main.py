@@ -2,40 +2,38 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import functools
+import getpass
 import hashlib
 import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import typer
 
 from panda_cli import render
-from panda_cli.runtime import ChatRuntime
 from panda_cli.terminal import reset_terminal as _reset_terminal
 from panda_cli.terminal import snapshot_console_mode
-from panda_core.agent import DEFAULT_MAX_STEPS
-from panda_core.config import accepted_providers, canonical_model, split_model
-from panda_core.doctor import run_doctor
-from panda_core.errors import ConfigError, ExecutionTimeout, PandaError, UsageError
-from panda_core.init import initialize_workspace
-from panda_core.model_catalog import CAPTURED_AT, snapshot_models
-from panda_core.policy import PolicyEngine, load_policy_or_default
-from panda_core.process import split_command
-from panda_core.provider import (
-    is_supported_model,
-    provider_for_config,
-    status_snapshot,
+from panda_core.credentials import (
+    clear_all,
+    clear_api_key,
+    credentials_path,
+    get_api_key,
+    mask_key,
+    set_api_key,
 )
-from panda_core.registry import find_study, load_registry, load_study_card
+from panda_core.errors import ConfigError, ExecutionTimeout, PandaError, UsageError
+from panda_core.limits import DEFAULT_MAX_STEPS
 from panda_core.session import SessionLog, list_sessions
-from panda_core.validator import Validator
 from panda_core.version import __version__
 from panda_core.workspace import Workspace, resolve_chat_workspace
+
+if TYPE_CHECKING:
+    from panda_cli.runtime import ChatRuntime
+    from panda_core.policy import PolicyEngine
 
 app = typer.Typer(
     add_completion=False,
@@ -50,11 +48,13 @@ session_app = typer.Typer(help="Hash-chained session ledger", no_args_is_help=Tr
 policy_app = typer.Typer(help="Policy evaluation and explanation", no_args_is_help=True)
 study_app = typer.Typer(help="Read-only study registry", no_args_is_help=True)
 mcp_app = typer.Typer(help="Optional MCP export for other clients", no_args_is_help=True)
+auth_app = typer.Typer(help="Provider credentials", no_args_is_help=True)
 
 app.add_typer(session_app, name="session")
 app.add_typer(policy_app, name="policy")
 app.add_typer(study_app, name="study")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(auth_app, name="auth")
 
 def handle[F: Callable[..., Any]](fn: F) -> F:
     @functools.wraps(fn)
@@ -224,6 +224,9 @@ def init_command(
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
+    from panda_core.init import initialize_workspace
+    from panda_core.process import split_command
+
     command = split_command(panda_command) if panda_command else None
     result = initialize_workspace(
         _root_value(root),
@@ -243,6 +246,109 @@ def init_command(
         render.init_panel(result)
 
 
+@auth_app.command("set")
+@handle
+def auth_set(
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    provider: str | None = typer.Option(
+        None, "--provider", help="Provider name (default: the workspace provider)."
+    ),
+    key: str | None = typer.Option(
+        None, "--key", help="API key. Omit to be prompted (recommended)."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Store a provider key outside the workspace. An exported env var still wins."""
+
+    workspace, _ = _chat_workspace(root)
+    name = (provider or workspace.config.provider.name).strip()
+    if key is None:
+        if not sys.stdin.isatty():
+            raise UsageError(
+                "no API key provided",
+                hint="run `panda auth set` in a terminal, or pass --key",
+            )
+        key = getpass.getpass(f"API key for {name}: ")
+    path = set_api_key(name, key)
+    if json_output:
+        render.print_json({"ok": True, "provider": name, "path": str(path)})
+        return
+    render.console().print(
+        f"[green]stored[/green] {name} in {path} (mode 0600, outside the workspace)"
+    )
+
+
+@auth_app.command("status")
+@handle
+def auth_status(
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    provider: str | None = typer.Option(
+        None, "--provider", help="Provider name (default: the workspace provider)."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Show where the key would come from. Never prints the key."""
+
+    workspace, _ = _chat_workspace(root)
+    name = (provider or workspace.config.provider.name).strip()
+    env_name = workspace.config.provider.api_key_env
+    from_env = os.environ.get(env_name) if name == workspace.config.provider.name else None
+    stored = get_api_key(name)
+    if from_env:
+        source, masked = "environment", mask_key(from_env)
+    elif stored:
+        source, masked = "credential store", mask_key(stored)
+    else:
+        source, masked = "none", "not set"
+    path = credentials_path()
+    payload = {
+        "ok": True,
+        "provider": name,
+        "api_key_env": env_name if name == workspace.config.provider.name else None,
+        "source": source,
+        "key": masked,
+        "credentials_path": str(path),
+        "file_exists": path.is_file(),
+    }
+    if json_output:
+        render.print_json(payload)
+        return
+    render.console().print(f"provider:  {name}")
+    render.console().print(f"source:    {source}")
+    render.console().print(f"key:       {masked}")
+    render.console().print(f"store:     {path}")
+    if source == "none":
+        render.console().print("run `panda auth set` to store a key for this user.")
+
+
+@auth_app.command("clear")
+@handle
+def auth_clear(
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    provider: str | None = typer.Option(
+        None, "--provider", help="Provider name (default: the workspace provider)."
+    ),
+    all_keys: bool = typer.Option(False, "--all", help="Remove every stored key."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Remove a stored key. An exported env var is not affected."""
+
+    if all_keys:
+        removed = clear_all()
+        target = "all providers"
+    else:
+        workspace, _ = _chat_workspace(root)
+        target = (provider or workspace.config.provider.name).strip()
+        removed = clear_api_key(target)
+    if json_output:
+        render.print_json({"ok": True, "target": target, "removed": removed})
+        return
+    if removed:
+        render.console().print(f"[green]cleared[/green] {target}")
+    else:
+        render.console().print(f"no stored key for {target}")
+
+
 @app.command("doctor")
 @handle
 def doctor_command(
@@ -250,6 +356,8 @@ def doctor_command(
     validate: bool = typer.Option(False, "--validate", help="Also run the corpus validator."),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
+    from panda_core.doctor import run_doctor
+
     try:
         workspace = _load_workspace(root)
     except ConfigError:
@@ -277,6 +385,8 @@ def validate_command(
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit the validator JSON report."),
 ) -> None:
+    from panda_core.validator import Validator
+
     workspace = _load_workspace(root)
     log = _active_session(workspace, session)
     created = False
@@ -346,6 +456,8 @@ def run_command(
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the plan; do not call the model."),
     quiet: bool = typer.Option(False, "--quiet", help="Do not print the session id."),
 ) -> None:
+    import asyncio
+
     task_text = " ".join(task or []).strip()
     if not task_text:
         raise UsageError("a task is required", hint='example: panda run "validate the corpus"')
@@ -464,6 +576,8 @@ def _runtime(
     on_event: Any = None,
     approver: Any = None,
 ) -> ChatRuntime:
+    from panda_cli.runtime import ChatRuntime
+
     return ChatRuntime(
         workspace,
         model=model,
@@ -477,6 +591,9 @@ def _runtime(
 
 
 def _validate_model(workspace: Workspace, model: str | None) -> str:
+    from panda_core.config import accepted_providers, canonical_model, split_model
+    from panda_core.protocols import is_supported_model
+
     settings = workspace.config.provider
     selected = model or workspace.config.model
     provider, name = split_model(selected)
@@ -606,6 +723,8 @@ def models_command(
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
+    import asyncio
+
     try:
         workspace = _load_workspace(root)
     except ConfigError:
@@ -619,7 +738,9 @@ def models_command(
             render.print_error(exc)
         raise typer.Exit(exc.exit_code) from None
     api_key_env = workspace.config.provider.api_key_env
-    key_present = bool(os.environ.get(api_key_env))
+    key_present = bool(
+        os.environ.get(api_key_env) or get_api_key(workspace.config.provider.name)
+    )
     rows = [
         {
             "id": model.qualified(workspace.config.provider.name),
@@ -659,6 +780,9 @@ def models_command(
 async def _collect_models(
     workspace: Workspace, *, refresh: bool
 ) -> tuple[list[Any], str, str | None, str]:
+    from panda_core.model_catalog import CAPTURED_AT, snapshot_models
+    from panda_core.provider import provider_for_config
+
     provider = provider_for_config(workspace.config)
     try:
         models = await provider.list_models()
@@ -703,6 +827,8 @@ def _status(root: Path | None, *, json_output: bool) -> None:
     )
     last_summary = last.summary() if last else None
     info = workspace.describe()
+    from panda_core.provider import status_snapshot
+
     info["provider"] = status_snapshot()
     info["provider"]["model"] = workspace.config.model
     if json_output:
@@ -849,6 +975,8 @@ def session_close(
 
 # ---- policy ------------------------------------------------------------------
 def _policy_engine(workspace: Workspace) -> tuple[PolicyEngine, str]:
+    from panda_core.policy import PolicyEngine, load_policy_or_default
+
     policy, from_file = load_policy_or_default(workspace.policy_path)
     return PolicyEngine(policy, root=workspace.root), "file" if from_file else "built-in default"
 
@@ -924,6 +1052,8 @@ def policy_show(
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
+    from panda_core.policy import load_policy_or_default
+
     workspace = _load_workspace(root)
     policy, from_file = load_policy_or_default(workspace.policy_path)
     if json_output:
@@ -949,6 +1079,8 @@ def study_list(
     status: str | None = typer.Option(None, "--status", help="planned, active, or done."),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
+    from panda_core.registry import load_registry
+
     workspace = _load_workspace(root)
     studies = load_registry(workspace.root)
     if track:
@@ -968,6 +1100,8 @@ def study_show(
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
+    from panda_core.registry import find_study, load_study_card
+
     workspace = _load_workspace(root)
     study = find_study(workspace.root, study_id)
     card = load_study_card(study)

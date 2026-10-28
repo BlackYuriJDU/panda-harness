@@ -459,7 +459,7 @@ def models_table(
     if missing_key:
         output.print(
             Text(
-                f"{missing_key} callable model(s) need {api_key_env} exported in this shell",
+                f"{missing_key} callable model(s) need {api_key_env} or `panda auth set`",
                 style=AMBER,
             )
         )

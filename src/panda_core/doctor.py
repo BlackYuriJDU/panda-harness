@@ -9,10 +9,11 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
+from panda_core import credentials
 from panda_core.config import split_model
 from panda_core.errors import PandaError
 from panda_core.policy import load_policy
-from panda_core.provider import SUPPORTED_PROTOCOLS, classify_protocol
+from panda_core.protocols import SUPPORTED_PROTOCOLS, classify_protocol
 from panda_core.validator import Validator
 from panda_core.version import __version__
 from panda_core.workspace import Workspace
@@ -232,15 +233,21 @@ def run_doctor(workspace: Workspace, *, run_validation: bool = False) -> DoctorR
         f"{provider.name} · {provider.base_url}",
         required=True,
     )
-    key_present = bool(os.environ.get(provider.api_key_env))
+    stored_key = credentials.get_api_key(provider.name)
+    key_present = bool(os.environ.get(provider.api_key_env) or stored_key)
+    key_source = (
+        "environment"
+        if os.environ.get(provider.api_key_env)
+        else ("credential store" if stored_key else "not set")
+    )
     _check(
         checks,
         "provider_key",
         provider.api_key_env,
         "ok" if key_present else "warn",
-        "set" if key_present else "not set in this process",
-        f"export {provider.api_key_env} before `panda run` or `panda`; "
-        "Panda records the name only",
+        key_source,
+        f"run `panda auth set` (or export {provider.api_key_env}) before "
+        "`panda run` or `panda`; Panda records the source name only",
         required=False,
     )
     _, model_name = split_model(workspace.config.model)

@@ -17,6 +17,7 @@ from typing import Any
 
 from panda_core.atomic import atomic_write_text
 from panda_core.config import DEFAULT_VALIDATOR, PandaConfig, default_config, load_config
+from panda_core.credentials import has_api_key
 from panda_core.errors import ConfigError
 from panda_core.opencode import (
     ConfigWriteResult,
@@ -176,9 +177,12 @@ def initialize_workspace(
     result = InitResult(root=root, dry_run=dry_run, config=config)
     if dry_run:
         result.warnings.append("dry run: no files were written")
-    if not os.environ.get(config.provider.api_key_env):
+    if not os.environ.get(config.provider.api_key_env) and not has_api_key(
+        config.provider.name
+    ):
         result.warnings.append(
-            f"{config.provider.api_key_env} is not set; model calls fail until it is exported"
+            f"{config.provider.api_key_env} is not set and no key is stored; "
+            "run `panda auth set`"
         )
     if opencode:
         result.warnings.append(

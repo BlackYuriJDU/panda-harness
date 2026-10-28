@@ -415,6 +415,15 @@ class PandaCockpit(App[None]):
             self._status = self.runtime.status()
         except Exception as exc:
             self._report_exception(exc, "setup")
+        try:
+            if not self.runtime.provider.has_api_key():
+                self._notice(
+                    "no API key for "
+                    f"{self.runtime.provider.settings.name} · "
+                    "run `panda auth set`, then restart"
+                )
+        except Exception as exc:
+            self._report_exception(exc, "setup")
 
     def _mount_setup_error(self, exc: BaseException) -> None:
         block = Text()
