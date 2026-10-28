@@ -293,11 +293,18 @@ def test_parse_anthropic_usage_normalizes_every_field() -> None:
         (400, "rejected"),
     ],
 )
-def test_http_errors_are_stable_and_secret_free(status: int, needle: str) -> None:
+def test_http_errors_are_stable_and_secret_free(
+    status: int, needle: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status, text="upstream said no")
 
     provider = provider_with(handler)
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(provider, "_sleep", no_sleep)
     with pytest.raises(ProviderError) as raised:
         asyncio.run(collect(provider))
     message = raised.value.message
@@ -606,6 +613,170 @@ def test_transport_error_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
         raise httpx.ConnectError("boom", request=request)
 
     provider = provider_with(handler)
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(provider, "_sleep", no_sleep)
     with pytest.raises(ProviderError) as raised:
         asyncio.run(collect(provider))
     assert "transport" in raised.value.message
+
+
+def test_stream_retries_429_before_the_first_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"count": 0}
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(429, headers={"retry-after": "2"}, text="slow down")
+        return httpx.Response(200, text=sse({"choices": [{"delta": {"content": "ok"}}]}))
+
+    provider = provider_with(handler)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(provider, "_sleep", fake_sleep)
+    events = asyncio.run(collect(provider))
+
+    assert calls["count"] == 2
+    assert [event.text for event in events if isinstance(event, TextDelta)] == ["ok"]
+    assert sleeps and 1.4 <= sleeps[0] <= 2.6
+
+
+def test_stream_does_not_retry_after_partial_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        body = (
+            'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            'data: {"error":{"message":"boom"}}\n\n'
+        )
+        return httpx.Response(200, text=body)
+
+    provider = provider_with(handler)
+
+    async def fake_sleep(seconds: float) -> None:
+        raise AssertionError("must not retry after output")
+
+    monkeypatch.setattr(provider, "_sleep", fake_sleep)
+    with pytest.raises(ProviderError):
+        asyncio.run(collect(provider))
+    assert calls["count"] == 1
+
+
+def test_stream_does_not_retry_client_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(400, text="bad request")
+
+    provider = provider_with(handler)
+
+    async def fake_sleep(seconds: float) -> None:
+        raise AssertionError("must not retry a 400")
+
+    monkeypatch.setattr(provider, "_sleep", fake_sleep)
+    with pytest.raises(ProviderError):
+        asyncio.run(collect(provider))
+    assert calls["count"] == 1
+
+
+def test_stream_gives_up_after_max_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return httpx.Response(503, text="upstream")
+
+    provider = provider_with(handler)
+
+    async def fake_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(provider, "_sleep", fake_sleep)
+    with pytest.raises(ProviderError):
+        asyncio.run(collect(provider))
+    assert calls["count"] == 3
+
+
+def test_list_models_retries_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(503, text="upstream")
+        return httpx.Response(200, json={"data": [{"id": "deepseek-v4.1-flash"}]})
+
+    provider = provider_with(handler)
+
+    async def fake_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(provider, "_sleep", fake_sleep)
+    models = asyncio.run(provider.list_models())
+
+    assert calls["count"] == 2
+    assert [model.id for model in models] == ["deepseek-v4.1-flash"]
+
+
+def test_anthropic_history_drops_a_leading_assistant_turn() -> None:
+    _, converted = convert_messages_for_anthropic(
+        [
+            {"role": "assistant", "content": "leftover"},
+            {"role": "user", "content": "new question"},
+        ]
+    )
+
+    assert converted == [
+        {"role": "user", "content": [{"type": "text", "text": "new question"}]}
+    ]
+
+
+def test_anthropic_history_drops_orphan_tool_results() -> None:
+    _, converted = convert_messages_for_anthropic(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "missing", "content": "stale"},
+        ]
+    )
+
+    assert converted == [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+    ]
+
+
+def test_anthropic_history_drops_tool_results_of_a_dropped_assistant() -> None:
+    _, converted = convert_messages_for_anthropic(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "x"},
+            {"role": "user", "content": "next"},
+        ]
+    )
+
+    assert converted == [
+        {"role": "user", "content": [{"type": "text", "text": "next"}]}
+    ]

@@ -17,8 +17,10 @@ only used in the Authorization header.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import random
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -245,6 +247,58 @@ def _append_blocks(
         converted.append({"role": role, "content": list(blocks)})
 
 
+def _normalize_anthropic_turns(
+    turns: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Make history acceptable to the Anthropic Messages API.
+
+    Anthropic requires the first turn to be `user` and rejects `tool_result`
+    blocks whose `tool_use_id` was not emitted by the immediately preceding
+    assistant turn. Context trimming can produce both shapes, so drop the
+    invalid leading assistant turns and the orphan tool results.
+    """
+
+    def filter_orphans(
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        filtered: list[dict[str, Any]] = []
+        pending: set[str] = set()
+        for turn in items:
+            role = turn["role"]
+            blocks = turn["content"]
+            if role == "assistant":
+                pending = {
+                    str(block.get("id"))
+                    for block in blocks
+                    if block.get("type") == "tool_use" and block.get("id")
+                }
+                filtered.append(turn)
+                continue
+            kept = [
+                block
+                for block in blocks
+                if block.get("type") != "tool_result"
+                or str(block.get("tool_use_id") or "") in pending
+            ]
+            pending = set()
+            if kept:
+                filtered.append({"role": role, "content": kept})
+        return filtered
+
+    normalized = filter_orphans(turns)
+    while normalized and normalized[0]["role"] == "assistant":
+        normalized.pop(0)
+    # Dropping an assistant can orphan the tool results of the next user turn.
+    normalized = filter_orphans(normalized)
+    merged: list[dict[str, Any]] = []
+    for turn in normalized:
+        if merged and merged[-1]["role"] == turn["role"]:
+            merged[-1]["content"].extend(turn["content"])
+        else:
+            merged.append({"role": turn["role"], "content": list(turn["content"])})
+    return merged
+
+
 def convert_messages_for_anthropic(
     messages: Sequence[dict[str, Any]],
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -308,7 +362,7 @@ def convert_messages_for_anthropic(
             continue
         content = _text_content(message.get("content"))
         _append_blocks(converted, "user", [{"type": "text", "text": content}] if content else [])
-    return system_parts, converted
+    return system_parts, _normalize_anthropic_turns(converted)
 
 
 def convert_tools_for_anthropic(
@@ -397,9 +451,30 @@ class DoneEvent:
 ProviderEvent = TextDelta | ToolCallDelta | UsageEvent | DoneEvent
 
 
-def _error_for_status(status: int, body: str) -> ProviderError:
+RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+MAX_RETRY_DELAY_SECONDS = 15.0
+
+
+def _retry_after(response: httpx.Response) -> float | None:
+    raw = response.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw.strip()))
+    except ValueError:
+        return None
+
+
+def _error_for_status(
+    status: int, body: str, *, retry_after: float | None = None
+) -> ProviderError:
     excerpt = redact_text(body.strip())[:400]
-    details: dict[str, Any] = {"status": status}
+    details: dict[str, Any] = {
+        "status": status,
+        "retryable": status in RETRYABLE_STATUS,
+    }
+    if retry_after is not None:
+        details["retry_after"] = retry_after
     if excerpt:
         details["body"] = excerpt
     if status in {401, 403}:
@@ -574,21 +649,46 @@ class OpenCodeProvider:
 
     # ---- models ----
     async def list_models(self) -> list[ModelInfo]:
-        try:
-            response = await self.client.get(self.models_url, headers=self._headers())
-        except httpx.TimeoutException as exc:
-            raise ProviderError(
-                "provider model list timed out",
-                hint="check the network and provider.base_url",
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ProviderError(
-                "cannot reach the provider model list",
-                hint="check the network and provider.base_url",
-                details={"error": type(exc).__name__},
-            ) from exc
-        if response.status_code >= 400:
-            raise _error_for_status(response.status_code, response.text)
+        attempts = self.settings.max_retries + 1
+        response: httpx.Response | None = None
+        for attempt in range(attempts):
+            try:
+                response = await self.client.get(
+                    self.models_url, headers=self._headers()
+                )
+            except httpx.TimeoutException as exc:
+                error = ProviderError(
+                    "provider model list timed out",
+                    hint="check the network and provider.base_url",
+                    details={"retryable": True},
+                )
+                if attempt + 1 >= attempts:
+                    raise error from exc
+                await self._sleep_before_retry(attempt, error)
+                continue
+            except httpx.HTTPError as exc:
+                error = ProviderError(
+                    "cannot reach the provider model list",
+                    hint="check the network and provider.base_url",
+                    details={"error": type(exc).__name__, "retryable": True},
+                )
+                if attempt + 1 >= attempts:
+                    raise error from exc
+                await self._sleep_before_retry(attempt, error)
+                continue
+            if response.status_code >= 400:
+                error = _error_for_status(
+                    response.status_code,
+                    response.text,
+                    retry_after=_retry_after(response),
+                )
+                if attempt + 1 < attempts and error.details.get("retryable"):
+                    await self._sleep_before_retry(attempt, error)
+                    continue
+                raise error
+            break
+        if response is None:  # pragma: no cover - the loop either returns or raises
+            raise ProviderError("provider model list failed")
         try:
             payload = response.json()
         except ValueError as exc:
@@ -630,16 +730,56 @@ class OpenCodeProvider:
         self._ensure_protocol(model_id)
         key = self._require_api_key()
         session = session_id or self.session_id
+        attempts = self.settings.max_retries + 1
+        for attempt in range(attempts):
+            emitted = False
+            try:
+                async for event in self._stream_once(
+                    messages, tools, model_id=model_id, key=key, session_id=session
+                ):
+                    emitted = True
+                    yield event
+                return
+            except ProviderError as exc:
+                retryable = bool(exc.details.get("retryable")) if exc.details else False
+                if emitted or not retryable or attempt + 1 >= attempts:
+                    raise
+                await self._sleep_before_retry(attempt, exc)
+
+    async def _stream_once(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]] | None,
+        *,
+        model_id: str,
+        key: str,
+        session_id: str,
+    ) -> AsyncIterator[ProviderEvent]:
         if classify_protocol(model_id) == PROTOCOL_ANTHROPIC:
             async for event in self._stream_anthropic(
-                messages, tools, model_id=model_id, key=key, session_id=session
+                messages, tools, model_id=model_id, key=key, session_id=session_id
             ):
                 yield event
             return
         async for event in self._stream_openai(
-            messages, tools, model_id=model_id, key=key, session_id=session
+            messages, tools, model_id=model_id, key=key, session_id=session_id
         ):
             yield event
+
+    async def _sleep_before_retry(self, attempt: int, exc: ProviderError) -> None:
+        details = exc.details or {}
+        retry_after = details.get("retry_after")
+        if isinstance(retry_after, (int, float)) and retry_after >= 0:
+            delay = float(retry_after)
+        else:
+            delay = self.settings.retry_base_seconds * (2**attempt)
+        delay = min(delay, MAX_RETRY_DELAY_SECONDS)
+        # Jitter spreads retries; it is not a security boundary.
+        delay *= random.uniform(0.7, 1.3)  # noqa: S311
+        await self._sleep(delay)
+
+    async def _sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
 
     async def _stream_openai(
         self,
@@ -673,7 +813,9 @@ class OpenCodeProvider:
             ) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", "replace")
-                    raise _error_for_status(response.status_code, body)
+                    raise _error_for_status(
+                        response.status_code, body, retry_after=_retry_after(response)
+                    )
                 async for line in response.aiter_lines():
                     if not line:
                         continue
@@ -753,12 +895,13 @@ class OpenCodeProvider:
             raise ProviderError(
                 f"provider stream timed out after {self.settings.timeout_seconds:g}s",
                 hint="raise provider.timeout_seconds or narrow the task",
+                details={"retryable": True},
             ) from exc
         except httpx.HTTPError as exc:
             raise ProviderError(
                 "provider stream failed at the transport layer",
                 hint="retry once; if it repeats, check the network and provider.base_url",
-                details={"error": type(exc).__name__},
+                details={"error": type(exc).__name__, "retryable": True},
             ) from exc
 
         calls = tuple(
@@ -814,7 +957,9 @@ class OpenCodeProvider:
             ) as response:
                 if response.status_code >= 400:
                     body = (await response.aread()).decode("utf-8", "replace")
-                    raise _error_for_status(response.status_code, body)
+                    raise _error_for_status(
+                        response.status_code, body, retry_after=_retry_after(response)
+                    )
                 async for line in response.aiter_lines():
                     if not line:
                         continue
@@ -910,12 +1055,13 @@ class OpenCodeProvider:
             raise ProviderError(
                 f"provider stream timed out after {self.settings.timeout_seconds:g}s",
                 hint="raise provider.timeout_seconds or narrow the task",
+                details={"retryable": True},
             ) from exc
         except httpx.HTTPError as exc:
             raise ProviderError(
                 "provider stream failed at the transport layer",
                 hint="retry once; if it repeats, check the network and provider.base_url",
-                details={"error": type(exc).__name__},
+                details={"error": type(exc).__name__, "retryable": True},
             ) from exc
 
         usage = parse_anthropic_usage(usage_raw)

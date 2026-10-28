@@ -765,7 +765,13 @@ class PandaCockpit(App[None]):
         try:
             self._set_state("verifying")
             try:
-                return bool(await self.push_screen_wait(ApprovalScreen(request)))
+                # Textual types push_screen_wait as Screen[object]; the modal
+                # returns bool and the cast is guaranteed by ApprovalScreen.
+                return bool(
+                    await self.push_screen_wait(
+                        ApprovalScreen(request)  # type: ignore[arg-type]
+                    )
+                )
             finally:
                 self._set_state("working" if self._busy else "idle")
         except Exception as exc:
@@ -794,9 +800,9 @@ class PandaCockpit(App[None]):
             self._mount_widget(card)
             self._set_state("working")
         elif kind == "tool_result":
-            card = self._tool_cards.get(str(data.get("id", "")))
-            if card is not None:
-                card.finish(
+            existing = self._tool_cards.get(str(data.get("id", "")))
+            if existing is not None:
+                existing.finish(
                     ok=bool(data.get("ok")),
                     blocked=bool(data.get("blocked")),
                     detail=str(data.get("content", ""))[:160],

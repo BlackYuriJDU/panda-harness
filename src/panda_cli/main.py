@@ -1184,8 +1184,11 @@ def _configure_stdio() -> None:
     import sys
 
     for stream in (sys.stdout, sys.stderr):
-        with contextlib.suppress(AttributeError, OSError, ValueError):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 if __name__ == "__main__":

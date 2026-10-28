@@ -80,6 +80,8 @@ class ProviderSettings(BaseModel):
     context_window: int = Field(default=DEFAULT_CONTEXT_WINDOW, ge=1024, le=10_000_000)
     max_output_tokens: int = Field(default=DEFAULT_MAX_OUTPUT_TOKENS, ge=1, le=1_000_000)
     temperature: float = Field(default=0.2, ge=0, le=2)
+    max_retries: int = Field(default=2, ge=0, le=5)
+    retry_base_seconds: float = Field(default=0.5, ge=0, le=30)
 
     @field_validator("base_url")
     @classmethod

@@ -47,7 +47,7 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
         try:
             yield
         finally:
@@ -61,7 +61,7 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
                 import fcntl
 
                 with contextlib.suppress(OSError):
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
     finally:
         handle.close()
 

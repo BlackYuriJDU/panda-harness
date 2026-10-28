@@ -8,7 +8,12 @@ import sys
 
 from panda_core.policy import PolicyEngine, load_policy_or_default
 from panda_core.session import SessionLog
-from panda_core.tools import ApprovalRequest, ToolContext, ToolRegistry
+from panda_core.tools import (
+    ApprovalRequest,
+    ToolContext,
+    ToolRegistry,
+    _scrubbed_env,
+)
 
 
 def make_registry(workspace, *, approver=None) -> tuple[ToolRegistry, SessionLog]:
@@ -142,6 +147,66 @@ def test_shell_denied_by_operator_does_not_execute(workspace) -> None:
     result = call(registry, "run_shell", argv=[sys.executable, "-c", "print('nope')"])
     assert result.blocked
     assert "denied by the operator" in result.content
+
+
+def test_scrubbed_env_removes_secrets_but_keeps_path(monkeypatch) -> None:
+    monkeypatch.setenv("OPENCODE_API_KEY", "sk-test")
+    monkeypatch.setenv("MY_SERVICE_TOKEN", "tok")
+    monkeypatch.setenv("PANDA_SESSION_FILE", "ledger")
+
+    env = _scrubbed_env()
+
+    assert "OPENCODE_API_KEY" not in env
+    assert "MY_SERVICE_TOKEN" not in env
+    assert "PANDA_SESSION_FILE" not in env
+    assert any(name.upper() == "PATH" for name in env)
+
+
+def test_shell_does_not_inherit_secrets(workspace, monkeypatch) -> None:
+    monkeypatch.setenv("OPENCODE_API_KEY", "sk-test")
+    monkeypatch.setenv("MY_SERVICE_TOKEN", "tok")
+
+    async def approve(request: ApprovalRequest) -> bool:
+        return True
+
+    registry, _ = make_registry(workspace, approver=approve)
+    code = (
+        "import os;"
+        "print(os.environ.get('OPENCODE_API_KEY'), os.environ.get('MY_SERVICE_TOKEN'))"
+    )
+    result = call(registry, "run_shell", argv=[sys.executable, "-c", code])
+
+    assert result.ok, result.content
+    assert result.data["stdout"].strip() == "None None"
+
+
+def test_write_file_verifies_the_written_content(workspace, monkeypatch) -> None:
+    monkeypatch.setattr("panda_core.tools._read_exact", lambda path: "tampered")
+    registry, _ = make_registry(workspace)
+
+    result = call(
+        registry, "write_file", path="corpus/claims/verify.md", content="body"
+    )
+
+    assert not result.ok
+    assert "post-write verification failed" in result.content
+
+
+def test_edit_file_verifies_the_written_content(workspace, monkeypatch) -> None:
+    (workspace.root / "corpus" / "notes.md").write_text("alpha\n", encoding="utf-8")
+    monkeypatch.setattr("panda_core.tools._read_exact", lambda path: "tampered")
+    registry, _ = make_registry(workspace)
+
+    result = call(
+        registry,
+        "edit_file",
+        path="corpus/notes.md",
+        old_string="alpha",
+        new_string="beta",
+    )
+
+    assert not result.ok
+    assert "post-write verification failed" in result.content
 
 
 def test_biomedical_reads_from_corpus(workspace) -> None:

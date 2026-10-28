@@ -42,6 +42,11 @@ jobs:
       - name: Lint
         run: ruff check .
 
+      - name: Typecheck
+        run: |
+          python -m compileall -q src tests
+          mypy
+
       - name: Test
         run: pytest -q
 

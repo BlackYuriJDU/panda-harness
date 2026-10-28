@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -136,6 +137,53 @@ def _cap(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n[truncated {len(text) - limit} chars]"
+
+
+_SECRET_ENV_NAMES = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GEMINI_API_KEY",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GOOGLE_API_KEY",
+        "OPENAI_API_KEY",
+    }
+)
+_SECRET_ENV_PREFIXES = ("PANDA_", "OPENCODE_", "OPENROUTER_")
+_SECRET_ENV_SUFFIXES = (
+    "_KEY",
+    "_TOKEN",
+    "_SECRET",
+    "_PASSWORD",
+    "_PASSWD",
+    "_CREDENTIALS",
+)
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """Child processes never inherit harness or provider credentials."""
+
+    env: dict[str, str] = {}
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if upper in _SECRET_ENV_NAMES:
+            continue
+        if upper.startswith(_SECRET_ENV_PREFIXES):
+            continue
+        if upper.endswith(_SECRET_ENV_SUFFIXES):
+            continue
+        env[name] = value
+    return env
+
+
+def _read_exact(path: Path) -> str:
+    """Read without newline translation so post-write checks are exact."""
+
+    with open(path, encoding="utf-8", newline="") as handle:
+        return handle.read()
 
 
 def resolve_inside(root: Path, value: str) -> tuple[Path, str]:
@@ -451,7 +499,7 @@ class ToolRegistry:
                 "start_line": start,
                 "end_line": end,
                 "truncated": end < total,
-                "rule": decision.rule_id,
+                "rule": decision.rule_id if decision else None,
             },
             text=body,
         )
@@ -474,7 +522,7 @@ class ToolRegistry:
                 "pattern": pattern,
                 "count": len(entries),
                 "entries": entries,
-                "rule": decision.rule_id,
+                "rule": decision.rule_id if decision else None,
             },
         )
 
@@ -621,6 +669,17 @@ class ToolRegistry:
         changed = before != content
         if changed:
             atomic_write_text(path, content, mode=0o644)
+            try:
+                written = _read_exact(path)
+            except OSError as exc:
+                return _fail(
+                    "write_file", f"post-write verification failed: {exc}"
+                )
+            if written != content:
+                return _fail(
+                    "write_file",
+                    "post-write verification failed: content differs after write",
+                )
         return _ok(
             "write_file",
             {
@@ -664,6 +723,15 @@ class ToolRegistry:
         if blocked:
             return blocked
         atomic_write_text(path, after, mode=0o644)
+        try:
+            written = _read_exact(path)
+        except OSError as exc:
+            return _fail("edit_file", f"post-write verification failed: {exc}")
+        if written != after:
+            return _fail(
+                "edit_file",
+                "post-write verification failed: content differs after edit",
+            )
         return _ok(
             "edit_file",
             {
@@ -697,7 +765,9 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        result = await asyncio.to_thread(run_command, argv, cwd=cwd, timeout=timeout)
+        result = await asyncio.to_thread(
+            run_command, argv, cwd=cwd, timeout=timeout, env=_scrubbed_env()
+        )
         payload = {
             "argv": argv,
             "cwd": cwd_relative,

@@ -324,7 +324,7 @@ class Agent:
                 steps += 1
                 self._trim()
                 step_parts: list[str] = []
-                calls = []
+                calls: list[Any] = []
                 usage_box: list[Usage] = [Usage()]
                 async for event in self.provider.stream(
                     self.messages,
