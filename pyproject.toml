@@ -46,7 +46,7 @@ dev = [
 ]
 
 [project.scripts]
-panda = "panda_cli.main:main"
+panda = "panda_cli.entry:main"
 
 [project.urls]
 Homepage = "https://github.com/BlackYuriJDU/panda-harness"

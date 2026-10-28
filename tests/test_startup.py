@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -95,3 +97,29 @@ def test_normal_writable_cwd_still_used(
     assert workspace.initialized is False
     assert error is not None
     assert error.code == "config_error"
+
+def test_chat_workspace_skips_protected_windows_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows-specific protected roots")
+    system32 = tmp_path / "Windows" / "System32"
+    system32.mkdir(parents=True)
+    home = tmp_path / "home"
+    real_mkstemp = tempfile.mkstemp
+
+    def guarded_mkstemp(*, prefix: str, dir: Path | str) -> tuple[int, str]:
+        if Path(dir).resolve() == system32.resolve():
+            raise AssertionError("write probe attempted in a protected root")
+        return real_mkstemp(prefix=prefix, dir=dir)
+
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
+    monkeypatch.setenv("PANDA_HOME", str(home))
+    monkeypatch.chdir(system32)
+    monkeypatch.setattr("panda_core.workspace.tempfile.mkstemp", guarded_mkstemp)
+
+    workspace, error = _chat_workspace(None)
+
+    assert error is None
+    assert workspace.root == home.resolve()
+    assert not (system32 / ".panda").exists()

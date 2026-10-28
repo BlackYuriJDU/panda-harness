@@ -71,8 +71,38 @@ def home_workspace_path() -> Path:
     return Path.home() / ".local" / "share" / HOME_DIR / "home"
 
 
+def _is_protected_dir(path: Path) -> bool:
+    """Return True for Windows roots where a write probe may block."""
+
+    if os.name != "nt":
+        return False
+    try:
+        target = path.resolve()
+    except OSError:
+        return True
+    for name in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        value = os.environ.get(name, "").strip()
+        if not value:
+            continue
+        try:
+            root = Path(value).resolve()
+            target.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        return True
+    return False
+
+
 def is_writable_dir(path: Path) -> bool:
-    """Probe real writability by creating and removing a temp file."""
+    """Probe real writability by creating and removing a temp file.
+
+    Protected Windows roots are reported unwritable without touching them:
+    ``mkstemp`` inside ``System32`` can block for tens of seconds behind
+    Windows security/AV instead of failing fast.
+    """
+
+    if _is_protected_dir(path):
+        return False
 
     try:
         if not path.is_dir():

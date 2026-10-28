@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from panda_core.errors import ConfigError
-from panda_core.workspace import Workspace, find_workspace_root
+from panda_core.workspace import Workspace, find_workspace_root, is_writable_dir
 
 
 def test_find_root_from_nested_directory(workspace: Workspace) -> None:
@@ -69,3 +70,18 @@ def test_describe(workspace: Workspace) -> None:
 def test_git_state_without_repo(fake_corpus: Path) -> None:
     workspace = Workspace.from_root(fake_corpus)
     assert workspace.git_state()["repo"] is False
+
+def test_is_writable_dir_skips_protected_windows_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows-specific protected roots")
+    system32 = tmp_path / "Windows" / "System32"
+    system32.mkdir(parents=True)
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
+    monkeypatch.setattr(
+        "panda_core.workspace.tempfile.mkstemp",
+        lambda **kwargs: pytest.fail("write probe attempted in a protected root"),
+    )
+
+    assert is_writable_dir(system32) is False
