@@ -112,6 +112,30 @@ def test_tool_call_round_trip(workspace) -> None:
     tool_messages = [m for m in agent.messages if m.get("role") == "tool"]
     assert tool_messages and tool_messages[0]["tool_call_id"] == "call_1"
     assert "fixture corpus" in tool_messages[0]["content"]
+
+
+def test_tool_call_metadata_reaches_the_next_provider_call(workspace) -> None:
+    call = ToolCall(
+        id="call_9",
+        name="read_file",
+        arguments='{"path":"README.md"}',
+        metadata={"google": {"thought_signature": "sig"}},
+    )
+    agent, _, provider = make_agent(
+        workspace,
+        [
+            [DoneEvent(finish_reason="tool_calls", tool_calls=(call,))],
+            [TextDelta("done"), DoneEvent(finish_reason="stop")],
+        ],
+    )
+    asyncio.run(agent.run_turn("read it"))
+
+    assistant = next(m for m in agent.messages if m.get("role") == "assistant")
+    expected = {"google": {"thought_signature": "sig"}}
+    assert assistant["tool_calls"][0]["provider_meta"] == expected
+    sent = next(m for m in provider.calls[1] if m.get("role") == "assistant")
+    assert sent["tool_calls"][0]["provider_meta"] == expected
+
 def test_approval_denied_blocks_write(workspace) -> None:
     call = ToolCall(
         id="call_2",

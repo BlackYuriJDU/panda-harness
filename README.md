@@ -4,9 +4,8 @@
 
 > A fail-closed terminal harness for evidence-heavy research corpora.
 
-**Status:** alpha. `0.1.0a1` is the last tagged release; the autonomous runtime
-in `main` is the unreleased `0.2.0a1` line, described in
-[`docs/CONTRACT.md`](docs/CONTRACT.md).
+**Status:** alpha. `0.2.0a2` is the last tagged release; the line in `main` is
+the unreleased `0.2.0a3`, described in [`docs/CONTRACT.md`](docs/CONTRACT.md).
 
 Panda is a terminal agent and optional MCP server that keeps an AI model inside
 an evidence discipline: approved write scopes, canonical validation, a verifiable
@@ -34,10 +33,10 @@ bypass.
 
 - An autonomous terminal agent (cockpit, line REPL, or headless `panda run`) for a
   corpus with a canonical validator and a study registry.
-- A provider client for OpenCode Go: OpenAI-compatible chat completions plus
-  Anthropic Messages for Claude, with honest protocol classification for the
-  rest (GPT/Grok/Muse and Gemini are refused, never called with a wrong
-  adapter).
+- A provider client for OpenCode Go: all four wire protocols the Go catalogue
+  uses — OpenAI-compatible chat completions, Anthropic Messages for Claude, the
+  OpenAI Responses API for GPT/Grok/Muse, and Google generateContent for Gemini
+  — normalized into one event stream so the agent loop is protocol-agnostic.
 - A policy engine: ordered rules, last-match-wins, hard denies, `ask` treated as
   deny when nobody can answer.
 - A hash-chained session ledger with a tail anchor and redaction.
@@ -112,13 +111,13 @@ key is not exported in this shell.
 The provider is OpenCode Go: `provider.name = "opencode-go"`,
 `provider.base_url = "https://opencode.ai/inference/go"`, key in
 `OPENCODE_API_KEY`. The default model is
-`opencode-go/deepseek-v4.1-flash`; `claude-haiku-5-5` is callable through the
-Anthropic Messages adapter (`/anthropic/v1/messages`). OpenAI-chat models use
-`/openai/v1/chat/completions`. GPT/Grok/Muse (Responses API) and Gemini (Google
-API) are classified, reported as unsupported, and refused instead of being
-called with the wrong adapter; there is no silent fallback. The legacy
-`opencode/` model prefix is accepted as an alias for `opencode-go/` when the
-base URL is Go.
+`opencode-go/deepseek-v4.1-flash`. Every catalogue model is callable: OpenAI-chat
+models use `/openai/v1/chat/completions`, Claude uses the Anthropic Messages
+adapter (`/anthropic/v1/messages`), GPT/Grok/Muse use the Responses API
+(`/openai/v1/responses`), and Gemini uses Google generateContent
+(`/google/v1beta/models/<id>:streamGenerateContent`). Protocol classification is
+explicit; there is no silent fallback. The legacy `opencode/` model prefix is
+accepted as an alias for `opencode-go/` when the base URL is Go.
 
 Go requires two request headers that generic OpenAI clients do not send: a
 stable `x-opencode-session` id per conversation and a non-generic

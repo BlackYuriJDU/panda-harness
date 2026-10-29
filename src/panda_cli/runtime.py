@@ -18,6 +18,7 @@ from panda_core.errors import ConfigError
 from panda_core.model_catalog import CAPTURED_AT, snapshot_models
 from panda_core.policy import PolicyEngine, load_policy_or_default
 from panda_core.provider import (
+    SUPPORTED_PROTOCOLS,
     ModelInfo,
     OpenCodeProvider,
     classify_protocol,
@@ -147,10 +148,10 @@ class ChatRuntime:
                 hint=f"use `panda models`; the provider is {self.workspace.config.provider.name}",
             )
         protocol = classify_protocol(name)
-        if protocol != "openai-chat":
+        if protocol not in SUPPORTED_PROTOCOLS:
             raise ConfigError(
                 f"model {model!r} uses {protocol}, which is not implemented",
-                hint="pick an OpenAI-compatible model; `panda models` marks the rest unsupported",
+                hint="pick a supported id with `panda models`",
             )
         self.agent.set_model(model)
         self.provider.model = model

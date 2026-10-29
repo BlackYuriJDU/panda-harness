@@ -4,7 +4,58 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — target 0.2.0a1
+## [0.2.0a3] — 2026-10-29
+
+Every model in the captured Go catalogue is callable. The agent loop stays
+protocol-agnostic: all four adapters normalize into the same events.
+
+### Added
+
+- OpenAI Responses adapter (`POST /openai/v1/responses`) for GPT/Grok/Muse:
+  `instructions` from system messages, `function_call`/`function_call_output`
+  input items, streamed text and argument deltas, `response.completed` and
+  `response.incomplete` handling, and usage from `input_tokens`/`output_tokens`
+  plus cache details.
+- Google generateContent adapter
+  (`POST /google/v1beta/models/<id>:streamGenerateContent?alt=sse`) for Gemini:
+  `systemInstruction`, cleaned `functionDeclarations`, `functionCall` and
+  `functionResponse` history conversion, streamed text, finish-reason mapping,
+  and `usageMetadata` normalization.
+- Gemini thought signatures: the `thoughtSignature` of a function call is kept
+  in `ToolCall.metadata`, persisted as `provider_meta` on the assistant message,
+  and echoed on the next turn. It is stripped before any other protocol sees the
+  history.
+- Tests for both adapters: URL/payload shaping, text and tool streams, usage
+  parsers, history conversion, signature round-trip, fail-closed errors, and
+  schema-property preservation.
+
+### Changed
+
+- `SUPPORTED_PROTOCOLS` now covers `openai-chat`, `anthropic`, `responses`, and
+  `google`; `panda models`, `panda doctor`, the cockpit, and model switching stop
+  warning that the latter two are unsupported.
+- `panda run --dry-run` accepts every catalogued model instead of rejecting
+  Responses/Google ids.
+
+### Fixed
+
+- The Google schema cleaner no longer drops a tool argument whose *name* is
+  `pattern` (or `default`); property names are data, only schema keywords are
+  removed. This caused a real `400 required fields ['pattern']` failure for
+  `grep`.
+- Gemini reporting `finishReason: STOP` alongside function calls is mapped to
+  `tool_calls`, so the agent executes them.
+
+### Verified
+
+- Real two-turn tool calls: GPT-5.6, GPT-6, Grok-4.7, and Gemini-4 returned a
+  tool call and then an answer; Muse-1.3 returned a tool call on both turns.
+- Real agent loops: Gemini (2 steps, 1 tool call, cost `0.009864`) and GPT-6
+  (2 steps, 1 tool call, cost `0.00027337`), exit 0.
+- `ruff`, `compileall`, and `mypy` clean; full suite green on native and x64
+  virtualenvs.
+
+## [0.2.0a2] — 2026-10-28
 
 The autonomous runtime pivot. OpenCode is no longer in the runtime path; the
 provider is OpenCode Go, with OpenAI-chat and Anthropic Messages adapters.

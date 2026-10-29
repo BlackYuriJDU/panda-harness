@@ -1,10 +1,15 @@
 """OpenCode Go provider (https://opencode.ai/inference/go).
 
-Go exposes two wire protocols under one key: OpenAI-compatible chat completions
-at `/openai/v1/chat/completions` and Anthropic Messages at
-`/anthropic/v1/messages`. Both adapters are implemented here; GPT/Grok/Muse
-(Responses API) and Gemini (Google generateContent) are classified and reported
-honestly as unsupported instead of being called with the wrong adapter.
+Go exposes four wire protocols under one key: OpenAI-compatible chat
+completions at `/openai/v1/chat/completions`, Anthropic Messages at
+`/anthropic/v1/messages`, the OpenAI Responses API at `/openai/v1/responses`,
+and Google generateContent at `/google/v1beta/models/<id>:streamGenerateContent`.
+All four adapters normalize their events into the same `ProviderEvent` stream,
+so the agent loop never knows which wire protocol the model speaks.
+
+Gemini requires the `thoughtSignature` returned with a function call to be
+echoed back on the next turn; it travels in `ToolCall.metadata` and is stored
+on the assistant message as `provider_meta`, never sent to other protocols.
 
 Go also requires two non-generic headers on every request: a stable
 `x-opencode-session` id per conversation and a `panda-harness/<version>`
@@ -25,6 +30,7 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -62,6 +68,16 @@ ANTHROPIC_STOP_REASONS = {
     "max_tokens": "length",
     "pause_turn": "stop",
     "refusal": "content_filter",
+}
+GOOGLE_FINISH_REASONS = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "BLOCKLIST": "content_filter",
+    "PROHIBITED_CONTENT": "content_filter",
+    "SPII": "content_filter",
+    "OTHER": "stop",
 }
 
 
@@ -203,6 +219,91 @@ def merge_usage(target: dict[str, Any], raw: Any) -> None:
             merge_usage(target[key], value)
         elif isinstance(value, dict):
             target[key] = dict(value)
+
+
+def parse_responses_usage(raw: Any) -> Usage | None:
+    """Normalize Responses API usage (`input_tokens`/`output_tokens`)."""
+
+    if not isinstance(raw, dict) or not raw:
+        return None
+    prompt = _as_int(raw.get("input_tokens"))
+    completion = _as_int(raw.get("output_tokens"))
+    total = _as_int(raw.get("total_tokens")) or (prompt + completion)
+    details = raw.get("input_tokens_details")
+    cached = 0
+    cache_write = 0
+    if isinstance(details, dict):
+        cached = _as_int(details.get("cached_tokens"))
+        cache_write = _as_int(details.get("cache_write_tokens"))
+    return Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total,
+        cached_tokens=cached,
+        cache_write_tokens=cache_write,
+        cost_usd=_cost_value(raw),
+    )
+
+
+def parse_google_usage(raw: Any) -> Usage | None:
+    """Normalize Gemini `usageMetadata` into the shared `Usage` shape."""
+
+    if not isinstance(raw, dict) or not raw:
+        return None
+    prompt = _as_int(raw.get("promptTokenCount"))
+    completion = _as_int(raw.get("candidatesTokenCount"))
+    total = _as_int(raw.get("totalTokenCount")) or (prompt + completion)
+    return Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total,
+        cached_tokens=_as_int(raw.get("cachedContentTokenCount")),
+        cost_usd=_cost_value(raw),
+    )
+
+
+_OPENAI_MESSAGE_KEYS = frozenset({"role", "content", "name", "tool_call_id"})
+
+
+def sanitize_messages_for_openai(
+    messages: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop harness-only keys so OpenAI-compatible endpoints accept the history.
+
+    `provider_meta` carries Gemini thought signatures; it must never reach
+    another protocol. Assistant tool calls are rebuilt from their public shape.
+    """
+
+    cleaned: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        item = {key: message[key] for key in _OPENAI_MESSAGE_KEYS if key in message}
+        raw_calls = message.get("tool_calls")
+        if isinstance(raw_calls, list):
+            calls: list[dict[str, Any]] = []
+            for call in raw_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                calls.append(
+                    {
+                        "id": str(call.get("id") or ""),
+                        "type": "function",
+                        "function": (
+                            {
+                                "name": str(function.get("name") or ""),
+                                "arguments": str(function.get("arguments") or "{}"),
+                            }
+                            if isinstance(function, dict)
+                            else {"name": "", "arguments": "{}"}
+                        ),
+                    }
+                )
+            if calls:
+                item["tool_calls"] = calls
+        cleaned.append(item)
+    return cleaned
 
 
 def _text_content(value: Any) -> str:
@@ -395,6 +496,267 @@ def convert_tools_for_anthropic(
     return converted
 
 
+def convert_tools_for_responses(
+    tools: Sequence[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Translate OpenAI function tools into Responses API tool definitions."""
+
+    converted: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if tool.get("type") == "function" else tool
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        schema = function.get("parameters")
+        converted.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": str(function.get("description") or ""),
+                "parameters": (
+                    schema
+                    if isinstance(schema, dict) and schema
+                    else {"type": "object", "properties": {}}
+                ),
+            }
+        )
+    return converted
+
+
+def convert_messages_for_responses(
+    messages: Sequence[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Translate OpenAI-style history into Responses API input items.
+
+    System messages become `instructions`; assistant tool calls become
+    `function_call` items and tool results become `function_call_output` items,
+    which is the stateless shape the Responses API expects.
+    """
+
+    system_parts: list[str] = []
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        if role == "system":
+            content = _text_content(message.get("content"))
+            if content:
+                system_parts.append(content)
+            continue
+        if role == "tool":
+            call_id = str(message.get("tool_call_id") or "").strip()
+            if not call_id:
+                continue
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": _text_content(message.get("content")),
+                }
+            )
+            continue
+        if role == "assistant":
+            content = _text_content(message.get("content"))
+            if content:
+                items.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}],
+                    }
+                )
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                name = str(function.get("name") or "").strip()
+                call_id = str(call.get("id") or "").strip()
+                if not name or not call_id:
+                    continue
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": str(function.get("arguments") or "{}"),
+                    }
+                )
+            continue
+        content = _text_content(message.get("content"))
+        if content:
+            items.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": content}],
+                }
+            )
+    return "\n\n".join(system_parts), items
+
+
+_GOOGLE_SCHEMA_DROP = frozenset(
+    {
+        "$defs",
+        "$schema",
+        "additionalProperties",
+        "const",
+        "definitions",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "examples",
+        "pattern",
+        "default",
+    }
+)
+
+
+def _clean_google_schema(value: Any) -> Any:
+    """Keep only the OpenAPI subset the Gemini Schema object accepts.
+
+    `properties` is a map of caller-chosen names, not schema keywords: a tool
+    argument named `pattern` or `default` must survive even though the schema
+    keywords of the same name are dropped.
+    """
+
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "properties" and isinstance(item, dict):
+                cleaned[key] = {
+                    name: _clean_google_schema(schema) for name, schema in item.items()
+                }
+                continue
+            if key in _GOOGLE_SCHEMA_DROP:
+                continue
+            cleaned[key] = _clean_google_schema(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_clean_google_schema(item) for item in value]
+    return value
+
+
+def convert_tools_for_google(
+    tools: Sequence[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Translate OpenAI function tools into Gemini functionDeclarations."""
+
+    declarations: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if tool.get("type") == "function" else tool
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        schema = function.get("parameters")
+        declaration: dict[str, Any] = {
+            "name": name,
+            "description": str(function.get("description") or ""),
+        }
+        if isinstance(schema, dict) and schema:
+            declaration["parameters"] = _clean_google_schema(schema)
+        declarations.append(declaration)
+    return [{"functionDeclarations": declarations}] if declarations else []
+
+
+def convert_messages_for_google(
+    messages: Sequence[dict[str, Any]],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Translate OpenAI-style history into Gemini `contents`.
+
+    Function responses must carry the function name, so the converter tracks
+    call ids from the preceding assistant turn. Thought signatures stored in
+    `provider_meta` are echoed back on their functionCall part, which Gemini 4
+    requires for multi-turn tool use.
+    """
+
+    system_parts: list[str] = []
+    contents: list[dict[str, Any]] = []
+    pending_names: dict[str, str] = {}
+
+    def append(role: str, parts: list[dict[str, Any]]) -> None:
+        if not parts:
+            return
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"].extend(parts)
+        else:
+            contents.append({"role": role, "parts": list(parts)})
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        if role == "system":
+            content = _text_content(message.get("content"))
+            if content:
+                system_parts.append(content)
+            continue
+        if role == "assistant":
+            parts: list[dict[str, Any]] = []
+            content = _text_content(message.get("content"))
+            if content:
+                parts.append({"text": content})
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                name = str(function.get("name") or "").strip()
+                if not name:
+                    continue
+                call_id = str(call.get("id") or "").strip() or f"call_{len(pending_names)}"
+                part: dict[str, Any] = {
+                    "functionCall": {
+                        "name": name,
+                        "args": _tool_input(function.get("arguments")),
+                    }
+                }
+                meta = call.get("provider_meta")
+                google_meta = meta.get("google") if isinstance(meta, dict) else None
+                signature = (
+                    google_meta.get("thought_signature")
+                    if isinstance(google_meta, dict)
+                    else None
+                )
+                if isinstance(signature, str) and signature:
+                    part["thoughtSignature"] = signature
+                parts.append(part)
+                pending_names[call_id] = name
+            append("model", parts)
+            continue
+        if role == "tool":
+            call_id = str(message.get("tool_call_id") or "").strip()
+            response_name = pending_names.get(call_id)
+            if not response_name:
+                continue
+            append(
+                "user",
+                [
+                    {
+                        "functionResponse": {
+                            "name": response_name,
+                            "response": {
+                                "content": _text_content(message.get("content"))
+                            },
+                        }
+                    }
+                ],
+            )
+            continue
+        content = _text_content(message.get("content"))
+        if content:
+            append("user", [{"text": content}])
+    return system_parts, contents
+
+
 @dataclass(frozen=True)
 class TextDelta:
     text: str
@@ -418,6 +780,7 @@ class ToolCall:
     id: str
     name: str
     arguments: str
+    metadata: dict[str, Any] | None = None
 
     def parsed_arguments(self) -> dict[str, Any]:
         if not self.arguments.strip():
@@ -438,7 +801,14 @@ class ToolCall:
         return value
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "name": self.name, "arguments": self.arguments}
+        payload: dict[str, Any] = {
+            "id": self.id,
+            "name": self.name,
+            "arguments": self.arguments,
+        }
+        if self.metadata:
+            payload["metadata"] = self.metadata
+        return payload
 
 
 @dataclass(frozen=True)
@@ -565,6 +935,17 @@ class OpenCodeProvider:
     def anthropic_url(self) -> str:
         return f"{self.settings.base_url}/anthropic/v1/messages"
 
+    @property
+    def responses_url(self) -> str:
+        return f"{self.settings.base_url}/openai/v1/responses"
+
+    def google_url(self, model_id: str) -> str:
+        quoted = quote(model_id, safe="")
+        return (
+            f"{self.settings.base_url}/google/v1beta/models/{quoted}"
+            ":streamGenerateContent?alt=sse"
+        )
+
     # ---- auth ----
     def api_key(self) -> str | None:
         if self._api_key is not None:
@@ -635,11 +1016,7 @@ class OpenCodeProvider:
             raise ProviderError(
                 f"model {model_id!r} uses the {protocol} protocol, "
                 "which this build does not implement",
-                hint=(
-                    "OpenAI-chat and Anthropic (Claude) models are callable; "
-                    "GPT/Grok/Muse need the Responses API and Gemini needs the "
-                    "Google API, which this build does not implement"
-                ),
+                hint="run `panda models` to see supported model ids",
                 details={
                     "model": model_id,
                     "protocol": protocol,
@@ -755,8 +1132,21 @@ class OpenCodeProvider:
         key: str,
         session_id: str,
     ) -> AsyncIterator[ProviderEvent]:
-        if classify_protocol(model_id) == PROTOCOL_ANTHROPIC:
+        protocol = classify_protocol(model_id)
+        if protocol == PROTOCOL_ANTHROPIC:
             async for event in self._stream_anthropic(
+                messages, tools, model_id=model_id, key=key, session_id=session_id
+            ):
+                yield event
+            return
+        if protocol == PROTOCOL_RESPONSES:
+            async for event in self._stream_responses(
+                messages, tools, model_id=model_id, key=key, session_id=session_id
+            ):
+                yield event
+            return
+        if protocol == PROTOCOL_GOOGLE:
+            async for event in self._stream_google(
                 messages, tools, model_id=model_id, key=key, session_id=session_id
             ):
                 yield event
@@ -792,7 +1182,7 @@ class OpenCodeProvider:
     ) -> AsyncIterator[ProviderEvent]:
         payload: dict[str, Any] = {
             "model": model_id,
-            "messages": list(messages),
+            "messages": sanitize_messages_for_openai(messages),
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": self.settings.max_output_tokens,
@@ -1081,6 +1471,374 @@ class OpenCodeProvider:
         yield DoneEvent(finish_reason=finish_reason, tool_calls=calls, model=response_model)
 
 
+    async def _stream_responses(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]] | None,
+        *,
+        model_id: str,
+        key: str,
+        session_id: str,
+    ) -> AsyncIterator[ProviderEvent]:
+        """Stream the OpenAI Responses API, normalized to the shared events."""
+
+        instructions, converted = convert_messages_for_responses(messages)
+        payload: dict[str, Any] = {
+            "model": model_id,
+            "input": converted,
+            "stream": True,
+            "max_output_tokens": self.settings.max_output_tokens,
+        }
+        if instructions:
+            payload["instructions"] = instructions
+        if tools:
+            tool_payload = convert_tools_for_responses(tools)
+            if tool_payload:
+                payload["tools"] = tool_payload
+                payload["tool_choice"] = "auto"
+
+        headers = {**self._headers(session_id=session_id), "Authorization": f"Bearer {key}"}
+        slots: dict[int, dict[str, str]] = {}
+        usage_raw: dict[str, Any] = {}
+        finish_reason: str | None = None
+        response_model: str | None = None
+
+        try:
+            async with self.client.stream(
+                "POST", self.responses_url, json=payload, headers=headers
+            ) as response:
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", "replace")
+                    raise _error_for_status(
+                        response.status_code, body, retry_after=_retry_after(response)
+                    )
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderError(
+                            "provider sent a malformed stream chunk",
+                            details={"error": exc.msg},
+                        ) from exc
+                    if not isinstance(chunk, dict):
+                        continue
+                    kind = chunk.get("type")
+                    if kind == "error" or kind == "response.failed":
+                        raw_error = chunk.get("error")
+                        if raw_error is None and isinstance(chunk.get("response"), dict):
+                            raw_error = chunk["response"].get("error")
+                        message = (
+                            raw_error.get("message")
+                            if isinstance(raw_error, dict)
+                            else raw_error
+                        )
+                        raise ProviderError(
+                            "provider reported an error mid-stream",
+                            details={"message": redact_text(str(message))[:400]},
+                        )
+                    if kind in {"response.created", "response.in_progress"}:
+                        frame = chunk.get("response")
+                        if isinstance(frame, dict):
+                            response_model = (
+                                str(frame.get("model") or response_model or "") or None
+                            )
+                        continue
+                    if kind == "response.output_item.added":
+                        index = _as_int(chunk.get("output_index"))
+                        item = chunk.get("item")
+                        if isinstance(item, dict) and item.get("type") == "function_call":
+                            slot = slots.setdefault(
+                                index, {"id": "", "name": "", "arguments": ""}
+                            )
+                            slot["id"] = str(item.get("call_id") or slot["id"])
+                            slot["name"] = str(item.get("name") or slot["name"])
+                            yield ToolCallDelta(
+                                index=index,
+                                id=slot["id"] or None,
+                                name=slot["name"] or None,
+                            )
+                        continue
+                    if kind == "response.function_call_arguments.delta":
+                        index = _as_int(chunk.get("output_index"))
+                        delta = chunk.get("delta")
+                        if isinstance(delta, str) and delta:
+                            slot = slots.setdefault(
+                                index, {"id": "", "name": "", "arguments": ""}
+                            )
+                            slot["arguments"] += delta
+                            yield ToolCallDelta(
+                                index=index,
+                                id=slot["id"] or None,
+                                name=slot["name"] or None,
+                                arguments=delta,
+                            )
+                        continue
+                    if kind == "response.function_call_arguments.done":
+                        index = _as_int(chunk.get("output_index"))
+                        arguments = chunk.get("arguments")
+                        if isinstance(arguments, str):
+                            slot = slots.setdefault(
+                                index, {"id": "", "name": "", "arguments": ""}
+                            )
+                            slot["arguments"] = arguments
+                        continue
+                    if kind == "response.output_item.done":
+                        index = _as_int(chunk.get("output_index"))
+                        item = chunk.get("item")
+                        if isinstance(item, dict) and item.get("type") == "function_call":
+                            slot = slots.setdefault(
+                                index, {"id": "", "name": "", "arguments": ""}
+                            )
+                            slot["id"] = str(item.get("call_id") or slot["id"])
+                            slot["name"] = str(item.get("name") or slot["name"])
+                            slot["arguments"] = str(
+                                item.get("arguments") or slot["arguments"]
+                            )
+                        continue
+                    if kind in {"response.output_text.delta", "response.refusal.delta"}:
+                        delta = chunk.get("delta")
+                        if isinstance(delta, str) and delta:
+                            yield TextDelta(delta)
+                        continue
+                    if kind in {"response.completed", "response.incomplete"}:
+                        frame = chunk.get("response")
+                        if not isinstance(frame, dict):
+                            continue
+                        response_model = (
+                            str(frame.get("model") or response_model or "") or None
+                        )
+                        merge_usage(usage_raw, frame.get("usage"))
+                        details = frame.get("incomplete_details")
+                        if kind == "response.incomplete":
+                            reason = (
+                                str(details.get("reason") or "")
+                                if isinstance(details, dict)
+                                else ""
+                            )
+                            finish_reason = (
+                                "length" if reason == "max_output_tokens" else "incomplete"
+                            )
+                        continue
+        except ProviderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                f"provider stream timed out after {self.settings.timeout_seconds:g}s",
+                hint="raise provider.timeout_seconds or narrow the task",
+                details={"retryable": True},
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                "provider stream failed at the transport layer",
+                hint="retry once; if it repeats, check the network and provider.base_url",
+                details={"error": type(exc).__name__, "retryable": True},
+            ) from exc
+
+        usage = parse_responses_usage(usage_raw)
+        if usage is not None:
+            yield UsageEvent(usage)
+        calls = tuple(
+            ToolCall(
+                id=slot["id"] or f"call_{index}",
+                name=slot["name"],
+                arguments=slot["arguments"],
+            )
+            for index, slot in sorted(slots.items())
+            if slot["name"]
+        )
+        if finish_reason is None:
+            finish_reason = "tool_calls" if calls else "stop"
+        yield DoneEvent(finish_reason=finish_reason, tool_calls=calls, model=response_model)
+
+    async def _stream_google(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]] | None,
+        *,
+        model_id: str,
+        key: str,
+        session_id: str,
+    ) -> AsyncIterator[ProviderEvent]:
+        """Stream Gemini generateContent, normalized to the shared events."""
+
+        system_parts, contents = convert_messages_for_google(messages)
+        payload: dict[str, Any] = {
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": self.settings.max_output_tokens,
+                "temperature": self.settings.temperature,
+            },
+        }
+        if system_parts:
+            payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
+        if tools:
+            tool_payload = convert_tools_for_google(tools)
+            if tool_payload:
+                payload["tools"] = tool_payload
+
+        headers = {**self._headers(session_id=session_id), "Authorization": f"Bearer {key}"}
+        slots: dict[int, dict[str, str]] = {}
+        signatures: dict[str, str] = {}
+        usage_raw: dict[str, Any] = {}
+        finish_reason: str | None = None
+        response_model: str | None = None
+        next_index = 0
+
+        try:
+            async with self.client.stream(
+                "POST", self.google_url(model_id), json=payload, headers=headers
+            ) as response:
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", "replace")
+                    raise _error_for_status(
+                        response.status_code, body, retry_after=_retry_after(response)
+                    )
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderError(
+                            "provider sent a malformed stream chunk",
+                            details={"error": exc.msg},
+                        ) from exc
+                    if not isinstance(chunk, dict):
+                        continue
+                    raw_error = chunk.get("error")
+                    if raw_error is not None:
+                        message = (
+                            raw_error.get("message")
+                            if isinstance(raw_error, dict)
+                            else raw_error
+                        )
+                        raise ProviderError(
+                            "provider reported an error mid-stream",
+                            details={"message": redact_text(str(message))[:400]},
+                        )
+                    feedback = chunk.get("promptFeedback")
+                    if isinstance(feedback, dict) and feedback.get("blockReason"):
+                        raise ProviderError(
+                            "provider blocked the prompt",
+                            details={"reason": str(feedback["blockReason"])},
+                        )
+                    response_model = str(chunk.get("modelVersion") or response_model or "") or None
+                    merge_usage(usage_raw, chunk.get("usageMetadata"))
+                    candidates = chunk.get("candidates")
+                    if not isinstance(candidates, list):
+                        continue
+                    for candidate in candidates:
+                        if not isinstance(candidate, dict):
+                            continue
+                        content = candidate.get("content")
+                        parts = content.get("parts") if isinstance(content, dict) else None
+                        for part in parts if isinstance(parts, list) else []:
+                            if not isinstance(part, dict) or part.get("thought") is True:
+                                continue
+                            text = part.get("text")
+                            if isinstance(text, str) and text:
+                                yield TextDelta(text)
+                            call = part.get("functionCall")
+                            if not isinstance(call, dict):
+                                continue
+                            name = str(call.get("name") or "").strip()
+                            if not name:
+                                continue
+                            call_id = str(call.get("id") or "").strip() or (
+                                f"call_{next_index}"
+                            )
+                            if any(slot["id"] == call_id for slot in slots.values()):
+                                continue
+                            index = next_index
+                            next_index += 1
+                            arguments = json.dumps(
+                                _tool_input(call.get("args")),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            slots[index] = {
+                                "id": call_id,
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                            signature = part.get("thoughtSignature") or part.get(
+                                "thought_signature"
+                            )
+                            if isinstance(signature, str) and signature:
+                                signatures[call_id] = signature
+                            yield ToolCallDelta(
+                                index=index,
+                                id=call_id,
+                                name=name,
+                                arguments=arguments,
+                            )
+                        reason = candidate.get("finishReason")
+                        if reason:
+                            raw_reason = str(reason)
+                            if raw_reason == "MALFORMED_FUNCTION_CALL":
+                                raise ProviderError(
+                                    "provider could not form a valid tool call",
+                                    hint="retry the turn",
+                                    details={"finish_reason": raw_reason},
+                                )
+                            finish_reason = GOOGLE_FINISH_REASONS.get(
+                                raw_reason, raw_reason.lower()
+                            )
+        except ProviderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                f"provider stream timed out after {self.settings.timeout_seconds:g}s",
+                hint="raise provider.timeout_seconds or narrow the task",
+                details={"retryable": True},
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                "provider stream failed at the transport layer",
+                hint="retry once; if it repeats, check the network and provider.base_url",
+                details={"error": type(exc).__name__, "retryable": True},
+            ) from exc
+
+        usage = parse_google_usage(usage_raw)
+        if usage is not None:
+            yield UsageEvent(usage)
+        calls = tuple(
+            ToolCall(
+                id=slot["id"] or f"call_{index}",
+                name=slot["name"],
+                arguments=slot["arguments"],
+                metadata=(
+                    {"google": {"thought_signature": signatures[slot["id"]]}}
+                    if slot["id"] in signatures
+                    else None
+                ),
+            )
+            for index, slot in sorted(slots.items())
+            if slot["name"]
+        )
+        if finish_reason is None:
+            finish_reason = "tool_calls" if calls else "stop"
+        elif calls and finish_reason == "stop":
+            finish_reason = "tool_calls"
+        yield DoneEvent(finish_reason=finish_reason, tool_calls=calls, model=response_model)
+
+
 def provider_for_config(config: PandaConfig) -> OpenCodeProvider:
     return OpenCodeProvider(config.provider, model=config.model)
 
@@ -1127,12 +1885,19 @@ __all__ = [
     "USER_AGENT",
     "classify_protocol",
     "convert_messages_for_anthropic",
+    "convert_messages_for_google",
+    "convert_messages_for_responses",
     "convert_tools_for_anthropic",
+    "convert_tools_for_google",
+    "convert_tools_for_responses",
     "is_free_model",
     "is_supported_model",
     "model_protocol",
     "parse_anthropic_usage",
+    "parse_google_usage",
+    "parse_responses_usage",
     "parse_usage",
     "provider_for_config",
+    "sanitize_messages_for_openai",
     "status_snapshot",
 ]

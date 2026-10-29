@@ -1,4 +1,4 @@
-"""Provider: Go URLs/headers, SSE normalization, tools, usage, Anthropic adapter."""
+"""Provider: Go URLs/headers, SSE normalization, tools, usage, four adapters."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from panda_core.config import ProviderSettings
 from panda_core.errors import ProviderError
 from panda_core.model_catalog import MODEL_IDS
 from panda_core.provider import (
+    SUPPORTED_PROTOCOLS,
     DoneEvent,
     OpenCodeProvider,
     TextDelta,
@@ -21,9 +22,15 @@ from panda_core.provider import (
     UsageEvent,
     classify_protocol,
     convert_messages_for_anthropic,
+    convert_messages_for_google,
+    convert_messages_for_responses,
     convert_tools_for_anthropic,
+    convert_tools_for_google,
     is_free_model,
+    is_supported_model,
     parse_anthropic_usage,
+    parse_google_usage,
+    parse_responses_usage,
     parse_usage,
 )
 from panda_core.version import __version__
@@ -41,6 +48,16 @@ def anthropic_sse(*events: dict[str, Any]) -> str:
     return "".join(
         f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
     )
+
+
+def responses_sse(*events: dict[str, Any]) -> str:
+    return "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events
+    )
+
+
+def google_sse(*chunks: dict[str, Any]) -> str:
+    return "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
 
 
 def provider_with(handler, *, api_key="test-key", model="deepseek-v4.1-flash"):
@@ -125,7 +142,7 @@ def test_model_list_uses_go_url_and_required_headers() -> None:
     assert by_id["claude-haiku-5-5"].protocol == "anthropic"
     assert by_id["claude-haiku-5-5"].supported is True
     assert by_id["gpt-6-luna"].protocol == "responses"
-    assert by_id["gpt-6-luna"].supported is False
+    assert by_id["gpt-6-luna"].supported is True
     assert by_id["beam-free"].free is True
     assert by_id["deepseek-v4.1-flash"].qualified() == "opencode-go/deepseek-v4.1-flash"
 
@@ -323,23 +340,10 @@ def test_missing_api_key_names_only_the_variable(monkeypatch: pytest.MonkeyPatch
     assert "not set" in raised.value.message
 
 
-@pytest.mark.parametrize(
-    ("model", "protocol"),
-    [("opencode-go/gpt-6-luna", "responses"), ("opencode-go/gemini-4-argon", "google")],
-)
-def test_unsupported_protocol_fails_before_network(model: str, protocol: str) -> None:
-    calls = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        return httpx.Response(200, text=sse())
-
-    provider = provider_with(handler, model="deepseek-v4.1-flash")
-    with pytest.raises(ProviderError) as raised:
-        asyncio.run(collect(provider, model=model))
-    assert protocol in raised.value.message
-    assert raised.value.details["supported_protocols"] == ["anthropic", "openai-chat"]
-    assert calls["n"] == 0
+def test_every_catalog_model_is_callable() -> None:
+    assert {"anthropic", "google", "openai-chat", "responses"} == SUPPORTED_PROTOCOLS
+    missing = [model_id for model_id in MODEL_IDS if not is_supported_model(model_id)]
+    assert missing == []
 
 
 def test_foreign_provider_is_rejected() -> None:
@@ -780,3 +784,444 @@ def test_anthropic_history_drops_tool_results_of_a_dropped_assistant() -> None:
     assert converted == [
         {"role": "user", "content": [{"type": "text", "text": "next"}]}
     ]
+
+def test_responses_text_stream() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == f"{BASE}/openai/v1/responses"
+        assert request.headers["authorization"] == "Bearer test-key"
+        assert request.headers["user-agent"] == USER_AGENT
+        payload = json.loads(request.content)
+        assert payload["model"] == "gpt-6-luna"
+        assert payload["stream"] is True
+        assert payload["instructions"] == "rules"
+        assert payload["input"] == [
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ]
+        return httpx.Response(
+            200,
+            text=responses_sse(
+                {"type": "response.created", "response": {"model": "gpt-6-luna"}},
+                {"type": "response.output_text.delta", "delta": "po"},
+                {"type": "response.output_text.delta", "delta": "ng"},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "model": "gpt-6-luna",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 2,
+                            "total_tokens": 12,
+                            "input_tokens_details": {"cached_tokens": 4},
+                            "opencode": {"list_cost": 0.001},
+                        },
+                    },
+                },
+            ),
+        )
+
+    provider = provider_with(handler, model="gpt-6-luna")
+    events = asyncio.run(
+        collect(
+            provider,
+            messages=[
+                {"role": "system", "content": "rules"},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+    )
+
+    assert [event.text for event in events if isinstance(event, TextDelta)] == ["po", "ng"]
+    usage = next(event.usage for event in events if isinstance(event, UsageEvent))
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens) == (10, 2, 4)
+    assert usage.cost_usd == pytest.approx(0.001)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.model == "gpt-6-luna"
+    assert done.finish_reason == "stop"
+
+
+def test_responses_tool_call_stream() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["tools"] == [
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read.",
+                "parameters": schema,
+            }
+        ]
+        return httpx.Response(
+            200,
+            text=responses_sse(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": "",
+                    },
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "delta": '{"path":',
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "delta": '"README.md"}',
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "output_index": 0,
+                    "arguments": '{"path":"README.md"}',
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": '{"path":"README.md"}',
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {"model": "gpt-6-luna", "usage": {"input_tokens": 5}},
+                },
+            ),
+        )
+
+    provider = provider_with(handler, model="gpt-6-luna")
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "read_file", "description": "Read.", "parameters": schema},
+        }
+    ]
+    events = asyncio.run(collect(provider, tools=tools))
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.tool_calls == (
+        ToolCall(id="call_1", name="read_file", arguments='{"path":"README.md"}'),
+    )
+    assert done.finish_reason == "tool_calls"
+
+
+def test_responses_failed_event_fails_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=responses_sse(
+                {
+                    "type": "response.failed",
+                    "response": {"error": {"code": "server_error", "message": "boom"}},
+                }
+            ),
+        )
+
+    provider = provider_with(handler, model="gpt-6-luna")
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(collect(provider))
+    assert "mid-stream" in raised.value.message
+    assert "boom" in raised.value.details["message"]
+
+
+def test_responses_history_conversion() -> None:
+    instructions, items = convert_messages_for_responses(
+        [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "read"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "x"},
+            {"role": "assistant", "content": "done"},
+        ]
+    )
+
+    assert instructions == "rules"
+    assert items == [
+        {"role": "user", "content": [{"type": "input_text", "text": "read"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "read_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "x"},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+    ]
+
+
+def test_google_text_stream() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == (
+            f"{BASE}/google/v1beta/models/gemini-4-argon:streamGenerateContent?alt=sse"
+        )
+        payload = json.loads(request.content)
+        assert payload["systemInstruction"] == {"parts": [{"text": "rules"}]}
+        assert payload["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
+        return httpx.Response(
+            200,
+            text=google_sse(
+                {
+                    "modelVersion": "gemini-4-argon",
+                    "candidates": [
+                        {"content": {"role": "model", "parts": [{"text": "po"}]}}
+                    ],
+                    "usageMetadata": {"promptTokenCount": 10},
+                },
+                {
+                    "modelVersion": "gemini-4-argon",
+                    "candidates": [
+                        {
+                            "content": {"role": "model", "parts": [{"text": "ng"}]},
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 10,
+                        "candidatesTokenCount": 2,
+                        "totalTokenCount": 12,
+                        "opencode": {"list_cost": 0.002},
+                    },
+                },
+            ),
+        )
+
+    provider = provider_with(handler, model="gemini-4-argon")
+    events = asyncio.run(
+        collect(
+            provider,
+            messages=[
+                {"role": "system", "content": "rules"},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+    )
+
+    assert [event.text for event in events if isinstance(event, TextDelta)] == ["po", "ng"]
+    usage = next(event.usage for event in events if isinstance(event, UsageEvent))
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (10, 2, 12)
+    assert usage.cost_usd == pytest.approx(0.002)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.model == "gemini-4-argon"
+    assert done.finish_reason == "stop"
+
+
+def test_google_tool_call_keeps_thought_signature() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        declaration = payload["tools"][0]["functionDeclarations"][0]
+        assert declaration["name"] == "read_file"
+        assert "additionalProperties" not in declaration["parameters"]
+        return httpx.Response(
+            200,
+            text=google_sse(
+                {
+                    "modelVersion": "gemini-4-argon",
+                    "candidates": [
+                        {
+                            "content": {
+                                "role": "model",
+                                "parts": [
+                                    {
+                                        "thoughtSignature": "sig-1",
+                                        "functionCall": {
+                                            "id": "call_9",
+                                            "name": "read_file",
+                                            "args": {"path": "README.md"},
+                                        },
+                                    }
+                                ],
+                            },
+                            "finishReason": "STOP",
+                        }
+                    ],
+                    "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 3},
+                }
+            ),
+        )
+
+    provider = provider_with(handler, model="gemini-4-argon")
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "read_file", "description": "Read.", "parameters": schema},
+        }
+    ]
+    events = asyncio.run(collect(provider, tools=tools))
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.tool_calls == (
+        ToolCall(
+            id="call_9",
+            name="read_file",
+            arguments='{"path":"README.md"}',
+            metadata={"google": {"thought_signature": "sig-1"}},
+        ),
+    )
+    assert done.finish_reason == "tool_calls"
+
+
+def test_google_history_echoes_signature_and_names() -> None:
+    system, contents = convert_messages_for_google(
+        [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "read"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                        "provider_meta": {"google": {"thought_signature": "sig"}},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "# Panda"},
+        ]
+    )
+
+    assert system == ["rules"]
+    assert contents[0] == {"role": "user", "parts": [{"text": "read"}]}
+    assert contents[1]["parts"][0]["functionCall"] == {
+        "name": "read_file",
+        "args": {"path": "README.md"},
+    }
+    assert contents[1]["parts"][0]["thoughtSignature"] == "sig"
+    assert contents[2] == {
+        "role": "user",
+        "parts": [
+            {
+                "functionResponse": {
+                    "name": "read_file",
+                    "response": {"content": "# Panda"},
+                }
+            }
+        ],
+    }
+
+
+def test_google_blocked_prompt_fails_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, text=google_sse({"promptFeedback": {"blockReason": "SAFETY"}})
+        )
+
+    provider = provider_with(handler, model="gemini-4-argon")
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(collect(provider))
+    assert "blocked" in raised.value.message
+    assert raised.value.details["reason"] == "SAFETY"
+
+
+def test_google_usage_parser() -> None:
+    usage = parse_google_usage(
+        {
+            "promptTokenCount": 7,
+            "candidatesTokenCount": 3,
+            "totalTokenCount": 10,
+            "cachedContentTokenCount": 2,
+            "opencode": {"list_cost": 0.0005},
+        }
+    )
+
+    assert usage is not None
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.cached_tokens) == (7, 3, 2)
+    assert usage.cost_usd == pytest.approx(0.0005)
+
+
+def test_responses_usage_parser() -> None:
+    usage = parse_responses_usage(
+        {
+            "input_tokens": 9,
+            "output_tokens": 4,
+            "total_tokens": 13,
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 1},
+        }
+    )
+
+    assert usage is not None
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (9, 4, 13)
+    assert (usage.cached_tokens, usage.cache_write_tokens) == (3, 1)
+
+
+def test_openai_history_drops_provider_meta() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        messages = json.loads(request.content)["messages"]
+        assert "provider_meta" not in messages[1]["tool_calls"][0]
+        assert messages[1]["tool_calls"][0]["function"]["name"] == "read_file"
+        return httpx.Response(200, text=sse({"choices": [{"delta": {"content": "ok"}}]}))
+
+    provider = provider_with(handler)
+    asyncio.run(
+        collect(
+            provider,
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                            "provider_meta": {"google": {"thought_signature": "sig"}},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "x"},
+            ],
+        )
+    )
+
+def test_google_schema_keeps_property_named_pattern() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string"},
+                        "default": {"type": "string"},
+                    },
+                    "required": ["pattern"],
+                },
+            },
+        }
+    ]
+
+    declaration = convert_tools_for_google(tools)[0]["functionDeclarations"][0]
+
+    assert declaration["parameters"]["properties"] == {
+        "pattern": {"type": "string"},
+        "default": {"type": "string"},
+    }
+    assert declaration["parameters"]["required"] == ["pattern"]

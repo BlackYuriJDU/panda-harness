@@ -344,6 +344,11 @@ class Agent:
                             "id": call.id,
                             "type": "function",
                             "function": {"name": call.name, "arguments": call.arguments},
+                            **(
+                                {"provider_meta": call.metadata}
+                                if getattr(call, "metadata", None)
+                                else {}
+                            ),
                         }
                         for call in calls
                     ]

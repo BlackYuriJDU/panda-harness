@@ -262,18 +262,21 @@ def test_run_requires_task(wired_workspace) -> None:
     assert "task is required" in result.output
 
 
-def test_run_rejects_unsupported_protocol(wired_workspace) -> None:
+@pytest.mark.parametrize(
+    "model", ["opencode-go/gpt-6-luna", "opencode-go/gemini-4-argon"]
+)
+def test_run_plans_every_supported_protocol(wired_workspace, model: str) -> None:
     result = invoke(
         "run",
         "x",
         "--root",
         str(wired_workspace.root),
         "--model",
-        "opencode-go/gpt-6-luna",
+        model,
         "--dry-run",
     )
-    assert result.exit_code == 2
-    assert "protocol" in result.output
+    assert result.exit_code == 0
+    assert model in result.output
 
 
 def test_run_rejects_foreign_provider(wired_workspace) -> None:
@@ -303,7 +306,7 @@ def test_models_falls_back_to_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = json.loads(result.stdout)
     assert payload["source"] == "snapshot"
     assert payload["count"] == 38
-    assert sum(1 for model in payload["models"] if model["supported"]) == 31
+    assert sum(1 for model in payload["models"] if model["supported"]) == 38
     assert any(model["free"] for model in payload["models"])
 
 
@@ -322,7 +325,7 @@ def test_models_without_api_key_are_not_ready(monkeypatch: pytest.MonkeyPatch) -
     assert payload["api_key_env"] == "OPENCODE_API_KEY"
     assert payload["api_key_present"] is False
     assert payload["count"] == 38
-    assert sum(1 for model in payload["models"] if model["callable"]) == 31
+    assert sum(1 for model in payload["models"] if model["callable"]) == 38
     assert not any(model["ready"] for model in payload["models"])
 
 
@@ -340,7 +343,7 @@ def test_models_with_api_key_mark_supported_ready(monkeypatch: pytest.MonkeyPatc
     payload = json.loads(result.stdout)
     assert payload["api_key_present"] is True
     ready = [model for model in payload["models"] if model["ready"]]
-    assert len(ready) == 31
+    assert len(ready) == 38
     assert all(model["callable"] for model in ready)
     assert "dummy-not-a-secret" not in result.stdout
 

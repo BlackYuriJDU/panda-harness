@@ -258,7 +258,7 @@ def run_doctor(workspace: Workspace, *, run_validation: bool = False) -> DoctorR
         f"Model ({protocol})",
         "ok" if protocol in SUPPORTED_PROTOCOLS else "warn",
         workspace.config.model,
-        "openai-chat and anthropic (Claude) are implemented; "
+        "openai-chat, anthropic, responses, and google are implemented; "
         "pick a supported id with `panda models`",
         required=False,
     )

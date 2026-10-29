@@ -50,7 +50,7 @@ Nothing is enforced only in the prompt.
 |---|---|
 | `config.py` | Typed `.panda/config.json` (schema 2), provider settings, path restrictions. |
 | `workspace.py` | Root discovery, path normalization, git/tool probes. |
-| `provider.py` | OpenCode Go client: catalogue, protocol classification, OpenAI-chat and Anthropic Messages streaming adapters, usage. |
+| `provider.py` | OpenCode Go client: catalogue, protocol classification, streaming adapters for OpenAI chat, Anthropic Messages, Responses, and Google generateContent, usage. |
 | `agent.py` | System prompt, turn loop, tool dispatch, context trimming, approvals, usage accounting. |
 | `tools.py` | JSON-schema tool specs, path resolution, read/write/shell/validate/study/evidence/claim/number/session tools. |
 | `policy.py` | Ordered rules, last-match-wins, hard denies, `ask` handling. |
@@ -75,13 +75,17 @@ Nothing is enforced only in the prompt.
 
 ## Provider routing
 
-The provider is deliberately narrow: it implements the two wire protocols
-OpenCode Go exposes under one key, and nothing else.
+The provider implements the four wire protocols OpenCode Go exposes under one key
+and nothing else. All four normalize into the same event stream, so the agent
+loop never branches on protocol.
 
 ```text
-POST {base_url}/openai/v1/chat/completions   (stream, OpenAI chat)
-POST {base_url}/anthropic/v1/messages        (stream, Anthropic Messages)
-GET  {base_url}/v1/models                    (catalogue, 38 models)
+POST {base_url}/openai/v1/chat/completions                 (stream, OpenAI chat)
+POST {base_url}/anthropic/v1/messages                      (stream, Anthropic Messages)
+POST {base_url}/openai/v1/responses                        (stream, Responses)
+POST {base_url}/google/v1beta/models/<id>:streamGenerateContent?alt=sse
+                                                           (stream, Google)
+GET  {base_url}/v1/models                                  (catalogue, 38 models)
 ```
 
 Every request sends `User-Agent: panda-harness/<version>` and a stable
@@ -91,10 +95,11 @@ agent pass the Panda session id so the upstream trace matches the ledger.
 
 `classify_protocol()` maps a model id to its wire protocol: `claude-*` ->
 Anthropic Messages, `gpt-*`/`o1*`/`o3*`/`grok-*`/`muse-*` -> Responses,
-`gemini-*` -> Google generateContent, everything else -> OpenAI chat.
-`openai-chat` and `anthropic` are implemented. Unsupported ids are classified
-and reported honestly (exit `2` when selected) instead of being sent through the
-wrong adapter. There is no silent model fallback and no provider auto-switch.
+`gemini-*` -> Google generateContent, everything else -> OpenAI chat. All four
+protocols are implemented, so every id in the captured catalogue is callable.
+An unknown protocol still fails closed (exit `2` when selected) instead of being
+sent through the wrong adapter. There is no silent model fallback and no
+provider auto-switch.
 
 The Anthropic adapter converts the OpenAI-shaped history the agent owns: system
 messages become the `system` prompt, assistant tool calls become `tool_use`
@@ -103,6 +108,25 @@ adjacent same-role messages merge so roles alternate. Text deltas,
 `input_json_delta` tool arguments, stop reasons, and usage normalize into the
 same `TextDelta`/`ToolCall`/`Usage` shape as OpenAI chat; cost comes from
 `usage.opencode.list_cost` when present.
+
+The Responses adapter sends `input` items instead of messages: system text
+becomes `instructions`, assistant tool calls become `function_call` items, and
+tool results become `function_call_output` items. It consumes
+`response.output_text.delta`, `response.function_call_arguments.delta`, and the
+terminal `response.completed`/`response.incomplete` frames, so partial argument
+JSON streams like OpenAI chat. Usage maps from `input_tokens`/`output_tokens`
+plus `input_tokens_details`.
+
+The Google adapter sends `contents` with `systemInstruction`, and converts tools
+into `functionDeclarations` after stripping schema keys Gemini rejects
+(`additionalProperties`, `$schema`, `default`, …) while preserving caller-chosen
+property names — a tool argument called `pattern` must not disappear. Gemini
+requires the `thoughtSignature` returned with a `functionCall` to be echoed on
+the next turn; the adapter stores it in `ToolCall.metadata`, the agent persists
+it as `provider_meta` on the assistant message, and the converter restores it.
+It is stripped before any other protocol sees the history. Gemini often reports
+`finishReason: STOP` alongside function calls, so the adapter maps that to
+`tool_calls` when calls are present.
 
 The key is read from the environment by name (`OPENCODE_API_KEY` by default) and
 only used in the `Authorization` header. Error messages name the variable, never

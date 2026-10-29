@@ -611,10 +611,7 @@ def _validate_model(workspace: Workspace, model: str | None) -> str:
     if not is_supported_model(selected):
         raise ConfigError(
             f"model {selected!r} uses a protocol this build does not implement",
-            hint=(
-                "OpenAI-chat and Anthropic (Claude) models are callable; "
-                "GPT/Grok/Muse (responses) and Gemini (google) are not"
-            ),
+            hint="list the callable ids with `panda models`",
         )
     return selected
 
