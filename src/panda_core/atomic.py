@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import secrets
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -32,7 +33,7 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
-        if os.name == "nt":
+        if sys.platform == "win32":
             import msvcrt
 
             deadline = time.monotonic() + timeout
@@ -51,7 +52,7 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
         try:
             yield
         finally:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
 
                 with contextlib.suppress(OSError):
