@@ -1,6 +1,6 @@
 # Panda Harness — v0.2 Contract
 
-**Version:** `0.2.0a3` (unreleased)
+**Version:** `0.2.0a4` (unreleased)
 **Status:** frozen for the v0.2 line once tagged
 **Runtime:** Panda cockpit + REPL + headless run, over the OpenCode Go provider
 **License:** MIT

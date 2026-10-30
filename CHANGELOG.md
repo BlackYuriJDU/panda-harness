@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0a4] — 2026-10-30
+
+### Fixed
+
+- POSIX CI: `mypy` on Linux type-checked the Windows-only `msvcrt` lock branch
+  because it was guarded by `os.name`. Both Ubuntu jobs failed on
+  `msvcrt.locking`/`LK_NBLCK`/`LK_UNLCK`. The guard is now
+  `sys.platform == "win32"`, which mypy narrows per platform; runtime behaviour
+  is unchanged.
+
+### Verified
+
+- `mypy --platform linux` and `mypy --platform win32` are clean, `ruff` is
+  clean, and the full suite passes on Windows (340 passed, 4 skipped).
+
 ## [0.2.0a3] — 2026-10-29
 
 Every model in the captured Go catalogue is callable. The agent loop stays

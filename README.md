@@ -4,8 +4,8 @@
 
 > A fail-closed terminal harness for evidence-heavy research corpora.
 
-**Status:** alpha. `0.2.0a2` is the last tagged release; the line in `main` is
-the unreleased `0.2.0a3`, described in [`docs/CONTRACT.md`](docs/CONTRACT.md).
+**Status:** alpha. `0.2.0a3` is the last tagged release; the line in `main` is
+the unreleased `0.2.0a4`, described in [`docs/CONTRACT.md`](docs/CONTRACT.md).
 
 Panda is a terminal agent and optional MCP server that keeps an AI model inside
 an evidence discipline: approved write scopes, canonical validation, a verifiable

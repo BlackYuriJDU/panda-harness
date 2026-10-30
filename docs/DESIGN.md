@@ -33,7 +33,7 @@ workspace-relative; absolute paths appear only in diagnostics.
 
 ```text
 ┌ header ──────────────────────────────────────────────┐
-│ PANDA 0.2.0a3   root · branch · session · model      │
+│ PANDA 0.2.0a4   root · branch · session · model      │
 ├ transcript ─────────────────────────┬ sidebar ───────┤
 │ user / assistant markdown           │ mascot         │
 │ tool cards (running/ok/blocked)     │ state          │
