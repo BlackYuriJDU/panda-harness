@@ -98,6 +98,11 @@ enabled legacy export both produce a warning line.
 
 `.panda/config.json` is validated with Pydantic (`extra="forbid"`). Defaults:
 
+**Read-only commands run nothing.** `panda status` and the session metadata
+never execute the configured `node`; the Node.js version is reported from the
+user-scoped cache or as unknown. Node runs only for `panda doctor`,
+`panda validate`, and the validator tools.
+
 **Symbolic links.** The files the workspace names -- `.panda/config.json`,
 `.panda/policy.json`, the instructions file, and the validator script -- must be
 regular files reached through regular directories. A symbolic link anywhere
@@ -127,7 +132,7 @@ files only.
 | `provider.max_output_tokens` | `8192` |
 | `provider.temperature` | `0.2` |
 | `validator` | `corpus/validation/validate.mjs` |
-| `node` | `node` |
+| `node` | `node` (a plain command name resolved through `PATH`; paths, drive letters, spaces and options are refused) |
 | `node_min_major` | `20` |
 | `timeouts.validate_seconds` | `180` |
 | `timeouts.run_seconds` | `null` (no limit) |

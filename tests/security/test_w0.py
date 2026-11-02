@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
 import threading
 from collections.abc import Iterator
@@ -362,3 +363,75 @@ def test_dangling_instructions_symlink_is_refused_too(workspace: Workspace) -> N
     _link(workspace.instructions_path, workspace.root / "does-not-exist.txt")
     with pytest.raises(ConfigError):
         build_system_prompt(workspace)
+
+
+# --------------------------------------------------------------------------- TRUST-002
+def _fake_node(directory: Path, marker: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / "node"
+    script.write_text(f"#!/bin/sh\necho ran >> '{marker}'\necho v24.0.0\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+@POSIX_ONLY
+def test_status_does_not_execute_a_script_named_by_config_node(
+    workspace: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "node-ran.txt"
+    _fake_node(workspace.root / "tools", marker)
+    monkeypatch.setenv("PANDA_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(workspace.root)  # the real attack: a user opens the corpus
+    path = workspace.config_path
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["node"] = "tools/node"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    runner.invoke(app, ["status", "--root", str(workspace.root), "--json"])
+    assert not marker.exists()
+
+
+@POSIX_ONLY
+def test_status_never_probes_node_even_when_a_node_is_on_path(
+    workspace: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "node-on-path-ran.txt"
+    _fake_node(tmp_path / "bin", marker)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("PANDA_HOME", str(tmp_path / "home"))
+    result = runner.invoke(app, ["status", "--root", str(workspace.root), "--json"])
+    assert result.exit_code == 0, result.output
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "tools/node",
+        "./node",
+        "../node",
+        "..\\node",
+        "C:\\node.exe",
+        "C:node",
+        "/usr/bin/node",
+        "node --eval x",
+        "node;touch x",
+        "-node",
+        "",
+    ],
+)
+def test_config_node_must_be_a_simple_command_name(workspace: Workspace, value: str) -> None:
+    path = workspace.config_path
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["node"] = value
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+@pytest.mark.parametrize("value", ["node", "node.exe", "nodejs", "node24"])
+def test_config_node_accepts_plain_command_names(workspace: Workspace, value: str) -> None:
+    path = workspace.config_path
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["node"] = value
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert load_config(path).node == value

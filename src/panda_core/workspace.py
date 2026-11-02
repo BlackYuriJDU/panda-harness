@@ -266,14 +266,22 @@ class Workspace:
                 dirty = True
         return {"repo": True, "commit": commit, "branch": branch, "dirty": dirty}
 
-    def tool_versions(self) -> dict:
+    def tool_versions(self, *, probe: bool = True) -> dict:
+        """Tool versions for diagnostics.
+
+        With `probe=False` nothing is executed: the node version comes from the
+        user-scoped cache or is `None`. Read-only commands (`status`, session
+        metadata) use this so that opening a corpus never runs a binary
+        (TRUST-002); `doctor` and `validate` are where node runs.
+        """
+
         return {
             "python": platform.python_version(),
             "platform": platform.platform(),
-            "node": self._cached_node_version(),
+            "node": self._cached_node_version(probe=probe),
         }
 
-    def _cached_node_version(self) -> str | None:
+    def _cached_node_version(self, *, probe: bool = True) -> str | None:
         """Avoid spawning node on every boot; refresh at most once a week."""
 
         command = self.config.node
@@ -292,6 +300,8 @@ class Workspace:
         ):
             version = entry.get("version")
             return version if isinstance(version, str) else None
+        if not probe:
+            return None
         version = command_version(command, timeout=1.5)
         with contextlib.suppress(OSError):
             atomic_write_json(
@@ -311,7 +321,7 @@ class Workspace:
             "sessions": str(self.sessions_dir),
             "opencode_config": str(self.opencode_config_path),
             "git": self.git_state(),
-            "tools": self.tool_versions(),
+            "tools": self.tool_versions(probe=False),
         }
 
 

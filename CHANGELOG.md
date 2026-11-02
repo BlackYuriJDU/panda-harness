@@ -23,11 +23,19 @@ All notable changes to this project are documented here. The format follows
   the system prompt, and a linked validator is not executed. Instructions are now
   redacted before they reach the prompt.
 
+- `panda status` no longer executes the corpus-chosen `node` (TRUST-002).
+  `config.node` must be a plain command name resolved through `PATH`, and
+  `status` plus the session metadata do not probe the binary at all; the node
+  version is reported from the user-scoped cache or as `null`. `doctor`,
+  `validate` and the validator tools are where node runs.
+
 ### Changed
 
 - **Breaking for custom endpoints:** a workspace file with a non-official
   `provider.base_url` or `provider.api_key_env` is now rejected. `panda init
   --force` resets it to the defaults.
+- **Breaking for a path in `node`:** put the binary on `PATH` instead of naming
+  its path in `.panda/config.json`.
 - **Breaking for symlinked workspace files:** copy the target into the
   workspace instead of linking it.
 

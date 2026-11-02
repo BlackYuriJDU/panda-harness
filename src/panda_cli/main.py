@@ -112,7 +112,7 @@ def _session_metadata(workspace: Workspace) -> dict[str, Any]:
         "cwd": str(Path.cwd()),
         "panda_version": __version__,
         "git": workspace.git_state(),
-        "tools": workspace.tool_versions(),
+        "tools": workspace.tool_versions(probe=False),
         "env_names": env_names,
     }
 

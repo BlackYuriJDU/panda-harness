@@ -28,6 +28,7 @@ LEGACY_PROVIDER = "opencode"
 GO_BASE_SUFFIX = "/inference/go"
 DEFAULT_API_KEY_ENV = "OPENCODE_API_KEY"
 TRUSTED_PROVIDER_HOST = "opencode.ai"
+_NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 DEFAULT_CONTEXT_WINDOW = 131_072
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 DEFAULT_VALIDATOR = "corpus/validation/validate.mjs"
@@ -216,6 +217,17 @@ class PandaConfig(BaseModel):
     @classmethod
     def _relative_inside_workspace(cls, value: str) -> str:
         return _relative_posix_path(value)
+
+    @field_validator("node")
+    @classmethod
+    def _node_is_a_plain_command_name(cls, value: str) -> str:
+        # A path would let the corpus pick the binary Panda executes (TRUST-002).
+        if not _NODE_NAME_RE.match(value):
+            raise ValueError(
+                "node must be a plain command name resolved through PATH "
+                "(no path separators, drive letters, spaces or options)"
+            )
+        return value
 
     def to_jsonable(self) -> dict:
         return self.model_dump(mode="json")
