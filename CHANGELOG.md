@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Validator routes (SEC-002) and MCP policy (MCP-001, MCP-002): the `validate` tool
+  and the MCP `validate` and `study_show` ran with no policy check, so a rewritten
+  validator was executable without approval through three routes. `validate` is now
+  authorized under a `validate` action (baseline allow beneath any workspace policy,
+  and the validator itself is `hard_deny` for writes) and records
+  `validator_sha256`; the MCP service reuses `ToolRegistry`, so `ask` is denied and a
+  denial is written to the ledger. The `tool` rules now name the tools FastMCP
+  actually registers.
 - Shell policy by effect (SEC-001, SEC-007, shell route of SEC-002): commands are
   classified from argv tokens (`panda_core.shell_policy`) after the glob rules, and
   can only escalate. `git show HEAD:.env`, `git diff --output=README.md`,

@@ -26,7 +26,7 @@ from panda_core.provider import status_snapshot
 from panda_core.registry import find_study, load_registry, load_study_card, parse_frontmatter
 from panda_core.safe_read import ensure_plain_path
 from panda_core.session import SessionLog
-from panda_core.validator import Validator
+from panda_core.validator import Validator, validator_sha256
 from panda_core.workspace import Workspace
 
 IGNORED_DIRS = {
@@ -642,6 +642,12 @@ class ToolRegistry:
     async def _validate(self, args: dict[str, Any]) -> ToolResult:
         release = bool(args.get("release", False))
         workspace = self.ctx.workspace
+        _, blocked = await _authorize(
+            self.ctx, tool="validate", action="validate", resource=workspace.config.validator
+        )
+        if blocked:
+            return blocked
+        validator_hash = validator_sha256(workspace.root, workspace.validator_path)
         report = await asyncio.to_thread(
             lambda: Validator(
                 workspace.root,
@@ -652,6 +658,7 @@ class ToolRegistry:
             ).run(release=release)
         )
         payload = report.to_dict()
+        payload["validator_sha256"] = validator_hash
         return ToolResult(
             ok=report.ok,
             content=_json({"ok": report.ok, "tool": "validate", **payload}),

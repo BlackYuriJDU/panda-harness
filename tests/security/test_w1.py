@@ -438,3 +438,144 @@ def test_run_shell_authorizes_by_argv_not_by_joined_text(
     registry, _ = make_registry(workspace)
     result = call(registry, "run_shell", argv=["git", "diff", "--output=README.md x"])
     assert result.blocked
+
+
+# ------------------------------------------------------- SEC-002 (tool, MCP), MCP-001, MCP-002
+import hashlib  # noqa: E402
+
+
+def _policy_denying(workspace: Workspace, action: str, resource: str = "*") -> None:
+    body = {
+        "schema_version": 1,
+        "default": "ask",
+        "rules": [
+            {"id": "ro", "actions": ["read"], "resources": ["*"], "effect": "allow"},
+            {"id": f"no-{action}", "actions": [action], "resources": [resource], "effect": "deny"},
+        ],
+    }
+    workspace.policy_path.write_text(json.dumps(body), encoding="utf-8")
+
+
+def _marker_validator(workspace: Workspace, tmp_path) -> Path:  # noqa: F821
+    marker = tmp_path / "validator-ran.txt"
+    script = workspace.validator_path
+    script.write_text(
+        'import { writeFileSync } from "node:fs";\n'
+        f"writeFileSync({json.dumps(str(marker))}, 'x');\n"
+        'console.log(JSON.stringify({ok:true,checks:[]}));\n',
+        encoding="utf-8",
+    )
+    return marker
+
+
+def test_validate_tool_goes_through_the_policy(workspace: Workspace, tmp_path) -> None:
+    marker = _marker_validator(workspace, tmp_path)
+    _policy_denying(workspace, "validate")
+    registry, _ = make_registry(workspace)
+    result = call(registry, "validate")
+    assert result.blocked
+    assert not marker.exists()
+
+
+def test_validate_tool_still_works_with_an_older_policy_file(workspace: Workspace) -> None:
+    """A policy generated before the `validate` action existed must not break it."""
+
+    body = {
+        "schema_version": 1,
+        "default": "ask",
+        "rules": [{"id": "ro", "actions": ["read"], "resources": ["*"], "effect": "allow"}],
+    }
+    workspace.policy_path.write_text(json.dumps(body), encoding="utf-8")
+    registry, _ = make_registry(workspace)
+    result = call(registry, "validate")
+    assert result.ok and not result.blocked
+
+
+def test_validate_tool_records_the_validator_hash(workspace: Workspace) -> None:
+    registry, _ = make_registry(workspace)
+    result = call(registry, "validate")
+    expected = hashlib.sha256(workspace.validator_path.read_bytes()).hexdigest()
+    assert result.data["validator_sha256"] == expected
+
+
+def test_shell_route_to_the_validator_needs_an_approval(workspace: Workspace, tmp_path) -> None:
+    marker = _marker_validator(workspace, tmp_path)
+    registry, _ = make_registry(workspace)
+    result = call(registry, "run_shell", argv=["node", "corpus/validation/validate.mjs"])
+    assert result.blocked
+    assert not marker.exists()
+
+
+def test_mcp_validate_goes_through_the_policy(workspace: Workspace, tmp_path) -> None:
+    from panda_core.errors import PolicyDenied
+    from panda_core.service import PandaService
+
+    marker = _marker_validator(workspace, tmp_path)
+    _policy_denying(workspace, "validate")
+    with pytest.raises(PolicyDenied):
+        PandaService(workspace).validate()
+    assert not marker.exists()
+
+
+def test_mcp_validate_returns_the_validator_hash(workspace: Workspace) -> None:
+    from panda_core.service import PandaService
+
+    payload = PandaService(workspace).validate()
+    expected = hashlib.sha256(workspace.validator_path.read_bytes()).hexdigest()
+    assert payload["validator_sha256"] == expected
+
+
+def test_mcp_study_show_refuses_an_index_link_outside(workspace: Workspace, tmp_path) -> None:
+    from panda_core.service import PandaService
+
+    outside = _outside(tmp_path)
+    _repoint_index(workspace, str(outside / "secret.md"))
+    with pytest.raises(ConfigError):
+        PandaService(workspace).study_show("gse160208")
+
+
+def test_mcp_study_show_obeys_the_read_policy(workspace: Workspace) -> None:
+    from panda_core.errors import PolicyDenied
+    from panda_core.service import PandaService
+
+    # The deny comes after the broad allow, and the last matching rule wins.
+    _policy_denying(workspace, "read", "corpus/studies/gse160208.md")
+    with pytest.raises(PolicyDenied):
+        PandaService(workspace).study_show("gse160208")
+
+
+def test_neg_mcp_study_show_and_validate_still_work(workspace: Workspace) -> None:
+    from panda_core.service import PandaService
+
+    service = PandaService(workspace)
+    assert service.validate()["ok"] is True
+    assert "Body text" in service.study_show("gse160208")["body"]
+
+
+def test_mcp_every_exposed_read_goes_through_decide(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from panda_core.service import PandaService
+
+    seen: list[tuple[str, str]] = []
+    real = PolicyEngine.decide
+
+    def spy(self, action, resource):
+        seen.append((action, resource))
+        return real(self, action, resource)
+
+    monkeypatch.setattr(PolicyEngine, "decide", spy)
+    service = PandaService(workspace)
+    service.validate()
+    service.study_show("gse160208")
+    actions = {action for action, _ in seen}
+    assert {"validate", "read"} <= actions
+
+
+@pytest.mark.parametrize("name", ["validate", "study_show", "panda_validate", "panda_study_show"])
+def test_mcp_tool_rules_match_the_names_the_server_registers(name: str) -> None:
+    assert engine().decide("tool", name).effect == "allow"
+
+
+def test_neg_unknown_mcp_tool_still_asks() -> None:
+    assert engine().decide("tool", "run_shell").effect == "ask"

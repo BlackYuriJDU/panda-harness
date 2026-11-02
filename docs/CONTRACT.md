@@ -369,6 +369,15 @@ keeps task text out of every record.
 
 ## 10. MCP export (optional)
 
+**Policy on MCP tools.** `validate` and `study_show` run through the same tool
+registry and policy as the agent: `validate` is authorized under the `validate`
+action (allowed by default, restrictable by a workspace rule) and records the
+validator's SHA-256 (`validator_sha256`) in its result and in the `validate.result`
+ledger event; `study_show` is authorized under `read` for the card path. The MCP
+server has no approver, so an `ask` is denied, as in `panda run` without `--auto`.
+The `tool` policy rules list the plain names FastMCP registers (`validate`, ...)
+and the `panda_` spellings.
+
 MCP is not part of the Panda agent loop. It exists so other clients can reuse the
 read-only surface.
 

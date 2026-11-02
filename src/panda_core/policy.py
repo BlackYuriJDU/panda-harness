@@ -123,6 +123,20 @@ def _rule(
     )
 
 
+# Applied beneath every workspace policy, so a policy written before the `validate`
+# action existed keeps working; a workspace rule for the action overrides it.
+_BASELINE_RULES = (
+    _rule(
+        "validate-default",
+        ["validate"],
+        ["*"],
+        "allow",
+        "low",
+        "runs the workspace validator, which the agent cannot write",
+    ),
+)
+
+
 def default_policy() -> Policy:
     """The v0.1 policy envelope for a DCJ-like evidence corpus."""
 
@@ -269,12 +283,20 @@ def default_policy() -> Policy:
             "v0.1 never publishes; use the release workflow with human approval",
         ),
         _rule("spend-default-ask", ["spend"], ["*"], "ask", "critical"),
-        # MCP tool calls. The server enforces path-level policy for its tools.
+        # MCP tool calls. `validate` and `study_show` also pass through the registry
+        # policy (validate / read); the other exposed tools only describe state.
+        # FastMCP registers the plain names, so both spellings are listed.
         _rule("tool-default-ask", ["tool"], ["*"], "ask", "medium"),
         _rule(
             "tool-panda-readonly",
             ["tool"],
             [
+                "workspace_info",
+                "validate",
+                "policy_check",
+                "study_list",
+                "study_show",
+                "session_note",
                 "panda_workspace_info",
                 "panda_validate",
                 "panda_policy_check",
@@ -285,6 +307,7 @@ def default_policy() -> Policy:
             "allow",
         ),
         _rule("question-allow", ["question"], ["*"], "allow"),
+        _BASELINE_RULES[0],
         # Anything not named above is an explicit decision.
         _rule("external-default-ask", ["external_read", "external_write"], ["*"], "ask", "high"),
     )
@@ -380,7 +403,7 @@ class PolicyEngine:
 
     def matching_rules(self, action: str, resource: str) -> list[PolicyRule]:
         matched: list[PolicyRule] = []
-        for rule in (*self.policy.rules, *self._floor):
+        for rule in (*_BASELINE_RULES, *self.policy.rules, *self._floor):
             # Identical rules (the built-in policy already contains the floor)
             # are listed once; a weaker rule with the same id is kept and loses.
             if rule.matches(action, resource) and rule not in matched:

@@ -6,6 +6,7 @@ validator, parses its JSON contract, and maps the result to stable exit codes.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -108,6 +109,15 @@ class ValidationReport:
                 "warnings": list(self.warnings),
             },
         }
+
+
+def validator_sha256(root: Path, script: Path) -> str | None:
+    """SHA-256 of the validator the ledger should name, or None if unreadable."""
+
+    try:
+        return hashlib.sha256(ensure_plain_path(root, script).read_bytes()).hexdigest()
+    except (OSError, ConfigError):
+        return None
 
 
 class Validator:
