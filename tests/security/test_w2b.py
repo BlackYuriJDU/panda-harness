@@ -7,7 +7,9 @@ providers are fixtures, never the network.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import re
 import sys
 import threading
 import time
@@ -155,3 +157,142 @@ def test_stdin_is_closed_so_a_reading_command_does_not_hang() -> None:
     started = time.monotonic()
     result = run_command(["cat"], timeout=10)
     assert result.ok and result.stdout == "" and time.monotonic() - started < 3
+
+
+# --------------------------------------------------------------------------- EDIT-001
+def call(registry, name: str, **arguments):
+    return asyncio.run(registry.call(name, arguments))
+
+
+def edit(registry, path: str, old: str, new: str, **extra):
+    return call(registry, "edit_file", path=path, old_string=old, new_string=new, **extra)
+
+
+def test_edit_keeps_crlf_line_endings(workspace) -> None:
+    target = workspace.root / "corpus" / "crlf.txt"
+    target.write_bytes(b"alpha\r\nbeta\r\ngamma\r\n")
+    registry, _ = make_registry(workspace)
+    assert edit(registry, "corpus/crlf.txt", "beta", "BETA").ok
+    assert target.read_bytes() == b"alpha\r\nBETA\r\ngamma\r\n"
+
+
+def test_edit_matches_a_multiline_old_string_in_a_crlf_file(workspace) -> None:
+    target = workspace.root / "corpus" / "crlf2.txt"
+    target.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+    registry, _ = make_registry(workspace)
+    assert edit(registry, "corpus/crlf2.txt", "one\ntwo", "ONE\nTWO\nextra").ok
+    assert target.read_bytes() == b"ONE\r\nTWO\r\nextra\r\nthree\r\n"
+
+
+def test_edit_replace_all_keeps_crlf(workspace) -> None:
+    target = workspace.root / "corpus" / "crlf3.txt"
+    target.write_bytes(b"x\r\nx\r\n")
+    registry, _ = make_registry(workspace)
+    assert edit(registry, "corpus/crlf3.txt", "x", "y", replace_all=True).ok
+    assert target.read_bytes() == b"y\r\ny\r\n"
+
+
+def test_edit_refuses_a_file_that_is_not_utf8_and_leaves_it_alone(workspace) -> None:
+    target = workspace.root / "corpus" / "lat1.txt"
+    target.write_bytes(b"caf\xe9 alpha\nzeta\n")
+    registry, _ = make_registry(workspace)
+    result = edit(registry, "corpus/lat1.txt", "zeta", "ZETA")
+    assert not result.ok and "UTF-8" in result.content
+    assert target.read_bytes() == b"caf\xe9 alpha\nzeta\n"
+    assert b"\xef\xbf\xbd" not in target.read_bytes()
+
+
+def test_edit_refuses_mixed_line_endings_and_leaves_the_file_alone(workspace) -> None:
+    target = workspace.root / "corpus" / "mixed.txt"
+    target.write_bytes(b"a\r\nb\nc\r\n")
+    registry, _ = make_registry(workspace)
+    result = edit(registry, "corpus/mixed.txt", "b", "B")
+    assert not result.ok and "line ending" in result.content
+    assert target.read_bytes() == b"a\r\nb\nc\r\n"
+
+
+def test_edit_preserves_a_bom_non_ascii_and_a_missing_final_newline(workspace) -> None:
+    target = workspace.root / "corpus" / "bom.txt"
+    target.write_bytes("﻿çafé 日本\nfim".encode())
+    registry, _ = make_registry(workspace)
+    assert edit(registry, "corpus/bom.txt", "fim", "FIM").ok
+    assert target.read_bytes() == "﻿çafé 日本\nFIM".encode()
+
+
+def test_neg_lf_files_and_write_file_are_unchanged(workspace) -> None:
+    registry, _ = make_registry(workspace)
+    lf = workspace.root / "corpus" / "lf.txt"
+    lf.write_bytes(b"a\nb\n")
+    assert edit(registry, "corpus/lf.txt", "b", "B").ok and lf.read_bytes() == b"a\nB\n"
+    assert call(registry, "write_file", path="corpus/w.txt", content="a\r\nb\r\n").ok
+    assert (workspace.root / "corpus" / "w.txt").read_bytes() == b"a\r\nb\r\n"
+
+
+# --------------------------------------------------------------------------- LED-001
+HEX64 = re.compile(r"\b[0-9a-f]{64}\b")
+
+
+def sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_write_and_edit_report_content_hashes(workspace) -> None:
+    registry, _ = make_registry(workspace)
+    target = workspace.root / "corpus" / "h.md"
+    created = call(registry, "write_file", path="corpus/h.md", content="hello")
+    assert created.data["sha256_before"] is None
+    assert created.data["sha256_after"] == sha(target)
+    before = sha(target)
+    edited = edit(registry, "corpus/h.md", "hello", "bye")
+    assert edited.data["sha256_before"] == before
+    assert edited.data["sha256_after"] == sha(target)
+
+
+def test_an_unchanged_write_reports_equal_hashes(workspace) -> None:
+    registry, _ = make_registry(workspace)
+    call(registry, "write_file", path="corpus/same.md", content="x")
+    again = call(registry, "write_file", path="corpus/same.md", content="x")
+    assert again.data["sha256_before"] == again.data["sha256_after"]
+
+
+def test_the_ledger_carries_the_file_hashes(workspace) -> None:
+    from test_w2a import make_agent, tool_call
+
+    from panda_core.provider import DoneEvent, TextDelta
+
+    agent, session, _, _ = make_agent(
+        workspace,
+        [
+            [tool_call("write_file", path="corpus/l.md", content="hello")],
+            [TextDelta("ok"), DoneEvent(finish_reason="stop")],
+        ],
+    )
+    asyncio.run(agent.run_turn("write"))
+    results = [e for e in session.events() if e.type == "tool.result"]
+    assert results[0].data["sha256_after"] == sha(workspace.root / "corpus" / "l.md")
+    ends = [e for e in session.events() if e.type == "turn.end"]
+    assert HEX64.fullmatch(ends[-1].data["tree_sha256"])
+
+
+def test_tree_hash_is_stable_across_copies_and_changes_with_one_byte(
+    workspace, tmp_path
+) -> None:
+    import shutil
+
+    from panda_core.treehash import tree_hash
+
+    first = tree_hash(workspace.root)
+    copy = tmp_path / "copy"
+    shutil.copytree(workspace.root, copy, ignore=shutil.ignore_patterns(".panda"))
+    assert tree_hash(copy).digest == first.digest
+    (copy / "corpus" / "evidence.md").write_bytes(b"# evidence!\n")
+    assert tree_hash(copy).digest != first.digest
+
+
+def test_tree_hash_ignores_the_ledger_and_other_non_corpus_files(workspace) -> None:
+    from panda_core.treehash import tree_hash
+
+    before = tree_hash(workspace.root).digest
+    SessionLog.create(workspace.sessions_dir, label="noise")
+    (workspace.root / "scratch.tmp").write_text("x")
+    assert tree_hash(workspace.root).digest == before

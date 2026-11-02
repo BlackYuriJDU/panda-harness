@@ -31,6 +31,7 @@ from panda_core.provider import (
 from panda_core.safe_read import read_workspace_file
 from panda_core.session import SessionLog
 from panda_core.tools import ApprovalRequest, ToolRegistry, ToolResult
+from panda_core.treehash import tree_hash
 from panda_core.workspace import Workspace
 
 DEFAULT_SYSTEM_CHARS = 24_000
@@ -226,6 +227,7 @@ class Agent:
         self.last_steps = 0
         self._cancelled = False
         self._turn_active = False
+        self._tree_cache: dict[str, tuple[int, int, str]] = {}
         self._pinned: dict[str, Any] | None = None
         self._summary: dict[str, Any] | None = None
         self._trimmed_total = 0
@@ -511,6 +513,12 @@ class Agent:
                             "ok": result.ok,
                             "blocked": getattr(result, "blocked", False),
                             "content": result.content,
+                            **{
+                                key: result.data[key]
+                                for key in ("path", "sha256_before", "sha256_after")
+                                if isinstance(getattr(result, "data", None), dict)
+                                and key in result.data
+                            },
                         },
                     )
                     self._emit(
@@ -555,6 +563,7 @@ class Agent:
             )
             self._end_turn_quietly(turn, "error", steps, tool_calls)
             raise
+        tree = await asyncio.to_thread(tree_hash, self.workspace.root, self._tree_cache)
         self._log(
             "turn.end",
             {
@@ -564,6 +573,9 @@ class Agent:
                 "tool_calls": tool_calls,
                 "usage": usage.to_dict(),
                 "text_chars": sum(len(part) for part in texts),
+                "tree_sha256": tree.digest,
+                "tree_files": tree.files,
+                **({"tree_truncated": True} if tree.truncated else {}),
                 **({"finish_reason": finish_reason} if finish_reason else {}),
             },
         )

@@ -85,6 +85,24 @@ def atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
             tmp.unlink()
 
 
+def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+    """Write bytes atomically, exactly as given (no newline or encoding changes)."""
+
+    ensure_dir(path.parent)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        with open(tmp, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
 def atomic_write_json(path: Path, payload: Any, *, indent: int = 2, mode: int = 0o600) -> None:
     atomic_write_text(
         path,

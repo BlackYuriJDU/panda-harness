@@ -317,6 +317,18 @@ workspace, secret paths, and traversal are refused by policy or by path
 resolution, not by prompt text. `write_file`, `edit_file`, and `run_shell` are
 the non-read-only tools and require a policy `allow` (or an approved `ask`).
 
+**Edits are byte-exact.** `edit_file` reads and writes bytes: the file's line ending
+(LF, CRLF or CR) is kept, a BOM and non-ASCII text are kept, and a file that is not
+valid UTF-8 or has mixed line endings is refused and left untouched, never rewritten
+with replacement characters. `write_file` writes exactly the content it is given.
+
+**Content hashes.** `write_file` and `edit_file` return `sha256_before` (null for a new
+file) and `sha256_after`, and the agent copies `path`, `sha256_before` and
+`sha256_after` into the `tool.result` event. `turn.end` carries `tree_sha256`,
+`tree_files` (and `tree_truncated`): the SHA-256 over the sorted
+`(path, file SHA-256)` of every regular file under `corpus/`. It is stable across
+copies of the same corpus and ignores the ledger and anything outside `corpus/`.
+
 **Process limits.** A command runs in its own process group with stdin closed. The
 timeout, a cancellation of the tool call (Ctrl+C, `--timeout`) and output beyond the
 per-stream cap (4 MB) each stop the whole group, so a child started by the command

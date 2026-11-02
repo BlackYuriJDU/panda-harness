@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -19,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from panda_core.atomic import atomic_write_text
+from panda_core.atomic import atomic_write_bytes, atomic_write_text
 from panda_core.errors import ConfigError, PandaError
 from panda_core.policy import Decision, PolicyEngine
 from panda_core.process import run_command
@@ -27,6 +28,7 @@ from panda_core.provider import status_snapshot
 from panda_core.registry import find_study, load_registry, load_study_card, parse_frontmatter
 from panda_core.safe_read import ensure_plain_path
 from panda_core.session import SessionLog
+from panda_core.treehash import file_sha256
 from panda_core.validator import Validator, validator_sha256
 from panda_core.workspace import Workspace
 
@@ -179,6 +181,21 @@ def _scrubbed_env() -> dict[str, str]:
             continue
         env[name] = value
     return env
+
+
+def _line_ending(text: str) -> str:
+    """The single line ending of `text`; mixed endings are refused (EDIT-001)."""
+
+    crlf = text.count("\r\n")
+    lone_lf = text.count("\n") - crlf
+    lone_cr = text.count("\r") - crlf
+    kinds = [kind for kind, n in (("\r\n", crlf), ("\n", lone_lf), ("\r", lone_cr)) if n]
+    if len(kinds) > 1:
+        raise ToolInputError(
+            "file has mixed line endings; edit_file will not guess which to keep "
+            "(use write_file with the full content)"
+        )
+    return kinds[0] if kinds else "\n"
 
 
 def _read_exact(path: Path) -> str:
@@ -700,11 +717,14 @@ class ToolRegistry:
         if path.is_dir():
             raise ToolInputError(f"path is a directory: {relative}")
         before = ""
+        hash_before: str | None = None
         if path.is_file():
             try:
-                before = path.read_text(encoding="utf-8", errors="replace")
+                raw_before = path.read_bytes()
             except OSError as exc:
                 raise ToolInputError(f"cannot read existing file: {exc}") from exc
+            before = raw_before.decode("utf-8", errors="replace")
+            hash_before = hashlib.sha256(raw_before).hexdigest()
         preview = _diff_preview(relative, before, content)
         _, blocked = await _authorize(
             self.ctx,
@@ -737,6 +757,8 @@ class ToolRegistry:
                 "bytes": len(content.encode("utf-8")),
                 "changed": changed,
                 "created": not before and changed,
+                "sha256_before": hash_before,
+                "sha256_after": file_sha256(path) if path.is_file() else None,
             },
         )
 
@@ -752,7 +774,17 @@ class ToolRegistry:
             raise ToolInputError(f"file not found: {relative}")
         if path.stat().st_size > MAX_WRITE_BYTES:
             raise ToolInputError(f"file exceeds {MAX_WRITE_BYTES} bytes")
-        before = path.read_text(encoding="utf-8", errors="replace")
+        raw = path.read_bytes()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ToolInputError(
+                "file is not valid UTF-8; edit_file refuses to rewrite it because "
+                "bytes would be lost (use write_file with the full content)"
+            ) from None
+        ending = _line_ending(text)
+        before = text.replace(ending, "\n") if ending != "\n" else text
+        old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
         count = before.count(old)
         if count == 0:
             raise ToolInputError("old_string was not found; read the file before editing")
@@ -772,12 +804,13 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        atomic_write_text(path, after, mode=0o644)
+        data = (after.replace("\n", ending) if ending != "\n" else after).encode("utf-8")
+        atomic_write_bytes(path, data, mode=0o644)
         try:
-            written = _read_exact(path)
+            written = _read_exact(path)  # no newline translation, so CRLF is compared as is
         except OSError as exc:
             return _fail("edit_file", f"post-write verification failed: {exc}")
-        if written != after:
+        if written != data.decode("utf-8"):
             return _fail(
                 "edit_file",
                 "post-write verification failed: content differs after edit",
@@ -787,7 +820,9 @@ class ToolRegistry:
             {
                 "path": relative,
                 "replacements": count if replace_all else 1,
-                "bytes": len(after.encode("utf-8")),
+                "bytes": len(data),
+                "sha256_before": hashlib.sha256(raw).hexdigest(),
+                "sha256_after": hashlib.sha256(data).hexdigest(),
             },
         )
 

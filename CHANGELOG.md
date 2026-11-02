@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Byte-exact edits (EDIT-001): `edit_file` rewrote CRLF as LF and replaced non-UTF-8
+  bytes with U+FFFD, which is irreversible for a file not tracked by git. It now reads
+  and writes bytes, keeps the line ending, BOM and non-ASCII text, and refuses (leaving
+  the file untouched) a file that is not UTF-8 or has mixed line endings.
+- Content hashes in the ledger (LED-001): writes and edits report `sha256_before` and
+  `sha256_after`, copied into `tool.result`, and `turn.end` carries a `tree_sha256` of
+  `corpus/`, so the ledger proves the state left behind and not only the sequence.
 - Process control (SEC-008): a timeout killed only the direct child, Ctrl+C cancelled
   the turn but the command kept running, `asyncio.wait_for` could not bound a running
   tool, and output was captured without a limit. `run_command` now runs the command
