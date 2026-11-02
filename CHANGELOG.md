@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Credential files (SEC-005): `.git/config`, `.netrc`, `.npmrc`, `.pypirc`,
+  `.git-credentials`, `credentials.json`, `.aws/credentials`, `.docker/config.json`,
+  `*.p12`, `*.pfx`, `*.kdbx`, `*.keystore`, `*.jks` and `secrets.*` are `hard_deny`
+  for reads, at the root as well as nested.
+- Policy effects (POL-001): an unknown `effect` such as `"hard-deny"` is now a
+  configuration error instead of silently becoming an approvable `ask`.
 - Workspace trust boundary (TRUST-001): `.panda/config.json` can no longer choose
   where the provider key is sent. `provider.base_url` must be `https` on
   `opencode.ai` and `provider.api_key_env` must be `OPENCODE_API_KEY`; any other

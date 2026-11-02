@@ -305,7 +305,13 @@ Effects:
 - `deny` — blocked.
 - `hard_deny` — blocked even with `--approve`.
 
-Hard denies include secret paths (`.env`, `*.pem`, `*.key`, `.ssh/`, etc.),
+A rule whose `effect` is not one of these four is a configuration error (exit `2`);
+it is never downgraded to `ask`.
+
+Hard denies include secret paths (`.env`, `*.pem`, `*.key`, `.ssh/`, and credential
+files such as `.git/config`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`,
+`credentials.json`, `.aws/credentials`, `.docker/config.json`, `*.p12`, `*.pfx`,
+`*.kdbx`, `*.keystore` and `secrets.*`, at the root and nested),
 force-push, history rewrites, recursive deletion, and release publishing.
 
 An `ask` becomes an approval request with a single decision:

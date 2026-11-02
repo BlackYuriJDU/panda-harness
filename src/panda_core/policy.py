@@ -142,6 +142,21 @@ def default_policy() -> Policy:
             "private key or cloud credential",
         ),
         _rule(
+            "read-credential-files",
+            ["read"],
+            [
+                ".git/config", "*/.git/config", ".netrc", "*/.netrc", "_netrc", "*/_netrc",
+                ".npmrc", "*/.npmrc", ".pypirc", "*/.pypirc", ".pgpass", "*/.pgpass",
+                ".git-credentials", "*/.git-credentials", "credentials.json",
+                "*/credentials.json", ".aws/credentials", ".ssh/*", ".docker/config.json",
+                "*/.docker/config.json", "*.p12", "*.pfx", "*.kdbx", "*.keystore", "*.jks",
+                "secrets.*", "*/secrets.*",
+            ],
+            "hard_deny",
+            "critical",
+            "credential file",
+        ),
+        _rule(
             "read-agent-credentials",
             ["read"],
             ["*/.config/opencode/service.json", "*/.claude/.credentials.json"],
@@ -274,6 +289,8 @@ def default_policy() -> Policy:
     return Policy(rules=rules, default="ask")
 
 
+_EFFECTS = frozenset({"allow", "ask", "deny", "hard_deny"})
+
 _CONTROL_PLANE_RULE = _rule(
     "floor-control-plane",
     ["write", "edit"],
@@ -321,6 +338,11 @@ def load_policy(path: Path) -> Policy:
             )
         rules: list[PolicyRule] = []
         for index, item in enumerate(raw.get("rules", [])):
+            if item.get("effect") not in _EFFECTS:
+                raise ConfigError(
+                    f"policy rule {index} has an invalid effect: {item.get('effect')!r}",
+                    hint=f"use one of {', '.join(sorted(_EFFECTS))}",
+                )
             rules.append(
                 PolicyRule(
                     id=str(item["id"]),
