@@ -36,6 +36,9 @@ All notable changes to this project are documented here. The format follows
   everything can no longer let the agent rewrite the policy, the ledger or the
   validator. Writes to `corpus/validation/**` are now `hard_deny` for the agent.
 
+- `panda doctor` records the Node.js version it measured in the user-scoped cache,
+  so `panda status` can report it without running the binary.
+
 ### Changed
 
 - **Breaking for custom endpoints:** a workspace file with a non-official

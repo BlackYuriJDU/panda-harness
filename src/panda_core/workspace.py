@@ -22,7 +22,7 @@ from panda_core.config import (
     load_config,
 )
 from panda_core.errors import ConfigError
-from panda_core.process import command_version
+from panda_core.process import command_version, parse_version
 
 CONFIG_DIR = ".panda"
 CONFIG_FILE = "config.json"
@@ -280,6 +280,24 @@ class Workspace:
             "platform": platform.platform(),
             "node": self._cached_node_version(probe=probe),
         }
+
+    def record_node_version(self, text: str) -> None:
+        """Store a node version that `doctor` has just measured.
+
+        Read-only commands report it without ever running the binary.
+        """
+
+        parsed = parse_version(text)
+        if parsed is None:
+            return
+        cache_path = home_workspace_path().parent / "cache" / "tool-versions.json"
+        entry = {
+            "command": self.config.node,
+            "version": ".".join(str(part) for part in parsed),
+            "checked_at": int(time.time()),
+        }
+        with contextlib.suppress(OSError):
+            atomic_write_json(cache_path, {"node": entry})
 
     def _cached_node_version(self, *, probe: bool = True) -> str | None:
         """Avoid spawning node on every boot; refresh at most once a week."""

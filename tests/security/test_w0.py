@@ -544,3 +544,19 @@ def test_chain_001_hostile_corpus_delivers_nothing_on_the_first_request(
     assert seen == []
     assert SYNTH_KEY not in result.output
     assert SYNTH_FILE_MARKER not in result.output
+
+
+@POSIX_ONLY
+def test_doctor_fills_the_node_cache_so_status_can_report_it(
+    workspace: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "node-calls.txt"
+    _fake_node(tmp_path / "bin", marker)
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("PANDA_HOME", str(tmp_path / "home"))
+    assert workspace.tool_versions(probe=False)["node"] is None
+    runner.invoke(app, ["doctor", "--root", str(workspace.root), "--json"])
+    calls_after_doctor = marker.read_text(encoding="utf-8")
+    result = runner.invoke(app, ["status", "--root", str(workspace.root), "--json"])
+    assert json.loads(result.stdout)["workspace"]["tools"]["node"] == "24.0.0"
+    assert marker.read_text(encoding="utf-8") == calls_after_doctor  # status ran nothing

@@ -131,6 +131,7 @@ def run_doctor(workspace: Workspace, *, run_validation: bool = False) -> DoctorR
             node=workspace.config.node,
             min_major=workspace.config.node_min_major,
         ).node_version()
+        workspace.record_node_version(node_version)
         _check(
             checks,
             "node",
