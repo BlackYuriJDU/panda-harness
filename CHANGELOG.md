@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Fail-closed ledger (PROV-001): `Agent._log` swallowed ledger failures, so with an
+  invalid anchor the turn ended `completed`, `write_file` wrote and nothing was
+  recorded. A ledger failure now raises a session-integrity error (exit `4`) before
+  any tool runs, including `approval.*` records, and the MCP `_record` raises too.
+  `turn.end` uses status `ledger_failed` when it can still be written.
+- Agent loop (AGT-001, AGT-003): an unexpected tool exception is a failed result, any
+  other exception still closes the turn, unanswered tool calls are answered on
+  cancel or error, and a provider `finish_reason` of `length`, `content_filter`,
+  `incomplete` or similar gives status `incomplete` instead of `completed`.
 - Ledger (SES-001, SES-002, SES-003, PERF-001): an event forged into the log with a
   valid chain was legitimized by the next legitimate append, and a crash between the
   write and the anchor was absorbed silently. `append` now requires the anchor to

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from panda_core.errors import PandaError, ProviderError
+from panda_core.errors import PandaError, ProviderError, SessionIntegrityError
 from panda_core.limits import DEFAULT_MAX_STEPS
 from panda_core.provider import (
     DoneEvent,
@@ -108,6 +108,9 @@ class TurnResult:
             "context_ratio": round(self.context_ratio, 4),
             "session_id": self.session_id,
         }
+
+INCOMPLETE_REASONS = frozenset({"length", "max_tokens", "content_filter", "incomplete", "refusal"})
+
 
 def _shrink(value: Any, *, limit: int = LOG_STRING_LIMIT) -> Any:
     if isinstance(value, str):
@@ -234,17 +237,46 @@ class Agent:
             with contextlib.suppress(Exception):
                 self._on_event(AgentEvent(kind=kind, data=data))
 
-    def _log(self, event_type: str, data: dict[str, Any] | None = None) -> None:
+    def _log(
+        self,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+        *,
+        best_effort: bool = False,
+    ) -> None:
+        """Record an event; a ledger that cannot record stops the turn (PROV-001).
+
+        No record, no action: when the write fails the exception propagates before
+        the model's next step or any tool can run. `best_effort` is only for the
+        error paths that are already unwinding, where a second failure must not
+        mask the first.
+        """
+
         if self.session is None:
             return
+        critical = event_type == "tool.call" or event_type.startswith("approval.")
         try:
             if self.session.is_closed():
+                if critical and not best_effort:
+                    raise SessionIntegrityError(
+                        f"cannot record {event_type}: the session is closed",
+                        hint="start a new session",
+                    )
                 return
             self.session.append(event_type, _shrink(data or {}))
-        except (PandaError, OSError):
-            # Provenance failure must not fabricate success, but the turn can
-            # still return the model output; the error is surfaced separately.
+        except SessionIntegrityError:
+            if best_effort:
+                self._emit("log_error", event_type=event_type)
+                return
+            raise
+        except (PandaError, OSError) as exc:
             self._emit("log_error", event_type=event_type)
+            if best_effort:
+                return
+            raise SessionIntegrityError(
+                f"cannot write the session ledger ({event_type}): {exc}",
+                hint="free disk space or run `panda session verify`; no action was taken",
+            ) from exc
 
     async def _approve(self, request: ApprovalRequest) -> bool:
         self._log("approval.request", request.to_dict())
@@ -300,43 +332,52 @@ class Agent:
             raise ValueError("user message is empty")
         self.turn_index += 1
         turn = self.turn_index
-        self._log(
-            "turn.start",
-            {
-                "turn": turn,
-                "model": self.model,
-                "max_steps": self.max_steps,
-                "active_study": self.active_study,
-            },
-        )
-        if self.private:
-            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            self._log("message.user", {"sha256": digest, "chars": len(text), "private": True})
-        else:
-            self._log("message.user", {"content": text, "chars": len(text)})
-        self._emit("turn_start", turn=turn, model=self.model)
-        self.messages.append({"role": "user", "content": text})
-
         steps = 0
         tool_calls = 0
         texts: list[str] = []
         usage = Usage()
         status = "completed"
+        finish_reason: str | None = None
         try:
+            self._log(
+                "turn.start",
+                {
+                    "turn": turn,
+                    "model": self.model,
+                    "max_steps": self.max_steps,
+                    "active_study": self.active_study,
+                },
+            )
+            if self.private:
+                digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                self._log(
+                    "message.user", {"sha256": digest, "chars": len(text), "private": True}
+                )
+            else:
+                self._log("message.user", {"content": text, "chars": len(text)})
+            self._emit("turn_start", turn=turn, model=self.model)
+            self.messages.append({"role": "user", "content": text})
             while steps < self.max_steps:
                 steps += 1
                 self._trim()
                 step_parts: list[str] = []
                 calls: list[Any] = []
                 usage_box: list[Usage] = [Usage()]
+                finish_box: list[str | None] = [None]
                 async for event in self.provider.stream(
                     self.messages,
                     self.tools.to_openai(),
                     model=self.model,
                     session_id=self.session_id,
                 ):
-                    self._handle_provider_event(event, step_parts, usage_box, calls)
+                    self._handle_provider_event(event, step_parts, usage_box, calls, finish_box)
                 step_usage = usage_box[0]
+                dropped = 0
+                if finish_box[0] in INCOMPLETE_REASONS:
+                    # Cut off by the provider (AGT-003): tool-call arguments may be
+                    # truncated, so none of them is run or kept in the history.
+                    status, finish_reason = "incomplete", finish_box[0]
+                    dropped, calls = len(calls), []
                 step_text = "".join(step_parts)
                 if step_text:
                     texts.append(step_text)
@@ -362,6 +403,7 @@ class Agent:
                         "content": step_text,
                         "chars": len(step_text),
                         "tool_calls": [call.name for call in calls],
+                        **({"dropped_tool_calls": dropped} if dropped else {}),
                     },
                 )
                 if step_usage.total_tokens or step_usage.prompt_tokens:
@@ -414,15 +456,30 @@ class Agent:
                 if steps >= self.max_steps:
                     status = "max_steps"
         except asyncio.CancelledError:
-            self._log(
-                "turn.end",
-                {"turn": turn, "status": "cancelled", "steps": steps, "tool_calls": tool_calls},
-            )
-            self._emit("turn_end", status="cancelled", steps=steps)
+            self._close_dangling_tool_calls("cancelled")
+            self._end_turn_quietly(turn, "cancelled", steps, tool_calls)
+            raise
+        except SessionIntegrityError as exc:
+            self._close_dangling_tool_calls("ledger_failed")
+            self._end_turn_quietly(turn, "ledger_failed", steps, tool_calls)
+            self._emit("error", code=exc.code, message=exc.message)
             raise
         except PandaError as exc:
-            self._log("error", {"code": exc.code, "message": exc.message})
+            self._close_dangling_tool_calls("error")
+            # Typed errors (provider, policy) keep their documented shape: an
+            # `error` event and no `turn.end`.
+            self._log("error", {"code": exc.code, "message": exc.message}, best_effort=True)
             self._emit("error", code=exc.code, message=exc.message)
+            raise
+        except Exception as exc:
+            # Whatever else escapes still leaves a closed turn in the ledger (AGT-001).
+            self._close_dangling_tool_calls("error")
+            self._log(
+                "error",
+                {"code": "internal_error", "message": f"{type(exc).__name__}: {exc}"},
+                best_effort=True,
+            )
+            self._end_turn_quietly(turn, "error", steps, tool_calls)
             raise
         self._log(
             "turn.end",
@@ -433,6 +490,7 @@ class Agent:
                 "tool_calls": tool_calls,
                 "usage": usage.to_dict(),
                 "text_chars": sum(len(part) for part in texts),
+                **({"finish_reason": finish_reason} if finish_reason else {}),
             },
         )
         self.last_steps = steps
@@ -454,6 +512,7 @@ class Agent:
         step_parts: list[str],
         usage_box: list[Usage],
         calls: list[Any],
+        finish_box: list[str | None] | None = None,
     ) -> None:
         if isinstance(event, TextDelta):
             step_parts.append(event.text)
@@ -470,6 +529,8 @@ class Agent:
             )
         elif isinstance(event, DoneEvent):
             calls.extend(event.tool_calls)
+            if finish_box is not None:
+                finish_box[0] = event.finish_reason
 
     async def _execute_tool(self, call: Any) -> ToolResult:
         try:
@@ -479,7 +540,41 @@ class Agent:
                 ok=False,
                 content=json.dumps({"ok": False, "error": exc.message}, ensure_ascii=False),
             )
-        return await self.tools.call(call.name, arguments)
+        try:
+            return await self.tools.call(call.name, arguments)
+        except Exception as exc:  # noqa: BLE001 - a handler bug must not strand the history
+            message = f"tool {call.name} failed unexpectedly: {type(exc).__name__}: {exc}"
+            return ToolResult(
+                ok=False,
+                content=json.dumps({"ok": False, "error": message}, ensure_ascii=False),
+            )
+
+    def _close_dangling_tool_calls(self, reason: str) -> None:
+        """Answer every tool call that never got a result, so the history stays valid."""
+
+        answered: set[str] = set()
+        for message in reversed(self.messages):
+            if message.get("role") == "tool":
+                answered.add(str(message.get("tool_call_id")))
+            elif message.get("role") == "assistant":
+                for call in message.get("tool_calls") or []:
+                    if call["id"] not in answered:
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call["id"],
+                                "content": json.dumps({"ok": False, "error": reason}),
+                            }
+                        )
+                break
+
+    def _end_turn_quietly(self, turn: int, status: str, steps: int, tool_calls: int) -> None:
+        self._log(
+            "turn.end",
+            {"turn": turn, "status": status, "steps": steps, "tool_calls": tool_calls},
+            best_effort=True,
+        )
+        self._emit("turn_end", status=status, steps=steps)
 
     # ---- conversation control ----
     def set_model(self, model: str) -> None:

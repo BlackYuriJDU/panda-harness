@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from panda_core import errors
-from panda_core.errors import PandaError, PolicyDenied
+from panda_core.errors import PandaError, PolicyDenied, SessionIntegrityError
 from panda_core.policy import PolicyEngine, load_policy_or_default
 from panda_core.provider import status_snapshot
 from panda_core.registry import load_registry
@@ -93,18 +93,24 @@ class PandaService:
                     "mcp.connect",
                     {"cwd": str(Path.cwd()), "pid": os.getpid()},
                 )
-            except (PandaError, OSError):
+            except (PandaError, OSError) as exc:
                 self.session = None
-                return False
+                raise SessionIntegrityError(
+                    f"cannot create the MCP session ledger: {exc}",
+                    hint="free disk space or fix .panda/sessions; the tool did not run",
+                ) from exc
         if self.session is None:
             return False
         try:
             self.session.append(event_type, data)
             return True
-        except (PandaError, OSError):
-            # Read-only tools remain usable if provenance is unavailable; the
-            # tool result tells the client that it was not logged.
-            return False
+        except SessionIntegrityError:
+            raise
+        except (PandaError, OSError) as exc:
+            raise SessionIntegrityError(
+                f"cannot write the session ledger ({event_type}): {exc}",
+                hint="run `panda session verify`; the result was not returned",
+            ) from exc
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Run a tool through the same registry and policy the agent uses (MCP-002).

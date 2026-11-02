@@ -5,6 +5,7 @@ PROV-001, SES-001/002/003, PERF-001, AGT-001/002/003/004. Synthetic data only.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -249,3 +250,222 @@ def test_cli_recover_refuses_a_forged_chain_with_exit_4(workspace) -> None:
         app, ["session", "recover", session.session_id, "--root", str(workspace.root)]
     )
     assert result.exit_code == 4
+
+
+# --------------------------------------------------------------------------- agent helpers
+import asyncio  # noqa: E402
+from typing import Any  # noqa: E402
+
+from panda_core.agent import Agent  # noqa: E402
+from panda_core.policy import PolicyEngine, load_policy_or_default  # noqa: E402
+from panda_core.provider import DoneEvent, TextDelta, ToolCall  # noqa: E402
+from panda_core.tools import ToolContext, ToolRegistry  # noqa: E402
+
+
+class Script:
+    def __init__(self, script: list[list[Any]]) -> None:
+        self.script = list(script)
+        self.calls: list[list[dict[str, Any]]] = []
+
+    async def stream(self, messages, tools=None, model=None, session_id=None):
+        self.calls.append([dict(m) for m in messages])
+        events = self.script.pop(0) if self.script else [DoneEvent(finish_reason="stop")]
+        for event in events:
+            if isinstance(event, BaseException):
+                raise event
+            yield event
+
+
+def make_agent(workspace, script, *, approver=None, max_steps=4, context_window=None):
+    session = SessionLog.create(workspace.sessions_dir, label="w2a")
+    policy, _ = load_policy_or_default(workspace.policy_path)
+    registry = ToolRegistry(
+        ToolContext(
+            workspace=workspace,
+            policy=PolicyEngine(policy, root=workspace.root),
+            session=session,
+        )
+    )
+    seen: list[Any] = []
+    agent = Agent(
+        workspace,
+        Script(script),
+        registry,
+        session=session,
+        max_steps=max_steps,
+        approver=approver,
+        context_window=context_window,
+        on_event=seen.append,
+    )
+    return agent, session, registry, seen
+
+
+def tool_call(name: str, **arguments: Any) -> DoneEvent:
+    call = ToolCall(id="c1", name=name, arguments=json.dumps(arguments))
+    return DoneEvent(finish_reason="tool_calls", tool_calls=(call,))
+
+
+async def approve_all(request) -> bool:
+    return True
+
+
+# --------------------------------------------------------------------------- PROV-001
+def test_a_broken_ledger_stops_the_turn_before_any_write(workspace, monkeypatch) -> None:
+    agent, session, _, seen = make_agent(
+        workspace,
+        [[tool_call("write_file", path="corpus/h.md", content="hello")]],
+    )
+    real = SessionLog.append
+
+    def fail_on_tool_call(self, event_type, data=None):
+        if event_type == "tool.call":
+            raise SessionIntegrityError("simulated anchor failure")
+        return real(self, event_type, data)
+
+    monkeypatch.setattr(SessionLog, "append", fail_on_tool_call)
+    with pytest.raises(SessionIntegrityError):
+        asyncio.run(agent.run_turn("write it"))
+    assert not (workspace.root / "corpus" / "h.md").exists()
+    assert any(e.kind == "turn_end" and e.data.get("status") == "ledger_failed" for e in seen)
+
+
+def test_a_broken_ledger_starts_no_subprocess(workspace, tmp_path, monkeypatch) -> None:
+    marker = tmp_path / "ran.txt"
+    agent, session, _, _ = make_agent(
+        workspace,
+        [[tool_call("run_shell", argv=["touch", str(marker)])]],
+        approver=approve_all,
+    )
+    session._write_anchor(999, "0" * 64)  # the audit's own scenario: anchor ahead of the log
+    with pytest.raises(SessionIntegrityError):
+        asyncio.run(agent.run_turn("touch it"))
+    assert not marker.exists()
+
+
+def test_a_full_disk_is_a_ledger_failure_not_a_silent_skip(workspace, monkeypatch) -> None:
+    import errno
+
+    agent, session, _, _ = make_agent(
+        workspace, [[tool_call("write_file", path="corpus/d.md", content="x")]]
+    )
+
+    def full(fd: int, data: bytes) -> int:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("panda_core.session.os.write", full)
+    with pytest.raises(SessionIntegrityError):
+        asyncio.run(agent.run_turn("write"))
+    monkeypatch.undo()
+    assert not (workspace.root / "corpus" / "d.md").exists()
+
+
+def test_a_failing_approval_record_denies_the_action(workspace, monkeypatch) -> None:
+    agent, session, _, _ = make_agent(
+        workspace,
+        [[tool_call("write_file", path="pipeline/a.py", content="x")], []],
+        approver=approve_all,
+    )
+    real = SessionLog.append
+
+    def fail_on_approval(self, event_type, data=None):
+        if event_type.startswith("approval."):
+            raise SessionIntegrityError("simulated")
+        return real(self, event_type, data)
+
+    monkeypatch.setattr(SessionLog, "append", fail_on_approval)
+    with contextlib.suppress(SessionIntegrityError):
+        asyncio.run(agent.run_turn("write"))
+    assert not (workspace.root / "pipeline" / "a.py").exists()
+
+
+def test_mcp_record_failure_is_raised(workspace, monkeypatch) -> None:
+    from panda_core.service import PandaService
+
+    session = SessionLog.create(workspace.sessions_dir, label="mcp")
+    service = PandaService(workspace, session=session)
+
+    def boom(self, event_type, data=None):
+        raise SessionIntegrityError("simulated")
+
+    monkeypatch.setattr(SessionLog, "append", boom)
+    with pytest.raises(SessionIntegrityError):
+        service.note("a note")
+
+
+def test_neg_a_healthy_ledger_runs_the_tool(workspace) -> None:
+    agent, session, _, _ = make_agent(
+        workspace,
+        [[tool_call("write_file", path="corpus/ok.md", content="fine")], [TextDelta("done")]],
+    )
+    asyncio.run(agent.run_turn("write"))
+    assert (workspace.root / "corpus" / "ok.md").read_text() == "fine"
+    assert session.verify().ok
+
+
+# --------------------------------------------------------------------------- AGT-001
+def test_an_unexpected_tool_exception_becomes_a_failed_result(workspace) -> None:
+    agent, session, registry, _ = make_agent(
+        workspace, [[tool_call("workspace_info")], [TextDelta("recovered")]]
+    )
+
+    async def broken(args):
+        raise RuntimeError("handler exploded")
+
+    registry._handlers["workspace_info"] = broken
+    result = asyncio.run(agent.run_turn("go"))
+    assert result.status == "completed"
+    tool_messages = [m for m in agent.messages if m.get("role") == "tool"]
+    assert len(tool_messages) == 1 and "handler exploded" in tool_messages[0]["content"]
+    assert "turn.end" in [e.type for e in session.events()]
+
+
+def test_a_provider_crash_still_closes_the_turn(workspace) -> None:
+    agent, session, _, _ = make_agent(workspace, [[RuntimeError("provider blew up")]])
+    with pytest.raises(RuntimeError):
+        asyncio.run(agent.run_turn("go"))
+    ends = [e for e in session.events() if e.type == "turn.end"]
+    assert ends and ends[-1].data["status"] == "error"
+
+
+def test_a_cancelled_tool_leaves_no_unanswered_tool_calls(workspace) -> None:
+    agent, session, registry, _ = make_agent(workspace, [[tool_call("workspace_info")]])
+
+    async def hang(args):
+        raise asyncio.CancelledError
+
+    registry._handlers["workspace_info"] = hang
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(agent.run_turn("go"))
+    calls = [m for m in agent.messages if m.get("tool_calls")]
+    answered = {m["tool_call_id"] for m in agent.messages if m.get("role") == "tool"}
+    assert {c["id"] for m in calls for c in m["tool_calls"]} <= answered
+
+
+# --------------------------------------------------------------------------- AGT-003
+@pytest.mark.parametrize("reason", ["length", "content_filter", "incomplete"])
+def test_a_cut_off_answer_is_not_reported_as_completed(workspace, reason: str) -> None:
+    agent, session, _, _ = make_agent(
+        workspace, [[TextDelta("partial"), DoneEvent(finish_reason=reason)]]
+    )
+    result = asyncio.run(agent.run_turn("go"))
+    assert result.status == "incomplete"
+    ends = [e for e in session.events() if e.type == "turn.end"]
+    assert ends[-1].data["status"] == "incomplete"
+    assert ends[-1].data["finish_reason"] == reason
+
+
+def test_truncated_tool_calls_are_not_executed(workspace) -> None:
+    call = ToolCall(id="c1", name="write_file", arguments='{"path":"corpus/t.md","content":"x')
+    agent, _, _, _ = make_agent(
+        workspace, [[DoneEvent(finish_reason="length", tool_calls=(call,))]]
+    )
+    result = asyncio.run(agent.run_turn("go"))
+    assert result.status == "incomplete"
+    assert not (workspace.root / "corpus" / "t.md").exists()
+    assert not any(m.get("tool_calls") for m in agent.messages)
+
+
+@pytest.mark.parametrize("reason", ["stop", "tool_calls", None, "end_turn"])
+def test_neg_normal_finish_reasons_complete(workspace, reason) -> None:
+    agent, _, _, _ = make_agent(workspace, [[TextDelta("ok"), DoneEvent(finish_reason=reason)]])
+    assert asyncio.run(agent.run_turn("go")).status == "completed"

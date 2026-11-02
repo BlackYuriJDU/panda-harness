@@ -196,6 +196,19 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   (`status`, `text`, `steps`, `tool_calls`, `usage`, `context_tokens`,
   `context_window`, `context_ratio`, `session_id`).
 - A timeout maps to exit code `4`.
+- **The ledger is on the critical path.** If an event cannot be recorded (disk full,
+  anchor mismatch, closed session), the turn stops before the next model step or
+  tool runs, with a session-integrity error (exit `4`). The turn ends with status
+  `ledger_failed` when the ledger still accepts that final event. There is no
+  degraded mode.
+- **A cut-off answer is not `completed`.** When the provider stops with
+  `length`, `max_tokens`, `content_filter`, `refusal` or `incomplete`, the turn
+  status is `incomplete` and `turn.end` carries `finish_reason`. Tool calls from a
+  cut-off step are dropped, not executed, because their arguments may be truncated.
+- An unexpected exception in a tool becomes a failed tool result; any other
+  unexpected exception still writes a `turn.end` with status `error`. Tool calls
+  left without a result by a cancellation or an error are answered with a failed
+  result, so the conversation stays valid.
 
 ### 4.2 `panda models`
 
