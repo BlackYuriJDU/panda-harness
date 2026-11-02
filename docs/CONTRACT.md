@@ -317,6 +317,11 @@ workspace, secret paths, and traversal are refused by policy or by path
 resolution, not by prompt text. `write_file`, `edit_file`, and `run_shell` are
 the non-read-only tools and require a policy `allow` (or an approved `ask`).
 
+**`grep` runs in a child process.** The regular expression is chosen by the model and
+can take exponential time while holding the interpreter lock, so the search runs in a
+separate process that is killed after 10 seconds; the tool then returns an error that
+suggests `fixed_strings`. Files are filtered by the `read` policy in the parent first.
+
 **Edits are byte-exact.** `edit_file` reads and writes bytes: the file's line ending
 (LF, CRLF or CR) is kept, a BOM and non-ASCII text are kept, and a file that is not
 valid UTF-8 or has mixed line endings is refused and left untouched, never rewritten

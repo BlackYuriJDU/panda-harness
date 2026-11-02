@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- ReDoS in `grep` (SEC-006): the model's regular expression ran synchronously on the
+  event loop, so 26 characters could freeze the cockpit and the approval prompt for
+  seconds. The search now runs in a child process (`panda_core.grep_worker`) that is
+  killed after 10 seconds, while the policy filter stays in the parent.
 - Byte-exact edits (EDIT-001): `edit_file` rewrote CRLF as LF and replaced non-UTF-8
   bytes with U+FFFD, which is irreversible for a file not tracked by git. It now reads
   and writes bytes, keeps the line ending, BOM and non-ASCII text, and refuses (leaving

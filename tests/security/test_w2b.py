@@ -296,3 +296,80 @@ def test_tree_hash_ignores_the_ledger_and_other_non_corpus_files(workspace) -> N
     SessionLog.create(workspace.sessions_dir, label="noise")
     (workspace.root / "scratch.tmp").write_text("x")
     assert tree_hash(workspace.root).digest == before
+
+
+# --------------------------------------------------------------------------- SEC-006
+def test_a_catastrophic_regex_is_stopped_and_the_loop_stays_responsive(
+    workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("panda_core.tools.GREP_TIMEOUT_SECONDS", 1.0)
+    (workspace.root / "corpus" / "evil.txt").write_text("a" * 40 + "!\n", encoding="utf-8")
+    registry, _ = make_registry(workspace)
+
+    async def scenario() -> tuple[object, int, float]:
+        ticks = 0
+        stop = asyncio.Event()
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while not stop.is_set():
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        watcher = asyncio.create_task(ticker())
+        started = time.monotonic()
+        result = await registry.call("grep", {"pattern": "(a+)+$", "glob": "corpus/evil.txt"})
+        elapsed = time.monotonic() - started
+        stop.set()
+        await watcher
+        return result, ticks, elapsed
+
+    result, ticks, elapsed = asyncio.run(scenario())
+    assert not result.ok and "longer than" in result.content
+    assert elapsed < 6
+    assert ticks >= 8, "the event loop was blocked while the regex ran"
+
+
+@POSIX
+def test_the_search_worker_does_not_outlive_a_timeout(
+    workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    monkeypatch.setattr("panda_core.tools.GREP_TIMEOUT_SECONDS", 1.0)
+    (workspace.root / "corpus" / "evil2.txt").write_text("a" * 40 + "!\n", encoding="utf-8")
+    pids: list[int] = []
+    real = subprocess.Popen
+
+    class Recording(real):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            pids.append(self.pid)
+
+    monkeypatch.setattr("panda_core.process.subprocess.Popen", Recording)
+    registry, _ = make_registry(workspace)
+    call(registry, "grep", pattern="(a+)+$", glob="corpus/evil2.txt")
+    monkeypatch.undo()
+    assert pids, "the search must run in a child process"
+    for pid in pids:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+
+def test_fixed_strings_cannot_be_made_catastrophic(workspace) -> None:
+    (workspace.root / "corpus" / "f.txt").write_text("(a+)+$ " + "a" * 40 + "\n", encoding="utf-8")
+    registry, _ = make_registry(workspace)
+    result = call(registry, "grep", pattern="(a+)+$", glob="corpus/f.txt", fixed_strings=True)
+    assert result.ok and result.data["count"] == 1
+
+
+def test_neg_grep_results_keep_their_shape(workspace) -> None:
+    (workspace.root / "corpus" / "g.txt").write_text("one\nTwo words\nthree\n", encoding="utf-8")
+    registry, _ = make_registry(workspace)
+    result = call(registry, "grep", pattern="two", glob="corpus/g.txt")
+    assert result.ok and result.data["matches"] == ["corpus/g.txt:2: Two words"]
+    assert result.data["files_scanned"] == 1 and result.data["truncated"] is False
+    sensitive = call(registry, "grep", pattern="two", glob="corpus/g.txt", case_sensitive=True)
+    assert sensitive.data["count"] == 0
+    limited = call(registry, "grep", pattern="e", glob="corpus/g.txt", max_matches=1)
+    assert limited.data["truncated"] is True and limited.data["count"] == 1

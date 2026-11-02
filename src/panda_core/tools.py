@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import threading
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from panda_core.treehash import file_sha256
 from panda_core.validator import Validator, validator_sha256
 from panda_core.workspace import Workspace
 
+GREP_TIMEOUT_SECONDS = 10.0
 IGNORED_DIRS = {
     ".git",
     ".hg",
@@ -580,50 +582,60 @@ class ToolRegistry:
             raise ToolInputError("pattern must not be empty")
         flags = 0 if case_sensitive else re.IGNORECASE
         try:
-            regex = re.compile(re.escape(pattern) if fixed else pattern, flags)
+            re.compile(re.escape(pattern) if fixed else pattern, flags)
         except re.error as exc:
             raise ToolInputError(f"invalid regular expression: {exc}") from exc
         _, blocked = await _authorize(self.ctx, tool="grep", action="read", resource=".")
         if blocked:
             return blocked
-        matches: list[str] = []
-        files_scanned = 0
         omitted = 0
-        truncated = False
         root = self.ctx.workspace.root.resolve()
+        candidates: list[str] = []
         for candidate in _iter_files(self.ctx.workspace.root, glob, 5_000):
             if not candidate.is_file() or candidate.stat().st_size > MAX_READ_BYTES:
                 continue
             if not _readable_by_policy(self.ctx, root, candidate):
                 omitted += 1
                 continue
-            files_scanned += 1
-            try:
-                raw = candidate.read_bytes()
-            except OSError:
-                continue
-            if b"\x00" in raw[:2048]:
-                continue
-            text = raw.decode("utf-8", "replace")
-            relative = candidate.relative_to(root).as_posix()
-            for number, line in enumerate(text.splitlines(), start=1):
-                if regex.search(line):
-                    matches.append(f"{relative}:{number}: {line[:300]}")
-                    if len(matches) >= limit:
-                        truncated = True
-                        break
-            if truncated:
-                break
+            candidates.append(candidate.relative_to(root).as_posix())
+        request = {
+            "pattern": pattern,
+            "flags": flags,
+            "fixed": fixed,
+            "limit": limit,
+            "max_bytes": MAX_READ_BYTES,
+            "files": candidates,
+        }
+        worker = Path(__file__).with_name("grep_worker.py")
+        result = await asyncio.to_thread(
+            run_command,
+            [sys.executable, "-I", str(worker)],
+            cwd=root,
+            timeout=GREP_TIMEOUT_SECONDS,
+            env=_scrubbed_env(),
+            input_text=json.dumps(request),
+        )
+        if result.timed_out:
+            return _fail(
+                "grep",
+                f"the pattern took longer than {GREP_TIMEOUT_SECONDS:g}s and was stopped; "
+                "use fixed_strings or a simpler pattern",
+            )
+        try:
+            found = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            detail = result.stderr.strip()[-300:] or "no output"
+            return _fail("grep", f"the search worker failed: {detail}")
         return _ok(
             "grep",
             {
                 "pattern": pattern,
                 "glob": glob,
-                "files_scanned": files_scanned,
+                "files_scanned": found["scanned"],
                 "omitted_by_policy": omitted,
-                "count": len(matches),
-                "matches": matches,
-                "truncated": truncated,
+                "count": len(found["matches"]),
+                "matches": found["matches"],
+                "truncated": found["truncated"],
             },
         )
 
