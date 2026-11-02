@@ -254,6 +254,15 @@ payload carries `ok: false` and a stable `code`.
 
 ## 6. Provider and model routing
 
+**A stream must end properly.** Each protocol has a terminal event: `[DONE]` or a
+`finish_reason` (OpenAI chat), `message_stop` or a `stop_reason` (Anthropic),
+`response.completed` or `response.incomplete` (Responses), a candidate `finishReason`
+(Google). A stream that ends without one is a protocol error (exit `4`), never a
+complete answer. Server-sent events are read per event: the `data:` lines of one
+event are joined with a newline, and comments and other fields are ignored. Tool-call
+ids that the provider does not supply are generated as `call_<stream>_<index>` and do
+not repeat across steps.
+
 The provider is OpenCode Go, with four implemented adapters under one key:
 
 - OpenAI-compatible chat: `POST {base_url}/openai/v1/chat/completions`;

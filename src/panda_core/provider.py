@@ -44,7 +44,7 @@ from panda_core.config import (
     split_model,
 )
 from panda_core.credentials import get_api_key
-from panda_core.errors import ConfigError, ProviderError
+from panda_core.errors import ConfigError, ProtocolError, ProviderError
 from panda_core.protocols import (
     PROTOCOL_ANTHROPIC,
     PROTOCOL_GOOGLE,
@@ -878,6 +878,29 @@ def _error_for_status(
     )
 
 
+async def _sse_data(response: httpx.Response) -> AsyncIterator[str]:
+    """Yield the `data` of each server-sent event, per the SSE format (PROV-003).
+
+    An event ends at a blank line; its `data:` lines are joined with a newline;
+    comments and other fields are ignored. A partial last event is still delivered.
+    """
+
+    lines: list[str] = []
+    async for line in response.aiter_lines():
+        if line == "":
+            if lines:
+                yield "\n".join(lines).strip()
+                lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if field == "data":
+            lines.append(value[1:] if value.startswith(" ") else value)
+    if lines:
+        yield "\n".join(lines).strip()
+
+
 class OpenCodeProvider:
     """Streaming client for OpenCode Go (OpenAI chat + Anthropic Messages)."""
 
@@ -1123,6 +1146,14 @@ class OpenCodeProvider:
                     raise
                 await self._sleep_before_retry(attempt, exc)
 
+    _stream_serial = 0
+
+    def _generated_id(self, index: int) -> str:
+        # Ids the provider did not supply must stay unique across steps, or a
+        # later step collides with an earlier one when the history is replayed
+        # to a stricter protocol (PROV-004).
+        return f"call_{self._stream_serial}_{index}"
+
     async def _stream_once(
         self,
         messages: Sequence[dict[str, Any]],
@@ -1132,6 +1163,7 @@ class OpenCodeProvider:
         key: str,
         session_id: str,
     ) -> AsyncIterator[ProviderEvent]:
+        self._stream_serial += 1
         protocol = classify_protocol(model_id)
         if protocol == PROTOCOL_ANTHROPIC:
             async for event in self._stream_anthropic(
@@ -1197,6 +1229,7 @@ class OpenCodeProvider:
         finish_reason: str | None = None
         response_model: str | None = None
 
+        terminal = False
         try:
             async with self.client.stream(
                 "POST", self.chat_url, json=payload, headers=headers
@@ -1206,15 +1239,9 @@ class OpenCodeProvider:
                     raise _error_for_status(
                         response.status_code, body, retry_after=_retry_after(response)
                     )
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                async for data in _sse_data(response):
                     if data == "[DONE]":
+                        terminal = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -1246,6 +1273,7 @@ class OpenCodeProvider:
                     choice = choices[0] if isinstance(choices[0], dict) else {}
                     if choice.get("finish_reason"):
                         finish_reason = str(choice["finish_reason"])
+                        terminal = True
                     delta = choice.get("delta")
                     if not isinstance(delta, dict):
                         continue
@@ -1294,9 +1322,15 @@ class OpenCodeProvider:
                 details={"error": type(exc).__name__, "retryable": True},
             ) from exc
 
+        if not terminal:
+            raise ProtocolError(
+                "provider stream ended without a terminal event",
+                hint="the response was cut off; retry the turn",
+                details={"protocol": "openai-chat"},
+            )
         calls = tuple(
             ToolCall(
-                id=slot["id"] or f"call_{index}",
+                id=slot["id"] or self._generated_id(index),
                 name=slot["name"],
                 arguments=slot["arguments"],
             )
@@ -1341,6 +1375,7 @@ class OpenCodeProvider:
         finish_reason: str | None = None
         response_model: str | None = model_id
 
+        terminal = False
         try:
             async with self.client.stream(
                 "POST", self.anthropic_url, json=payload, headers=headers
@@ -1350,15 +1385,9 @@ class OpenCodeProvider:
                     raise _error_for_status(
                         response.status_code, body, retry_after=_retry_after(response)
                     )
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                async for data in _sse_data(response):
                     if data == "[DONE]":
+                        terminal = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -1370,6 +1399,8 @@ class OpenCodeProvider:
                     if not isinstance(chunk, dict):
                         continue
                     kind = chunk.get("type")
+                    if kind == "message_stop":
+                        terminal = True
                     if kind == "error":
                         raw_error = chunk.get("error")
                         message = (
@@ -1435,6 +1466,7 @@ class OpenCodeProvider:
                     if kind == "message_delta":
                         delta = chunk.get("delta")
                         if isinstance(delta, dict) and delta.get("stop_reason"):
+                            terminal = True
                             raw_reason = str(delta["stop_reason"])
                             finish_reason = ANTHROPIC_STOP_REASONS.get(raw_reason, raw_reason)
                         merge_usage(usage_raw, chunk.get("usage"))
@@ -1457,9 +1489,15 @@ class OpenCodeProvider:
         usage = parse_anthropic_usage(usage_raw)
         if usage is not None:
             yield UsageEvent(usage)
+        if not terminal:
+            raise ProtocolError(
+                "provider stream ended without a terminal event",
+                hint="the response was cut off; retry the turn",
+                details={"protocol": "anthropic"},
+            )
         calls = tuple(
             ToolCall(
-                id=slot["id"] or f"call_{index}",
+                id=slot["id"] or self._generated_id(index),
                 name=slot["name"],
                 arguments=slot["arguments"],
             )
@@ -1503,6 +1541,7 @@ class OpenCodeProvider:
         finish_reason: str | None = None
         response_model: str | None = None
 
+        terminal = False
         try:
             async with self.client.stream(
                 "POST", self.responses_url, json=payload, headers=headers
@@ -1512,15 +1551,9 @@ class OpenCodeProvider:
                     raise _error_for_status(
                         response.status_code, body, retry_after=_retry_after(response)
                     )
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                async for data in _sse_data(response):
                     if data == "[DONE]":
+                        terminal = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -1610,6 +1643,7 @@ class OpenCodeProvider:
                             yield TextDelta(delta)
                         continue
                     if kind in {"response.completed", "response.incomplete"}:
+                        terminal = True
                         frame = chunk.get("response")
                         if not isinstance(frame, dict):
                             continue
@@ -1646,9 +1680,15 @@ class OpenCodeProvider:
         usage = parse_responses_usage(usage_raw)
         if usage is not None:
             yield UsageEvent(usage)
+        if not terminal:
+            raise ProtocolError(
+                "provider stream ended without a terminal event",
+                hint="the response was cut off; retry the turn",
+                details={"protocol": "responses"},
+            )
         calls = tuple(
             ToolCall(
-                id=slot["id"] or f"call_{index}",
+                id=slot["id"] or self._generated_id(index),
                 name=slot["name"],
                 arguments=slot["arguments"],
             )
@@ -1693,6 +1733,7 @@ class OpenCodeProvider:
         response_model: str | None = None
         next_index = 0
 
+        terminal = False
         try:
             async with self.client.stream(
                 "POST", self.google_url(model_id), json=payload, headers=headers
@@ -1702,15 +1743,9 @@ class OpenCodeProvider:
                     raise _error_for_status(
                         response.status_code, body, retry_after=_retry_after(response)
                     )
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                async for data in _sse_data(response):
                     if data == "[DONE]":
+                        terminal = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -1761,7 +1796,7 @@ class OpenCodeProvider:
                             if not name:
                                 continue
                             call_id = str(call.get("id") or "").strip() or (
-                                f"call_{next_index}"
+                                self._generated_id(next_index)
                             )
                             if any(slot["id"] == call_id for slot in slots.values()):
                                 continue
@@ -1790,6 +1825,7 @@ class OpenCodeProvider:
                             )
                         reason = candidate.get("finishReason")
                         if reason:
+                            terminal = True
                             raw_reason = str(reason)
                             if raw_reason == "MALFORMED_FUNCTION_CALL":
                                 raise ProviderError(
@@ -1818,9 +1854,15 @@ class OpenCodeProvider:
         usage = parse_google_usage(usage_raw)
         if usage is not None:
             yield UsageEvent(usage)
+        if not terminal:
+            raise ProtocolError(
+                "provider stream ended without a terminal event",
+                hint="the response was cut off; retry the turn",
+                details={"protocol": "google"},
+            )
         calls = tuple(
             ToolCall(
-                id=slot["id"] or f"call_{index}",
+                id=slot["id"] or self._generated_id(index),
                 name=slot["name"],
                 arguments=slot["arguments"],
                 metadata=(

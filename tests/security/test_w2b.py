@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import sys
@@ -373,3 +374,148 @@ def test_neg_grep_results_keep_their_shape(workspace) -> None:
     assert sensitive.data["count"] == 0
     limited = call(registry, "grep", pattern="e", glob="corpus/g.txt", max_matches=1)
     assert limited.data["truncated"] is True and limited.data["count"] == 1
+
+
+# ------------------------------------------------------------ providers (fixtures only)
+import httpx  # noqa: E402
+
+from panda_core.config import ProviderSettings  # noqa: E402
+from panda_core.errors import ProtocolError  # noqa: E402
+from panda_core.provider import DoneEvent as ProvDone  # noqa: E402
+from panda_core.provider import OpenCodeProvider  # noqa: E402
+
+OPENAI_MODEL = "deepseek-v4.1-flash"
+RESPONSES_MODEL = "gpt-5.6"
+GOOGLE_MODEL = "gemini-4"
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+
+def provider_for(body: str, *, model: str) -> OpenCodeProvider:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return OpenCodeProvider(
+        ProviderSettings(max_retries=0), model=model, client=client, api_key="SYNTH_SECRET_KEY"
+    )
+
+
+async def drain(provider: OpenCodeProvider, model: str, messages=None):
+    events = []
+    async for event in provider.stream(
+        messages or [{"role": "user", "content": "hi"}], None, model=model
+    ):
+        events.append(event)
+    return events
+
+
+def sse_of(*chunks: dict, done: bool = False, events: bool = False) -> str:
+    out = ""
+    for chunk in chunks:
+        if events:
+            out += f"event: {chunk['type']}\n"
+        out += f"data: {json.dumps(chunk)}\n\n"
+    return out + ("data: [DONE]\n\n" if done else "")
+
+
+# --------------------------------------------------------------------------- PROV-002
+TRUNCATED = [
+    (OPENAI_MODEL, sse_of({"choices": [{"delta": {"content": "parcial"}}]})),
+    (
+        RESPONSES_MODEL,
+        sse_of({"type": "response.output_text.delta", "delta": "parcial"}, events=True),
+    ),
+    (GOOGLE_MODEL, sse_of({"candidates": [{"content": {"parts": [{"text": "parcial"}]}}]})),
+    (
+        ANTHROPIC_MODEL,
+        sse_of(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "p"},
+            },
+            events=True,
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(("model", "body"), TRUNCATED)
+def test_a_stream_cut_without_a_terminal_event_is_a_protocol_error(model, body) -> None:
+    with pytest.raises(ProtocolError):
+        asyncio.run(drain(provider_for(body, model=model), model))
+
+
+COMPLETE = [
+    (OPENAI_MODEL, sse_of({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]})),
+    (OPENAI_MODEL, sse_of({"choices": [{"delta": {"content": "ok"}}]}, done=True)),
+    (
+        RESPONSES_MODEL,
+        sse_of(
+            {"type": "response.output_text.delta", "delta": "ok"},
+            {"type": "response.completed", "response": {}},
+            events=True,
+        ),
+    ),
+    (
+        GOOGLE_MODEL,
+        sse_of(
+            {"candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}
+        ),
+    ),
+    (
+        ANTHROPIC_MODEL,
+        sse_of(
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "ok"},
+            },
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+            events=True,
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(("model", "body"), COMPLETE)
+def test_neg_a_complete_stream_still_finishes(model, body) -> None:
+    events = asyncio.run(drain(provider_for(body, model=model), model))
+    assert isinstance(events[-1], ProvDone)
+
+
+# --------------------------------------------------------------------------- PROV-003
+def test_an_sse_event_with_several_data_lines_is_joined_with_newlines() -> None:
+    payload = json.dumps({"choices": [{"delta": {"content": "linha"}, "finish_reason": "stop"}]})
+    half = payload.index('"delta"')
+    body = f"data: {payload[:half]}\ndata: {payload[half:]}\n\n"
+    events = asyncio.run(drain(provider_for(body, model=OPENAI_MODEL), OPENAI_MODEL))
+    assert "".join(getattr(e, "text", "") for e in events) == "linha"
+
+
+def test_sse_comments_and_unknown_fields_are_ignored() -> None:
+    chunk = {"choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}]}
+    body = f": keep-alive\nid: 7\nretry: 100\ndata: {json.dumps(chunk)}\n\n"
+    events = asyncio.run(drain(provider_for(body, model=OPENAI_MODEL), OPENAI_MODEL))
+    assert "".join(getattr(e, "text", "") for e in events) == "x"
+
+
+# --------------------------------------------------------------------------- PROV-004
+def tool_chunk(call_id: str | None = None) -> dict:
+    fragment: dict = {"index": 0, "function": {"name": "read_file", "arguments": "{}"}}
+    if call_id:
+        fragment["id"] = call_id
+    return {"choices": [{"delta": {"tool_calls": [fragment]}, "finish_reason": "tool_calls"}]}
+
+
+def test_generated_tool_call_ids_do_not_repeat_between_steps() -> None:
+    provider = provider_for(sse_of(tool_chunk()), model=OPENAI_MODEL)
+    first = asyncio.run(drain(provider, OPENAI_MODEL))[-1].tool_calls[0].id
+    second = asyncio.run(drain(provider, OPENAI_MODEL))[-1].tool_calls[0].id
+    assert first != second
+
+
+def test_neg_ids_supplied_by_the_provider_are_kept() -> None:
+    provider = provider_for(sse_of(tool_chunk("toolu_ABC")), model=OPENAI_MODEL)
+    assert asyncio.run(drain(provider, OPENAI_MODEL))[-1].tool_calls[0].id == "toolu_ABC"

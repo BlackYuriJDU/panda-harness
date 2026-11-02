@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Provider streams (PROV-002, PROV-003, PROV-004): a stream cut off before its terminal
+  event was accepted as a complete answer in all four protocols; it is now a protocol
+  error (exit `4`). SSE events are read per event (several `data:` lines are joined
+  with a newline), and generated tool-call ids (`call_<stream>_<index>`) no longer
+  repeat between steps, which made Anthropic reject the replayed history with
+  `tool_use ids must be unique`.
 - ReDoS in `grep` (SEC-006): the model's regular expression ran synchronously on the
   event loop, so 26 characters could freeze the cockpit and the approval prompt for
   seconds. The search now runs in a child process (`panda_core.grep_worker`) that is
