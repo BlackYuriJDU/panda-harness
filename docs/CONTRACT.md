@@ -263,6 +263,13 @@ event are joined with a newline, and comments and other fields are ignored. Tool
 ids that the provider does not supply are generated as `call_<stream>_<index>` and do
 not repeat across steps.
 
+**History is repaired before it is sent.** Anthropic gets a `tool_result` marked
+`is_error` for every `tool_use` that has none, Responses gets a `function_call_output`
+for every `function_call` (and loses outputs without a call), and a Gemini history never
+starts with a `model` turn (function responses whose call went with it are dropped).
+The synthetic text is `[no result was recorded for this tool call]`. Gemini
+`thoughtSignature` data stays on the Google path only.
+
 The provider is OpenCode Go, with four implemented adapters under one key:
 
 - OpenAI-compatible chat: `POST {base_url}/openai/v1/chat/completions`;

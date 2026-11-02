@@ -337,6 +337,9 @@ def _tool_input(arguments: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+NO_TOOL_RESULT = "[no result was recorded for this tool call]"
+
+
 def _append_blocks(
     converted: list[dict[str, Any]], role: str, blocks: list[dict[str, Any]]
 ) -> None:
@@ -386,11 +389,49 @@ def _normalize_anthropic_turns(
                 filtered.append({"role": role, "content": kept})
         return filtered
 
+    def close_dangling(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Answer every `tool_use` that has no `tool_result` (ADP-001).
+
+        Anthropic rejects the request when a tool_use is not followed by its
+        result. A cancelled or failed turn can leave that shape in the history.
+        """
+
+        closed: list[dict[str, Any]] = []
+        for position, turn in enumerate(items):
+            closed.append(turn)
+            if turn["role"] != "assistant":
+                continue
+            ids = [
+                str(block["id"])
+                for block in turn["content"]
+                if block.get("type") == "tool_use" and block.get("id")
+            ]
+            following = items[position + 1] if position + 1 < len(items) else None
+            blocks = following["content"] if following and following["role"] == "user" else []
+            answered = {str(b.get("tool_use_id")) for b in blocks if b.get("type") == "tool_result"}
+            synthetic = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": NO_TOOL_RESULT,
+                    "is_error": True,
+                }
+                for call_id in ids
+                if call_id not in answered
+            ]
+            if not synthetic:
+                continue
+            if following is not None and following["role"] == "user":
+                following["content"] = synthetic + list(following["content"])
+            else:
+                closed.append({"role": "user", "content": synthetic})
+        return closed
+
     normalized = filter_orphans(turns)
     while normalized and normalized[0]["role"] == "assistant":
         normalized.pop(0)
     # Dropping an assistant can orphan the tool results of the next user turn.
-    normalized = filter_orphans(normalized)
+    normalized = close_dangling(filter_orphans(normalized))
     merged: list[dict[str, Any]] = []
     for turn in normalized:
         if merged and merged[-1]["role"] == turn["role"]:
@@ -596,7 +637,28 @@ def convert_messages_for_responses(
                     "content": [{"type": "input_text", "text": content}],
                 }
             )
-    return "\n\n".join(system_parts), items
+    return "\n\n".join(system_parts), _pair_responses_items(items)
+
+
+def _pair_responses_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every `function_call` gets an output, and an output needs a call (ADP-001)."""
+
+    called = {i["call_id"] for i in items if i.get("type") == "function_call"}
+    answered = {i["call_id"] for i in items if i.get("type") == "function_call_output"}
+    paired: list[dict[str, Any]] = []
+    for item in items:
+        if item.get("type") == "function_call_output" and item["call_id"] not in called:
+            continue  # orphaned by trimming
+        paired.append(item)
+        if item.get("type") == "function_call" and item["call_id"] not in answered:
+            paired.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": item["call_id"],
+                    "output": NO_TOOL_RESULT,
+                }
+            )
+    return paired
 
 
 _GOOGLE_SCHEMA_DROP = frozenset(
@@ -754,7 +816,42 @@ def convert_messages_for_google(
         content = _text_content(message.get("content"))
         if content:
             append("user", [{"text": content}])
-    return system_parts, contents
+    return system_parts, _google_valid_start(contents)
+
+
+def _google_valid_start(contents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Gemini rejects a history that starts with `model` (ADP-002).
+
+    Context trimming can leave a leading model turn. Drop it, and drop the
+    function responses whose call went with it (or that do not answer the
+    function calls of the turn right before them).
+    """
+
+    start = 0
+    while start < len(contents) and contents[start]["role"] == "model":
+        start += 1
+    cleaned: list[dict[str, Any]] = []
+    called: set[str] = set()
+    for turn in contents[start:]:
+        if turn["role"] == "model":
+            called = {
+                part["functionCall"]["name"] for part in turn["parts"] if "functionCall" in part
+            }
+            parts = list(turn["parts"])
+        else:
+            parts = [
+                part
+                for part in turn["parts"]
+                if "functionResponse" not in part or part["functionResponse"]["name"] in called
+            ]
+            called = set()
+        if not parts:
+            continue
+        if cleaned and cleaned[-1]["role"] == turn["role"]:
+            cleaned[-1]["parts"].extend(parts)
+        else:
+            cleaned.append({"role": turn["role"], "parts": parts})
+    return cleaned
 
 
 @dataclass(frozen=True)

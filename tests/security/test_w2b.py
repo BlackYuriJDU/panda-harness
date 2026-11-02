@@ -519,3 +519,132 @@ def test_generated_tool_call_ids_do_not_repeat_between_steps() -> None:
 def test_neg_ids_supplied_by_the_provider_are_kept() -> None:
     provider = provider_for(sse_of(tool_chunk("toolu_ABC")), model=OPENAI_MODEL)
     assert asyncio.run(drain(provider, OPENAI_MODEL))[-1].tool_calls[0].id == "toolu_ABC"
+
+
+# --------------------------------------------------------------------------- ADP-001 / ADP-002
+from panda_core.provider import (  # noqa: E402
+    convert_messages_for_anthropic,
+    convert_messages_for_google,
+    convert_messages_for_responses,
+)
+
+
+def assistant_call(call_id: str, name: str = "read_file", meta: dict | None = None) -> dict:
+    call = {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+    if meta:
+        call["provider_meta"] = meta
+    return call
+
+
+def tool_result(call_id: str, text: str = "result") -> dict:
+    return {"role": "tool", "tool_call_id": call_id, "content": text}
+
+
+def test_anthropic_gets_a_tool_result_for_every_tool_use() -> None:
+    history = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": None, "tool_calls": [assistant_call("A")]},
+        {"role": "user", "content": "next"},
+    ]
+    _, turns = convert_messages_for_anthropic(history)
+    user_turn = turns[2]
+    assert user_turn["role"] == "user"
+    first = user_turn["content"][0]
+    assert first["type"] == "tool_result" and first["tool_use_id"] == "A" and first["is_error"]
+    assert user_turn["content"][1]["type"] == "text"
+
+
+def test_anthropic_only_the_missing_result_is_synthesized() -> None:
+    history = [
+        {"role": "user", "content": "task"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [assistant_call("A"), assistant_call("B")],
+        },
+        tool_result("A", "real"),
+    ]
+    _, turns = convert_messages_for_anthropic(history)
+    results = {b["tool_use_id"]: b for b in turns[-1]["content"] if b["type"] == "tool_result"}
+    assert set(results) == {"A", "B"}
+    assert results["A"]["content"] == "real" and results["B"].get("is_error")
+
+
+def test_anthropic_a_dangling_last_tool_use_gets_a_closing_user_turn() -> None:
+    history = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": None, "tool_calls": [assistant_call("A")]},
+    ]
+    _, turns = convert_messages_for_anthropic(history)
+    assert turns[-1]["role"] == "user" and turns[-1]["content"][0]["tool_use_id"] == "A"
+
+
+def test_neg_anthropic_complete_pairs_are_unchanged() -> None:
+    history = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": None, "tool_calls": [assistant_call("A")]},
+        tool_result("A", "ok"),
+        {"role": "assistant", "content": "done"},
+    ]
+    _, turns = convert_messages_for_anthropic(history)
+    blocks = [b for t in turns for b in t["content"] if b["type"] == "tool_result"]
+    assert len(blocks) == 1 and "is_error" not in blocks[0]
+
+
+def test_responses_gets_an_output_for_every_function_call_and_drops_orphans() -> None:
+    history = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": None, "tool_calls": [assistant_call("A")]},
+        tool_result("ZZZ", "orphan"),
+        {"role": "user", "content": "next"},
+    ]
+    _, items = convert_messages_for_responses(history)
+    outputs = [i for i in items if i.get("type") == "function_call_output"]
+    assert [o["call_id"] for o in outputs] == ["A"]
+    call_at = next(n for n, i in enumerate(items) if i.get("type") == "function_call")
+    assert items[call_at + 1]["type"] == "function_call_output"
+
+
+def test_neg_responses_complete_pairs_are_unchanged() -> None:
+    history = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": None, "tool_calls": [assistant_call("A")]},
+        tool_result("A", "ok"),
+    ]
+    _, items = convert_messages_for_responses(history)
+    assert [i.get("output") for i in items if i.get("type") == "function_call_output"] == ["ok"]
+
+
+def test_google_history_never_starts_with_the_model() -> None:
+    history = [
+        {"role": "system", "content": "s"},
+        {"role": "assistant", "content": "I was the first message"},
+        {"role": "user", "content": "task"},
+    ]
+    _, contents = convert_messages_for_google(history)
+    assert contents[0]["role"] == "user"
+
+
+def test_google_orphan_function_responses_are_dropped_with_their_calls() -> None:
+    history = [
+        {"role": "assistant", "content": None, "tool_calls": [assistant_call("A")]},
+        tool_result("A", "orphaned by the trim"),
+        {"role": "user", "content": "task"},
+    ]
+    _, contents = convert_messages_for_google(history)
+    assert contents[0]["role"] == "user"
+    assert not any("functionResponse" in part for c in contents for part in c["parts"])
+
+
+def test_neg_google_thought_signature_still_round_trips() -> None:
+    meta = {"google": {"thought_signature": "SIG123"}}
+    history = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": None, "tool_calls": [assistant_call("A", meta=meta)]},
+        tool_result("A", "ok"),
+    ]
+    _, contents = convert_messages_for_google(history)
+    parts = [p for c in contents for p in c["parts"]]
+    assert any(p.get("thoughtSignature") == "SIG123" for p in parts)
+    assert any("functionResponse" in p for p in parts)

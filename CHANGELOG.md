@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Adapters (ADP-001, ADP-002): a `tool_use` or `function_call` left without a result by
+  a cancelled or failed turn made Anthropic and Responses reject the replayed history,
+  and trimming could leave a Gemini history starting with a `model` turn. The history is
+  now repaired before it is sent: missing results are synthesized and marked as errors,
+  orphan outputs are dropped, and a Google history starts with `user`.
 - Provider streams (PROV-002, PROV-003, PROV-004): a stream cut off before its terminal
   event was accepted as a complete answer in all four protocols; it is now a protocol
   error (exit `4`). SSE events are read per event (several `data:` lines are joined
