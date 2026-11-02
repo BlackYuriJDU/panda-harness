@@ -576,3 +576,72 @@ def test_a_second_trim_updates_one_marker_not_two(workspace) -> None:
     asyncio.run(agent.run_turn(TASK + "_second"))
     markers = [m for m in agent.messages if "[contexto resumido:" in str(m.get("content"))]
     assert len(markers) == 1
+
+
+# --------------------------------------------------------------------------- AGT-004
+from panda_core.errors import UsageError  # noqa: E402
+
+
+def test_the_conversation_cannot_be_reset_while_a_tool_runs(workspace) -> None:
+    agent, session, registry, _ = make_agent(
+        workspace, [[tool_call("workspace_info")], [TextDelta("done")]]
+    )
+    outcomes: list[str] = []
+
+    async def probe(args):
+        for action in (
+            agent.reset_conversation,
+            lambda: agent.set_model("opencode-go/deepseek-v4.1-flash"),
+            lambda: agent.set_active_study("gse160208"),
+        ):
+            try:
+                action()
+                outcomes.append("allowed")
+            except UsageError:
+                outcomes.append("refused")
+        return await original(args)
+
+    original = registry._handlers["workspace_info"]
+    registry._handlers["workspace_info"] = probe
+    asyncio.run(agent.run_turn("go"))
+    assert outcomes == ["refused", "refused", "refused"]
+    roles = [m["role"] for m in agent.messages]
+    assert roles[:3] == ["system", "user", "assistant"] and "tool" in roles
+
+
+def test_the_conversation_can_be_reset_between_turns(workspace) -> None:
+    agent, _, _, _ = make_agent(workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]])
+    asyncio.run(agent.run_turn("go"))
+    agent.reset_conversation()
+    assert [m["role"] for m in agent.messages] == ["system"]
+
+
+def test_the_turn_flag_is_cleared_after_an_error(workspace) -> None:
+    agent, _, _, _ = make_agent(workspace, [[RuntimeError("boom")]])
+    with pytest.raises(RuntimeError):
+        asyncio.run(agent.run_turn("go"))
+    agent.reset_conversation()  # must not raise
+
+
+def test_cockpit_ignores_state_changing_commands_during_a_turn(workspace) -> None:
+    from panda_cli.cockpit import PandaCockpit
+
+    async def scenario() -> None:
+        app = PandaCockpit(workspace)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            before = app.runtime.model
+            calls: list[str] = []
+            app.runtime.reset = lambda: calls.append("reset")  # type: ignore[method-assign]
+            app._busy = True
+            for text in ("/clear", "/model opencode-go/other", "/study use gse160208", "!echo hi"):
+                app._submit_input(text)
+            await pilot.pause()
+            await app.action_clear_transcript()
+            await pilot.pause()
+            assert calls == []
+            assert app.runtime.model == before
+            assert app.runtime.active_study is None
+            app._busy = False
+
+    asyncio.run(scenario())

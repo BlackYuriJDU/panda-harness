@@ -205,6 +205,10 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   `length`, `max_tokens`, `content_filter`, `refusal` or `incomplete`, the turn
   status is `incomplete` and `turn.end` carries `finish_reason`. Tool calls from a
   cut-off step are dropped, not executed, because their arguments may be truncated.
+- **Nothing rewrites the conversation during a turn.** `/clear`, `Ctrl+L`, `/model`,
+  `/study ...` and `!command` are refused with a notice while a turn is running in the
+  cockpit, and the agent raises a usage error (exit `2`) if its model, active study or
+  history is changed mid-turn.
 - **Context trimming never drops the task.** When the conversation exceeds the
   context budget, the system prompt, the current turn's user message and the last six
   messages are kept; older messages are replaced by one marker message

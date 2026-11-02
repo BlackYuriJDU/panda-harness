@@ -48,6 +48,8 @@ SHADOW = PALETTE["white.shadow"]
 INK = PALETTE["ink"]
 MOUSE_OFF = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
 
+IDLE_FREE_COMMANDS = frozenset({"/help", "/quit", "/exit"})
+
 HELP_TEXT = """Panda cockpit commands
 
 /help                 show this help
@@ -850,6 +852,13 @@ class PandaCockpit(App[None]):
         if self.runtime is None:
             self._notice("runtime unavailable; restart panda to build it")
             return
+        if self._busy and (
+            text.startswith("!")
+            or (text.startswith("/") and text.split()[0].lower() not in IDLE_FREE_COMMANDS)
+        ):
+            # These change the conversation or run a command beside the turn (AGT-004).
+            self._notice("a turn is running; wait for it or press Ctrl+C first")
+            return
         if text.startswith("/"):
             self._run_command(text)
             return
@@ -1105,6 +1114,9 @@ class PandaCockpit(App[None]):
         self._notice("cancelling…")
 
     async def action_clear_transcript(self) -> None:
+        if self._busy:
+            self._notice("a turn is running; wait for it or press Ctrl+C first")
+            return
         transcript = self.query_one("#transcript", VerticalScroll)
         await transcript.remove_children()
         if self.runtime is not None:

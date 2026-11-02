@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from panda_core.errors import PandaError, ProviderError, SessionIntegrityError
+from panda_core.errors import PandaError, ProviderError, SessionIntegrityError, UsageError
 from panda_core.limits import DEFAULT_MAX_STEPS
 from panda_core.provider import (
     DoneEvent,
@@ -225,6 +225,7 @@ class Agent:
         self.last_context_tokens = 0
         self.last_steps = 0
         self._cancelled = False
+        self._turn_active = False
         self._pinned: dict[str, Any] | None = None
         self._summary: dict[str, Any] | None = None
         self._trimmed_total = 0
@@ -380,7 +381,25 @@ class Agent:
         )
 
     # ---- turn ----
+    @property
+    def busy(self) -> bool:
+        return self._turn_active
+
+    def _require_idle(self, what: str) -> None:
+        if self._turn_active:
+            raise UsageError(
+                f"cannot {what} while a turn is running",
+                hint="wait for the turn to finish or cancel it first",
+            )
+
     async def run_turn(self, user_message: str) -> TurnResult:
+        self._turn_active = True
+        try:
+            return await self._run_turn(user_message)
+        finally:
+            self._turn_active = False
+
+    async def _run_turn(self, user_message: str) -> TurnResult:
         text = user_message.strip()
         if not text:
             raise ValueError("user message is empty")
@@ -634,6 +653,7 @@ class Agent:
 
     # ---- conversation control ----
     def set_model(self, model: str) -> None:
+        self._require_idle("change the model")
         self.model = model
         self.messages[0] = {
             "role": "system",
@@ -641,6 +661,7 @@ class Agent:
         }
 
     def set_active_study(self, study_id: str | None) -> None:
+        self._require_idle("change the active study")
         self.active_study = study_id
         self.tools.ctx.active_study = study_id
         self.messages[0] = {
@@ -649,6 +670,7 @@ class Agent:
         }
 
     def reset_conversation(self) -> None:
+        self._require_idle("reset the conversation")
         self.messages = [self.messages[0]]
         self._pinned = self._summary = None
         self._trimmed_total = 0

@@ -18,6 +18,10 @@ All notable changes to this project are documented here. The format follows
   the last six messages are now pinned, removed messages are replaced by a visible
   marker, tool exchanges are removed whole, and a `context.trim` event records the
   count and the SHA-256 of every removed message.
+- Turn isolation (AGT-004): `/clear`, `Ctrl+L`, `/model`, `/study use` and `!cmd` ran
+  beside an active turn and could leave `[system, tool]` in the history. They are now
+  refused while a turn runs, and `Agent.reset_conversation`, `set_model` and
+  `set_active_study` raise a usage error mid-turn.
 - Agent loop (AGT-001, AGT-003): an unexpected tool exception is a failed result, any
   other exception still closes the turn, unanswered tool calls are answered on
   cancel or error, and a provider `finish_reason` of `length`, `content_filter`,
