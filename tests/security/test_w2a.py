@@ -469,3 +469,110 @@ def test_truncated_tool_calls_are_not_executed(workspace) -> None:
 def test_neg_normal_finish_reasons_complete(workspace, reason) -> None:
     agent, _, _, _ = make_agent(workspace, [[TextDelta("ok"), DoneEvent(finish_reason=reason)]])
     assert asyncio.run(agent.run_turn("go")).status == "completed"
+
+
+# --------------------------------------------------------------------------- AGT-002
+TASK = "PINNED_TASK_find_the_three_enriched_pathways"
+
+
+def _bulk(agent: Agent, rounds: int) -> None:
+    """Old conversation: user/assistant pairs and tool exchanges, each ~1 KB."""
+
+    for index in range(rounds):
+        agent.messages.append({"role": "user", "content": f"old question {index} " + "q" * 1_000})
+        call_id = f"old{index}"
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            }
+        )
+        agent.messages.append(
+            {"role": "tool", "tool_call_id": call_id, "content": "r" * 1_000}
+        )
+        agent.messages.append({"role": "assistant", "content": f"answer {index} " + "a" * 1_000})
+
+
+def test_the_task_survives_trimming_and_the_trim_is_recorded(workspace) -> None:
+    agent, session, _, _ = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]], context_window=1_000
+    )
+    _bulk(agent, 12)
+    asyncio.run(agent.run_turn(TASK))
+    provider = agent.provider
+    sent = provider.calls[0]
+    assert any(m.get("role") == "user" and m.get("content") == TASK for m in sent)
+    assert sent[0]["role"] == "system"
+    trims = [e for e in session.events() if e.type == "context.trim"]
+    assert trims, "the ledger must say the context was cut"
+    data = trims[0].data
+    assert data["removed"] > 0 and len(data["removed_sha256"]) == data["removed"]
+    assert all(len(h) == 64 for h in data["removed_sha256"])
+
+
+def test_a_visible_marker_replaces_the_removed_messages(workspace) -> None:
+    agent, _, _, _ = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]], context_window=1_000
+    )
+    _bulk(agent, 12)
+    asyncio.run(agent.run_turn(TASK))
+    markers = [m for m in agent.messages if "[contexto resumido:" in str(m.get("content"))]
+    assert len(markers) == 1
+    assert "read_file" in markers[0]["content"]
+
+
+def test_trimming_never_leaves_an_orphan_tool_message(workspace) -> None:
+    agent, _, _, _ = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]], context_window=1_000
+    )
+    _bulk(agent, 12)
+    asyncio.run(agent.run_turn(TASK))
+    announced: set[str] = set()
+    for message in agent.messages:
+        for call in message.get("tool_calls") or []:
+            announced.add(call["id"])
+        if message.get("role") == "tool":
+            assert message["tool_call_id"] in announced
+
+
+def test_the_most_recent_messages_are_kept_whole(workspace) -> None:
+    agent, _, _, _ = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]], context_window=1_000
+    )
+    _bulk(agent, 12)
+    last_four = [dict(m) for m in agent.messages[-4:]]
+    asyncio.run(agent.run_turn(TASK))
+    kept = agent.messages
+    for message in last_four:
+        assert message in kept
+
+
+def test_no_trim_event_when_everything_fits(workspace) -> None:
+    script = [[TextDelta("ok"), DoneEvent(finish_reason="stop")]]
+    agent, session, _, _ = make_agent(workspace, script)
+    asyncio.run(agent.run_turn("short task"))
+    assert not [e for e in session.events() if e.type == "context.trim"]
+
+
+def test_a_second_trim_updates_one_marker_not_two(workspace) -> None:
+    agent, _, _, _ = make_agent(
+        workspace,
+        [
+            [TextDelta("ok"), DoneEvent(finish_reason="stop")],
+            [TextDelta("ok2"), DoneEvent(finish_reason="stop")],
+        ],
+        context_window=1_000,
+    )
+    _bulk(agent, 8)
+    asyncio.run(agent.run_turn(TASK))
+    _bulk(agent, 8)
+    asyncio.run(agent.run_turn(TASK + "_second"))
+    markers = [m for m in agent.messages if "[contexto resumido:" in str(m.get("content"))]
+    assert len(markers) == 1

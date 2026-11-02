@@ -109,6 +109,7 @@ class TurnResult:
             "session_id": self.session_id,
         }
 
+KEEP_RECENT_MESSAGES = 6
 INCOMPLETE_REASONS = frozenset({"length", "max_tokens", "content_filter", "incomplete", "refusal"})
 
 
@@ -224,6 +225,10 @@ class Agent:
         self.last_context_tokens = 0
         self.last_steps = 0
         self._cancelled = False
+        self._pinned: dict[str, Any] | None = None
+        self._summary: dict[str, Any] | None = None
+        self._trimmed_total = 0
+        self._trimmed_tools: dict[str, int] = {}
         # The tool context is shared: one policy, one session, one approver.
         if self.session is not None:
             self.tools.ctx.session = self.session
@@ -312,18 +317,67 @@ class Agent:
     def estimate_context_tokens(self) -> int:
         return max(0, _messages_chars(self.messages) // 4)
 
+    def _oldest_removable(self) -> int | None:
+        """Index of the oldest message that trimming may drop, or None.
+
+        The system prompt, the task of the current turn, the running summary and
+        the most recent messages are never dropped (AGT-002).
+        """
+
+        for index in range(1, max(1, len(self.messages) - KEEP_RECENT_MESSAGES)):
+            message = self.messages[index]
+            if message is not self._pinned and message is not self._summary:
+                return index
+        return None
+
     def _trim(self) -> None:
         budget = self._context_budget_chars()
-        while len(self.messages) > 2 and _messages_chars(self.messages) > budget:
-            head = self.messages[1]
-            self.messages.pop(1)
-            if head.get("role") == "assistant" and head.get("tool_calls"):
-                # Keep tool results paired with their assistant message.
-                while len(self.messages) > 1 and self.messages[1].get("role") == "tool":
-                    self.messages.pop(1)
-            while len(self.messages) > 1 and self.messages[1].get("role") == "tool":
-                self.messages.pop(1)
+        removed: list[dict[str, Any]] = []
+        while _messages_chars(self.messages) > budget:
+            index = self._oldest_removable()
+            if index is None:
+                break
+            end = index + 1
+            if self.messages[index].get("role") in {"assistant", "tool"}:
+                # A tool result goes with the assistant message that asked for it.
+                while end < len(self.messages) and self.messages[end].get("role") == "tool":
+                    end += 1
+            removed.extend(self.messages[index:end])
+            del self.messages[index:end]
+        if removed:
+            self._record_trim(removed)
         self.last_context_tokens = self.estimate_context_tokens()
+
+    def _record_trim(self, removed: list[dict[str, Any]]) -> None:
+        for message in removed:
+            for call in message.get("tool_calls") or []:
+                name = call.get("function", {}).get("name", "?")
+                self._trimmed_tools[name] = self._trimmed_tools.get(name, 0) + 1
+        self._trimmed_total += len(removed)
+        tools = ", ".join(f"{n} x{c}" for n, c in sorted(self._trimmed_tools.items()))
+        content = f"[contexto resumido: {self._trimmed_total} mensagens]" + (
+            f"\nferramentas usadas nas mensagens removidas: {tools}" if tools else ""
+        )
+        if self._summary is None:
+            self._summary = {"role": "user", "content": content}
+            self.messages.insert(1, self._summary)
+        else:
+            self._summary["content"] = content
+        self._log(
+            "context.trim",
+            {
+                "removed": len(removed),
+                "removed_total": self._trimmed_total,
+                "removed_sha256": [
+                    hashlib.sha256(
+                        json.dumps(message, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                    ).hexdigest()
+                    for message in removed
+                ],
+                "chars_after": _messages_chars(self.messages),
+                "budget": self._context_budget_chars(),
+            },
+        )
 
     # ---- turn ----
     async def run_turn(self, user_message: str) -> TurnResult:
@@ -356,7 +410,9 @@ class Agent:
             else:
                 self._log("message.user", {"content": text, "chars": len(text)})
             self._emit("turn_start", turn=turn, model=self.model)
-            self.messages.append({"role": "user", "content": text})
+            task_message = {"role": "user", "content": text}
+            self.messages.append(task_message)
+            self._pinned = task_message
             while steps < self.max_steps:
                 steps += 1
                 self._trim()
@@ -594,6 +650,9 @@ class Agent:
 
     def reset_conversation(self) -> None:
         self.messages = [self.messages[0]]
+        self._pinned = self._summary = None
+        self._trimmed_total = 0
+        self._trimmed_tools = {}
         self.last_context_tokens = 0
         self.last_usage = Usage()
 

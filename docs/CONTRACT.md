@@ -205,6 +205,11 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   `length`, `max_tokens`, `content_filter`, `refusal` or `incomplete`, the turn
   status is `incomplete` and `turn.end` carries `finish_reason`. Tool calls from a
   cut-off step are dropped, not executed, because their arguments may be truncated.
+- **Context trimming never drops the task.** When the conversation exceeds the
+  context budget, the system prompt, the current turn's user message and the last six
+  messages are kept; older messages are replaced by one marker message
+  (`[contexto resumido: N mensagens]`, with the tools used) and a `context.trim`
+  event records how many messages were removed and the SHA-256 of each.
 - An unexpected exception in a tool becomes a failed tool result; any other
   unexpected exception still writes a `turn.end` with status `error`. Tool calls
   left without a result by a cancellation or an error are answered with a failed

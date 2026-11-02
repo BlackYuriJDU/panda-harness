@@ -13,6 +13,11 @@ All notable changes to this project are documented here. The format follows
   recorded. A ledger failure now raises a session-integrity error (exit `4`) before
   any tool runs, including `approval.*` records, and the MCP `_record` raises too.
   `turn.end` uses status `ledger_failed` when it can still be written.
+- Context (AGT-002): `_trim` removed the user's task first, without a summary and
+  without a trace in the ledger. The task of the current turn, the system prompt and
+  the last six messages are now pinned, removed messages are replaced by a visible
+  marker, tool exchanges are removed whole, and a `context.trim` event records the
+  count and the SHA-256 of every removed message.
 - Agent loop (AGT-001, AGT-003): an unexpected tool exception is a failed result, any
   other exception still closes the turn, unanswered tool calls are answered on
   cancel or error, and a provider `finish_reason` of `length`, `content_filter`,
