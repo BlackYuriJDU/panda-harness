@@ -29,11 +29,21 @@ All notable changes to this project are documented here. The format follows
   version is reported from the user-scoped cache or as `null`. `doctor`,
   `validate` and the validator tools are where node runs.
 
+- Policy floor (TRUST-003): a workspace `policy.json` with `default: "allow"` is
+  refused, and the engine always applies a built-in floor of `hard_deny` rules
+  (secret reads, force-push and destructive shell, release publishing, and
+  writes under `.panda/` and `corpus/validation/`). A hostile policy that allows
+  everything can no longer let the agent rewrite the policy, the ledger or the
+  validator. Writes to `corpus/validation/**` are now `hard_deny` for the agent.
+
 ### Changed
 
 - **Breaking for custom endpoints:** a workspace file with a non-official
   `provider.base_url` or `provider.api_key_env` is now rejected. `panda init
   --force` resets it to the defaults.
+- **Breaking for policy authors:** `default: "allow"` is rejected, and the agent
+  can no longer write `corpus/validation/**` or `.panda/**` even if a rule allows
+  it; edit those files yourself.
 - **Breaking for a path in `node`:** put the binary on `PATH` instead of naming
   its path in `.panda/config.json`.
 - **Breaking for symlinked workspace files:** copy the target into the

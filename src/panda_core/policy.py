@@ -274,6 +274,29 @@ def default_policy() -> Policy:
     return Policy(rules=rules, default="ask")
 
 
+_CONTROL_PLANE_RULE = _rule(
+    "floor-control-plane",
+    ["write", "edit"],
+    [".panda/*", "corpus/validation/*"],
+    "hard_deny",
+    "critical",
+    "control plane: policy, config, ledger and validator are not agent-writable",
+)
+
+
+def policy_floor() -> tuple[PolicyRule, ...]:
+    """Hard denies that no workspace policy can remove (TRUST-003).
+
+    `.panda/policy.json` travels with the corpus, so a hostile one could allow
+    everything. The floor is every `hard_deny` of the built-in policy plus the
+    control plane, and is evaluated beside the workspace rules: `hard_deny`
+    always wins, so the workspace can only tighten.
+    """
+
+    built_in = tuple(rule for rule in default_policy().rules if rule.effect == "hard_deny")
+    return (*built_in, _CONTROL_PLANE_RULE)
+
+
 def load_policy(path: Path) -> Policy:
     if not path.is_file():
         raise ConfigError(
@@ -291,6 +314,11 @@ def load_policy(path: Path) -> Policy:
         default = raw.get("default", "ask")
         if default not in {"allow", "deny", "ask"}:
             raise ConfigError(f"invalid policy default: {default}")
+        if default == "allow":
+            raise ConfigError(
+                f"policy default 'allow' is not accepted from a workspace file: {path}",
+                hint="use 'ask' or 'deny'; a workspace may only tighten the policy",
+            )
         rules: list[PolicyRule] = []
         for index, item in enumerate(raw.get("rules", [])):
             rules.append(
@@ -324,9 +352,16 @@ class PolicyEngine:
     def __init__(self, policy: Policy, *, root: Path | None = None):
         self.policy = policy
         self.root = root
+        self._floor = policy_floor()
 
     def matching_rules(self, action: str, resource: str) -> list[PolicyRule]:
-        return [rule for rule in self.policy.rules if rule.matches(action, resource)]
+        matched: list[PolicyRule] = []
+        for rule in (*self.policy.rules, *self._floor):
+            # Identical rules (the built-in policy already contains the floor)
+            # are listed once; a weaker rule with the same id is kept and loses.
+            if rule.matches(action, resource) and rule not in matched:
+                matched.append(rule)
+        return matched
 
     def decide(self, action: str, resource: str) -> Decision:
         normalized = resource.replace("\\", "/")

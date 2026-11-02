@@ -435,3 +435,94 @@ def test_config_node_accepts_plain_command_names(workspace: Workspace, value: st
     data["node"] = value
     path.write_text(json.dumps(data), encoding="utf-8")
     assert load_config(path).node == value
+
+
+# --------------------------------------------------------------------------- TRUST-003
+def _write_policy(workspace: Workspace, **fields: object) -> None:
+    body = {"schema_version": 1, "default": "ask", "rules": []}
+    body.update(fields)
+    workspace.policy_path.write_text(json.dumps(body), encoding="utf-8")
+
+
+ALLOW_EVERYTHING = {
+    "id": "allow-all",
+    "actions": ["*"],
+    "resources": ["*"],
+    "effect": "allow",
+}
+
+
+def test_policy_default_allow_is_rejected(workspace: Workspace) -> None:
+    from panda_core.policy import load_policy
+
+    _write_policy(workspace, default="allow")
+    with pytest.raises(ConfigError):
+        load_policy(workspace.policy_path)
+
+
+def test_run_refuses_a_workspace_policy_whose_default_is_allow(workspace: Workspace) -> None:
+    _write_policy(workspace, default="allow")
+    result = runner.invoke(app, ["run", "--dry-run", "--root", str(workspace.root), "task"])
+    assert result.exit_code == 2, result.output
+
+
+@pytest.mark.parametrize(
+    ("action", "resource"),
+    [
+        ("write", ".panda/policy.json"),
+        ("edit", ".panda/config.json"),
+        ("write", ".panda/sessions/s_1.jsonl"),
+        ("write", "corpus/validation/validate.mjs"),
+        ("write", "corpus/validation/sub/dir/x.mjs"),
+        ("write", ".PANDA/policy.json"),
+        ("read", ".env"),
+        ("read", "keys/server.pem"),
+        ("read", "home/.ssh/id_ed25519"),
+        ("shell", "git push --force origin main"),
+        ("shell", "git reset --hard HEAD"),
+        ("shell", "rm -rf corpus"),
+    ],
+)
+def test_floor_survives_a_policy_that_allows_everything(
+    workspace: Workspace, action: str, resource: str
+) -> None:
+    from panda_core.policy import PolicyEngine, load_policy
+
+    _write_policy(workspace, rules=[ALLOW_EVERYTHING])
+    engine = PolicyEngine(load_policy(workspace.policy_path), root=workspace.root)
+    assert engine.decide(action, resource).effect == "hard_deny"
+
+
+def test_floor_cannot_be_weakened_by_redefining_a_floor_rule(workspace: Workspace) -> None:
+    from panda_core.policy import PolicyEngine, load_policy
+
+    _write_policy(
+        workspace,
+        rules=[
+            {"id": "read-secrets", "actions": ["read"], "resources": ["none"], "effect": "allow"},
+            ALLOW_EVERYTHING,
+        ],
+    )
+    engine = PolicyEngine(load_policy(workspace.policy_path), root=workspace.root)
+    assert engine.decide("read", ".env").effect == "hard_deny"
+
+
+def test_runtime_applies_the_floor_to_write_file(workspace: Workspace) -> None:
+    from panda_cli.runtime import ChatRuntime
+
+    _write_policy(workspace, rules=[ALLOW_EVERYTHING])
+    before = workspace.policy_path.read_text(encoding="utf-8")
+    runtime = ChatRuntime(workspace)
+    assert runtime.policy.decide("write", ".panda/policy.json").effect == "hard_deny"
+    assert workspace.policy_path.read_text(encoding="utf-8") == before
+
+
+def test_neg_default_policy_decisions_are_unchanged(workspace: Workspace) -> None:
+    from panda_core.policy import PolicyEngine, load_policy
+
+    engine = PolicyEngine(load_policy(workspace.policy_path), root=workspace.root)
+    assert engine.decide("read", "corpus/evidence.md").effect == "allow"
+    assert engine.decide("write", "corpus/claims/c1.md").effect == "allow"
+    assert engine.decide("write", "pipeline/a.py").effect == "ask"
+    assert engine.decide("shell", "git status").effect == "allow"
+    assert engine.decide("shell", "git push origin main").effect == "ask"

@@ -314,6 +314,13 @@ and no global allow. In `panda run` without `--auto`, an `ask` is denied and the
 tool returns a blocked result, not an exception loop. Every request and decision
 is written to the ledger as `approval.request` / `approval.decision`.
 
+**Built-in floor.** `.panda/policy.json` is workspace data and may be hostile, so
+the engine always adds a floor of `hard_deny` rules after loading it: every
+`hard_deny` of the built-in policy (secret and credential reads, force-push and
+history rewrites, destructive shell, release publishing) plus writes and edits
+under `.panda/` and `corpus/validation/`. A workspace policy can only tighten
+the result. `default: "allow"` is refused with exit `2`; use `ask` or `deny`.
+
 `panda policy check` exits `0` only for `allow`; every other effect exits `5`.
 Path resources are resolved before matching, so `corpus/../README.md` normalizes
 to `README.md` and cannot borrow a `corpus/*` allow rule.
