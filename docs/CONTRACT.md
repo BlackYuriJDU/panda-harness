@@ -36,7 +36,7 @@ the action.
 | Python | 3.12 or newer |
 | Node.js | 20 or newer, only for the corpus validator |
 | OpenCode Go | `https://opencode.ai/inference/go` by default |
-| API key | `OPENCODE_API_KEY` (name configurable via `provider.api_key_env`) |
+| API key | `OPENCODE_API_KEY` (a workspace file cannot change the variable name) |
 | Git | optional, used for provenance metadata |
 | OpenCode CLI | **not required and not used** |
 
@@ -97,6 +97,15 @@ enabled legacy export both produce a warning line.
 ### 3.2 Configuration
 
 `.panda/config.json` is validated with Pydantic (`extra="forbid"`). Defaults:
+
+**Workspace trust boundary.** `.panda/config.json` is meant to be committed, so a
+corpus received from a third party controls it. When the file is loaded, only the
+official provider is accepted: `provider.base_url` must be `https` on
+`opencode.ai` (default port, no credentials in the URL) and `provider.api_key_env`
+must be `OPENCODE_API_KEY`. Anything else is a configuration error (exit `2`) and
+no request is made, so a corpus cannot choose where the provider key is sent. The
+`ProviderSettings` model itself is unchanged; the restriction applies to workspace
+files only.
 
 | Key | Default |
 |---|---|

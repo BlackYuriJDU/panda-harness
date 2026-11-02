@@ -110,7 +110,9 @@ key is not exported in this shell.
 
 The provider is OpenCode Go: `provider.name = "opencode-go"`,
 `provider.base_url = "https://opencode.ai/inference/go"`, key in
-`OPENCODE_API_KEY`. The default model is
+`OPENCODE_API_KEY`. A workspace file cannot point Panda at another host or
+another key variable (it is rejected with exit `2`), because the config travels
+with the corpus. The default model is
 `opencode-go/deepseek-v4.1-flash`. Every catalogue model is callable: OpenAI-chat
 models use `/openai/v1/chat/completions`, Claude uses the Anthropic Messages
 adapter (`/anthropic/v1/messages`), GPT/Grok/Muse use the Responses API

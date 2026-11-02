@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.2.0a5 hardening
+
+### Security
+
+- Workspace trust boundary (TRUST-001): `.panda/config.json` can no longer choose
+  where the provider key is sent. `provider.base_url` must be `https` on
+  `opencode.ai` and `provider.api_key_env` must be `OPENCODE_API_KEY`; any other
+  value is a configuration error (exit `2`) raised before any request. This
+  closes the key-exfiltration route for `panda run`, `panda chat` and
+  `panda models` when opening a corpus received from a third party.
+
+### Changed
+
+- **Breaking for custom endpoints:** a workspace file with a non-official
+  `provider.base_url` or `provider.api_key_env` is now rejected. `panda init
+  --force` resets it to the defaults.
+
 ## [0.2.0a4] — 2026-10-30
 
 ### Fixed

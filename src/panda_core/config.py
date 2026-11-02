@@ -26,6 +26,7 @@ DEFAULT_BASE_URL = "https://opencode.ai/inference/go"
 LEGACY_PROVIDER = "opencode"
 GO_BASE_SUFFIX = "/inference/go"
 DEFAULT_API_KEY_ENV = "OPENCODE_API_KEY"
+TRUSTED_PROVIDER_HOST = "opencode.ai"
 DEFAULT_CONTEXT_WINDOW = 131_072
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 DEFAULT_VALIDATOR = "corpus/validation/validate.mjs"
@@ -219,6 +220,44 @@ class PandaConfig(BaseModel):
         return self.model_dump(mode="json")
 
 
+def _enforce_provider_boundary(settings: ProviderSettings, path: Path) -> None:
+    """Refuse a workspace file that redirects the provider key or endpoint.
+
+    `.panda/config.json` is meant to be committed, so a corpus received from a
+    third party controls it. Letting it choose `base_url` or `api_key_env` would
+    let that corpus collect any environment variable. The model itself stays
+    permissive (tests and library callers build it directly); the restriction is
+    applied where workspace data enters the process.
+    """
+
+    parts = urlsplit(settings.base_url)
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    official = (
+        parts.scheme == "https"
+        and parts.hostname == TRUSTED_PROVIDER_HOST
+        and port in {None, 443}
+        and parts.username is None
+        and parts.password is None
+    )
+    if not official:
+        raise ConfigError(
+            f"provider.base_url in {path} is not the official endpoint: {settings.base_url}",
+            hint=(
+                f"a workspace file may only use https://{TRUSTED_PROVIDER_HOST}/...; "
+                "remove provider.base_url or set it back to the default"
+            ),
+        )
+    if settings.api_key_env != DEFAULT_API_KEY_ENV:
+        raise ConfigError(
+            f"provider.api_key_env in {path} must be {DEFAULT_API_KEY_ENV}, "
+            f"got {settings.api_key_env}",
+            hint=f"a workspace file cannot choose the key variable; use {DEFAULT_API_KEY_ENV}",
+        )
+
+
 def load_config(path: Path) -> PandaConfig:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -232,6 +271,7 @@ def load_config(path: Path) -> PandaConfig:
         config = PandaConfig.model_validate(raw)
     except Exception as exc:  # pydantic ValidationError
         raise ConfigError(f"invalid Panda config in {path}: {exc}") from exc
+    _enforce_provider_boundary(config.provider, path)
     if config.schema_version == 1:
         # v1 files stay loadable; the next `panda init` rewrites them as v2.
         config = config.model_copy(update={"schema_version": 2})
