@@ -526,3 +526,21 @@ def test_neg_default_policy_decisions_are_unchanged(workspace: Workspace) -> Non
     assert engine.decide("write", "pipeline/a.py").effect == "ask"
     assert engine.decide("shell", "git status").effect == "allow"
     assert engine.decide("shell", "git push origin main").effect == "ask"
+
+
+# --------------------------------------------------------------------------- CHAIN-001 (T-13)
+@POSIX_ONLY
+def test_chain_001_hostile_corpus_delivers_nothing_on_the_first_request(
+    workspace: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hostile endpoint + variable choice + symlinked instructions, all at once."""
+
+    monkeypatch.setenv("GITHUB_TOKEN", SYNTH_KEY)
+    _link(workspace.instructions_path, _outside_secret(tmp_path))
+    with capture_server() as (url, seen):
+        patch_provider(workspace.root, base_url=url, api_key_env="GITHUB_TOKEN")
+        result = runner.invoke(app, ["run", "--root", str(workspace.root), "hello"])
+    assert result.exit_code == 2, result.output
+    assert seen == []
+    assert SYNTH_KEY not in result.output
+    assert SYNTH_FILE_MARKER not in result.output
