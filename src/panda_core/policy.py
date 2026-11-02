@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
+import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +20,7 @@ from typing import Any, Literal
 from panda_core.atomic import atomic_write_json
 from panda_core.errors import ConfigError, PolicyDenied
 from panda_core.safe_read import read_workspace_file
+from panda_core.shell_policy import SEVERITY, ShellVerdict, classify_shell
 
 Effect = Literal["allow", "deny", "ask", "hard_deny"]
 Risk = Literal["low", "medium", "high", "critical"]
@@ -204,7 +208,6 @@ def default_policy() -> Policy:
                 "git log*",
                 "git show*",
                 "git branch*",
-                "node corpus/validation/validate.mjs*",
                 "panda validate*",
             ],
             "allow",
@@ -216,7 +219,6 @@ def default_policy() -> Policy:
             ["shell"],
             [
                 "git push *--force*",
-                "git push *-f*",
                 "git push *--mirror*",
                 "git push *--delete*",
             ],
@@ -386,6 +388,47 @@ class PolicyEngine:
         return matched
 
     def decide(self, action: str, resource: str) -> Decision:
+        if action == "shell":
+            try:
+                argv = shlex.split(resource, posix=os.name != "nt")
+            except ValueError:
+                argv = resource.split()
+            return self.decide_shell(argv, text=resource)
+        return self._decide_rules(action, resource)
+
+    def decide_shell(self, argv: Sequence[str], *, text: str | None = None) -> Decision:
+        """Decide a command from its argv: rules first, then the token classifier.
+
+        The classifier can only escalate (SEC-001, SEC-007), so a workspace policy
+        can tighten the result but never loosen it.
+        """
+
+        base = self._decide_rules("shell", text if text is not None else " ".join(argv))
+        verdict = classify_shell(argv)
+        if verdict is None:
+            return base
+        worst = verdict
+        for path in verdict.read_paths:
+            read = self._decide_rules("read", path)
+            if read.effect != "allow":
+                worst = max(
+                    (worst, ShellVerdict(read.effect, read.risk, f"reads {path}: {read.reason}",
+                                         read.rule_id or "shell-git-read")),
+                    key=lambda item: SEVERITY[item.effect],
+                )
+        if SEVERITY[worst.effect] <= SEVERITY[base.effect]:
+            return base
+        return Decision(
+            action="shell",
+            resource=base.resource,
+            effect=worst.effect,  # type: ignore[arg-type]
+            risk=worst.risk,  # type: ignore[arg-type]
+            rule_id=worst.rule_id,
+            reason=worst.reason,
+            matched_rules=(*base.matched_rules, worst.rule_id),
+        )
+
+    def _decide_rules(self, action: str, resource: str) -> Decision:
         normalized = resource.replace("\\", "/")
         matched = self.matching_rules(action, normalized)
         hard = [rule for rule in matched if rule.effect == "hard_deny"]

@@ -8,6 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Shell policy by effect (SEC-001, SEC-007, shell route of SEC-002): commands are
+  classified from argv tokens (`panda_core.shell_policy`) after the glob rules, and
+  can only escalate. `git show HEAD:.env`, `git diff --output=README.md`,
+  `git diff --no-index`, `git -C . reset --hard`, `git -c ... push --force`,
+  `git push origin +main`, `git branch -D`, `rm -r -f`, `rm -Rf` and
+  `find -delete` are now refused, and `git diff -- .env` is refused by the `read`
+  rules. `git push origin fix-foo` is `ask` instead of a false-positive
+  `hard_deny`. `node corpus/validation/validate.mjs` lost its pre-approval.
 - Study cards and claims (SEC-010, SEC-011): `study_show` followed whatever link
   `corpus/studies/INDEX.md` held, which the agent can rewrite, and `claim_*`
   followed symlinks out of the workspace. An INDEX link that is absolute or

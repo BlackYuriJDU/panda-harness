@@ -285,3 +285,156 @@ def test_claim_tools_ignore_a_symlink_to_a_file_outside(workspace: Workspace, tm
         assert MARK not in call(registry, tool, **args).content
     listing = call(registry, "claim_list")
     assert listing.ok and listing.data["total"] == 1
+
+
+# --------------------------------------------------------------------------- SEC-001 / SEC-007
+def decide_shell(command: str) -> str:
+    return engine().decide("shell", command).effect
+
+
+# The nine decisions the audit measured (F04), with the effect they must have now.
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("git push origin fix-foo", "ask"),
+        ("git -C . reset --hard HEAD", "hard_deny"),
+        ("git -c core.pager=cat push --force origin main", "hard_deny"),
+        ("rm -r -f corpus", "hard_deny"),
+        ("find corpus -delete", "hard_deny"),
+        ("git push origin +main", "hard_deny"),
+        ("git branch -D main", "hard_deny"),
+        ("git diff --output=README.md", "deny"),
+        ("git log -p --output=x", "deny"),
+    ],
+)
+def test_f04_decisions_by_effect(command: str, expected: str) -> None:
+    assert decide_shell(command) == expected
+
+
+# Reformulations of the same effect (option order, '=' vs space, ./ and case).
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("git --no-pager -C . push -f origin main", "hard_deny"),
+        ("git push -fu origin main", "hard_deny"),
+        ("git push --force-with-lease origin main", "hard_deny"),
+        ("git push --for origin main", "hard_deny"),
+        ("git push origin :main", "hard_deny"),
+        ("git push --delete origin topic", "hard_deny"),
+        ("git push --mirror", "hard_deny"),
+        ("GIT.EXE push --force origin main", "hard_deny"),
+        ("./git push --force", "hard_deny"),
+        ("/usr/bin/git reset --hard", "hard_deny"),
+        ("git reset --ha HEAD~1", "hard_deny"),
+        ("git clean -fd", "hard_deny"),
+        ("git clean --force -d", "hard_deny"),
+        ("git branch --delete topic", "hard_deny"),
+        ("git branch -d topic", "hard_deny"),
+        ("env git push --force", "hard_deny"),
+        ("rm -fr corpus", "hard_deny"),
+        ("rm -Rf corpus", "hard_deny"),
+        ("rm --recursive --force corpus", "hard_deny"),
+        ("RM -R corpus", "hard_deny"),
+        ("find . -type f -delete", "hard_deny"),
+        ("git diff --out=README.md", "deny"),
+        ("git diff --output README.md", "deny"),
+        ("git diff --no-index /dev/null /etc/hosts", "deny"),
+        ("git diff --ext-diff", "deny"),
+        ("git show --output=x HEAD", "deny"),
+    ],
+)
+def test_destructive_and_exfiltrating_variants_fail_closed(command: str, expected: str) -> None:
+    assert decide_shell(command) == expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git show HEAD:.env",
+        "git show HEAD:src/a.py",
+        "git -c core.pager=cat status",
+        "git diff /etc/passwd",
+        "git diff ../outside.txt",
+        "git branch newbranch",
+        "git branch -m old new",
+        "git log --exec-path",
+        "git checkout main",
+        "git commit -m msg",
+        "git push origin main",
+        "find . -exec rm {} ;",
+        "node corpus/validation/validate.mjs",
+    ],
+)
+def test_other_cases_need_an_approval(command: str) -> None:
+    assert decide_shell(command) == "ask"
+
+
+@pytest.mark.parametrize(
+    "command", ["git diff -- .env", "git log -p -- deploy.pem", "git show .npmrc"]
+)
+def test_reading_a_secret_through_git_is_refused(command: str) -> None:
+    assert decide_shell(command) == "hard_deny"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git status",
+        "git status --short --branch",
+        "git log --oneline -5",
+        "git log --since=2.days.ago --author=ana",
+        "git diff --stat",
+        "git diff HEAD~1 -- src/a.py",
+        "git diff main..feature",
+        "git show HEAD",
+        "git branch --list",
+        "git branch -a",
+        "git branch --show-current",
+        "panda validate",
+    ],
+)
+def test_neg_ordinary_read_only_commands_stay_allowed(command: str) -> None:
+    assert decide_shell(command) == "allow"
+
+
+def test_neg_force_push_is_still_hard_denied_with_approval() -> None:
+    from panda_core.errors import PolicyDenied
+
+    with pytest.raises(PolicyDenied):
+        engine().authorize("shell", "git push --force origin main", approved=True)
+
+
+def test_the_classifier_applies_even_to_a_policy_that_allows_everything(
+    workspace: Workspace,
+) -> None:
+    body = {
+        "schema_version": 1,
+        "default": "ask",
+        "rules": [{"id": "all", "actions": ["*"], "resources": ["*"], "effect": "allow"}],
+    }
+    workspace.policy_path.write_text(json.dumps(body), encoding="utf-8")
+    permissive = PolicyEngine(load_policy(workspace.policy_path), root=workspace.root)
+    assert permissive.decide("shell", "git branch -D main").effect == "hard_deny"
+    assert permissive.decide("shell", "git diff --output=x").effect == "deny"
+
+
+def test_run_shell_does_not_overwrite_a_file_through_git_diff(workspace: Workspace) -> None:
+    import subprocess
+
+    root = workspace.root
+    (root / "README.md").write_text("ORIGINAL\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    registry, _ = make_registry(workspace)
+    result = call(registry, "run_shell", argv=["git", "diff", "--output=README.md"])
+    assert result.blocked
+    assert (root / "README.md").read_text(encoding="utf-8") == "ORIGINAL\n"
+
+
+def test_run_shell_authorizes_by_argv_not_by_joined_text(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single argument that contains spaces must not hide a flag from the classifier."""
+
+    registry, _ = make_registry(workspace)
+    result = call(registry, "run_shell", argv=["git", "diff", "--output=README.md x"])
+    assert result.blocked

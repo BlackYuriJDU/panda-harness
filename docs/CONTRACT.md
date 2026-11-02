@@ -320,6 +320,20 @@ and no global allow. In `panda run` without `--auto`, an `ask` is denied and the
 tool returns a blocked result, not an exception loop. Every request and decision
 is written to the ledger as `approval.request` / `approval.decision`.
 
+**Shell commands are classified by argv tokens, not by text.** After the rules,
+the engine reads the command's tokens and can only escalate the result
+(`allow` < `ask` < `deny` < `hard_deny`). Options are normalised first (`git -C`,
+`-c`, `--git-dir`, `--no-pager`, `env`/`sudo` wrappers, `./git`, `GIT.EXE`,
+abbreviated long options). `hard_deny`: `git push` with `--force`/`-f`/`--mirror`/
+`--delete`/`+refspec`/`:refspec`, `git reset --hard`, `git clean -f`,
+`git branch -D/-d/--delete`, `rm` with a recursive flag in any form, `find -delete`.
+`deny`: `--output`, `--no-index`, `--ext-diff`. `allow`: `git status/diff/log/show`
+and `git branch --list` with a closed set of flags and no `rev:path`, absolute or
+`..` token. A path given to a read-only git command must pass the `read` rules, so
+`git diff -- .env` is refused. Anything else on `git` needs an approval, and a plain
+`git push origin fix-foo` is `ask`, no longer `hard_deny`. `node
+corpus/validation/validate.mjs` is no longer pre-approved: use the `validate` tool.
+
 **Built-in floor.** `.panda/policy.json` is workspace data and may be hostile, so
 the engine always adds a floor of `hard_deny` rules after loading it: every
 `hard_deny` of the built-in policy (secret and credential reads, force-push and

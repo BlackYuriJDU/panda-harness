@@ -240,8 +240,11 @@ async def _authorize(
     resource: str,
     preview: str = "",
     preview_kind: str = "none",
+    argv: Sequence[str] | None = None,
 ) -> tuple[Decision | None, ToolResult | None]:
-    decision = ctx.policy.decide(action, resource)
+    decision = (
+        ctx.policy.decide_shell(argv) if argv is not None else ctx.policy.decide(action, resource)
+    )
     if decision.effect == "allow":
         return decision, None
     if decision.effect in {"deny", "hard_deny"}:
@@ -801,6 +804,7 @@ class ToolRegistry:
             resource=command_text,
             preview=command_text,
             preview_kind="command",
+            argv=argv,
         )
         if blocked:
             return blocked
