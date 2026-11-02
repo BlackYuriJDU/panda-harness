@@ -30,6 +30,8 @@ ANCHOR_SCHEMA = "panda.session.anchor.v1"
 SESSION_ID_RE = re.compile(r"^s_[A-Za-z0-9_]{6,80}$")
 EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_.]{2,63}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+TAIL_WINDOW = 128 * 1024
+MAX_TAIL_BYTES = 256 * 1024 * 1024
 
 
 def utc_now() -> str:
@@ -162,6 +164,7 @@ class SessionLog:
             raise ConfigError(f"invalid session id: {self.session_id}")
         self.anchor_path = self.path.with_suffix(".anchor.json")
         self.lock_path = self.path.with_suffix(".lock")
+        self._tail_type: str | None = None
         self._tail: tuple[int, str] | None = self._read_tail()
         self._size = self.path.stat().st_size if self.path.exists() else 0
 
@@ -229,14 +232,25 @@ class SessionLog:
 
     # ---- reading ----
     def _read_tail(self) -> tuple[int, str] | None:
+        self._tail_type = None
         if not self.path.is_file() or self.path.stat().st_size == 0:
             return None
         with open(self.path, "rb") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
-            window = min(size, 128 * 1024)
-            handle.seek(size - window)
-            chunk = handle.read()
+            window = TAIL_WINDOW
+            while True:
+                window = min(size, window)
+                handle.seek(size - window)
+                chunk = handle.read()
+                # The last event is complete once a newline precedes it (SES-001).
+                if window == size or b"\n" in chunk.rstrip():
+                    break
+                if window >= MAX_TAIL_BYTES:
+                    raise SessionIntegrityError(
+                        f"last session event is larger than {MAX_TAIL_BYTES} bytes: {self.path}"
+                    )
+                window *= 4
         lines = [line for line in chunk.splitlines() if line.strip()]
         if not lines:
             return None
@@ -244,6 +258,7 @@ class SessionLog:
             record = json.loads(lines[-1].decode("utf-8"))
             seq = int(record["seq"])
             digest = str(record["hash"])
+            self._tail_type = str(record["type"])
         except (UnicodeDecodeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise SessionIntegrityError(
                 f"cannot read session tail: {self.path}",
@@ -291,61 +306,141 @@ class SessionLog:
             payload = redact(payload)
 
         with file_lock(self.lock_path):
+            return self._append_locked(event_type, payload)
+
+    def _check_anchor(self) -> None:
+        """Refuse to extend a log whose tail is not exactly what the anchor names.
+
+        Accepting an anchor that is behind the tail would let the next legitimate
+        append legitimize an event forged into the file (SES-003); a crash between
+        fsync and the anchor needs the explicit `recover()` instead (SES-002).
+        """
+
+        anchor = self._load_anchor()
+        if not anchor:
+            return
+        if self._tail is None:
+            raise SessionIntegrityError(
+                f"session anchor exists but the log is empty: {self.path}",
+                hint="the session log was truncated; run `panda session verify`",
+            )
+        anchor_seq = int(anchor.get("seq", -1))
+        if anchor_seq > self._tail[0]:
+            raise SessionIntegrityError(
+                f"session log is shorter than its anchor: {self.path}",
+                hint="the session log was truncated; restore it from a backup",
+            )
+        if anchor_seq < self._tail[0]:
+            raise SessionIntegrityError(
+                f"session log has events beyond its anchor: {self.path}",
+                hint="after a crash run `panda session recover`; otherwise the log was modified",
+            )
+        if anchor.get("hash") != self._tail[1]:
+            raise SessionIntegrityError(
+                f"session anchor does not match tail: {self.path}",
+                hint="the session log was modified; run `panda session verify`",
+            )
+
+    def _append_locked(
+        self, event_type: str, payload: dict[str, Any], *, check_anchor: bool = True
+    ) -> SessionEvent:
+        self._refresh_tail()
+        if check_anchor:
+            self._check_anchor()
+        seq = (self._tail[0] + 1) if self._tail else 1
+        prev = self._tail[1] if self._tail else None
+        ts = utc_now()
+        record: dict[str, Any] = {
+            "schema": SESSION_SCHEMA,
+            "seq": seq,
+            "ts": ts,
+            "session_id": self.session_id,
+            "type": event_type,
+            "data": payload,
+            "prev": prev,
+        }
+        digest = event_hash(record)
+        record["hash"] = digest
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+        ensure_dir(self.path.parent)
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+        fd = os.open(self.path, flags, 0o600)
+        try:
+            view = memoryview(line.encode("utf-8"))
+            while view:  # os.write may be short (SES-002)
+                view = view[os.write(fd, view) :]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._tail = (seq, digest)
+        self._tail_type = event_type
+        self._size = self.path.stat().st_size
+        self._write_anchor(seq, digest)
+        return SessionEvent(
+            schema=SESSION_SCHEMA,
+            seq=seq,
+            ts=ts,
+            session_id=self.session_id,
+            type=event_type,
+            data=payload,
+            prev=prev,
+            hash=digest,
+        )
+
+    def recover(self) -> bool:
+        """Adopt exactly one event that was written but never anchored.
+
+        Only the crash window is recoverable: the chain must be intact, the anchor
+        must name the event just before the tail, and nothing else may be wrong.
+        The adopted event stays in the log and is named in a `session.recovered`
+        event, so recovery is visible, never silent. Returns False if there was
+        nothing to recover.
+        """
+
+        with file_lock(self.lock_path):
             self._refresh_tail()
             anchor = self._load_anchor()
-            if anchor:
-                if self._tail is None:
-                    raise SessionIntegrityError(
-                        f"session anchor exists but the log is empty: {self.path}",
-                        hint="the session log was truncated; run `panda session verify`",
-                    )
-                if int(anchor.get("seq", -1)) > self._tail[0]:
-                    raise SessionIntegrityError(
-                        f"session log is shorter than its anchor: {self.path}",
-                        hint="the session log was truncated; restore it from a backup",
-                    )
-                if anchor.get("seq") == self._tail[0] and anchor.get("hash") != self._tail[1]:
-                    raise SessionIntegrityError(
-                        f"session anchor does not match tail: {self.path}",
-                        hint="the session log was modified; run `panda session verify`",
-                    )
-            seq = (self._tail[0] + 1) if self._tail else 1
-            prev = self._tail[1] if self._tail else None
-            ts = utc_now()
-            record: dict[str, Any] = {
-                "schema": SESSION_SCHEMA,
-                "seq": seq,
-                "ts": ts,
-                "session_id": self.session_id,
-                "type": event_type,
-                "data": payload,
-                "prev": prev,
-            }
-            digest = event_hash(record)
-            record["hash"] = digest
-            line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
-
-            ensure_dir(self.path.parent)
-            flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-            fd = os.open(self.path, flags, 0o600)
-            try:
-                os.write(fd, line.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            self._tail = (seq, digest)
-            self._size = self.path.stat().st_size
-            self._write_anchor(seq, digest)
-            return SessionEvent(
-                schema=SESSION_SCHEMA,
-                seq=seq,
-                ts=ts,
-                session_id=self.session_id,
-                type=event_type,
-                data=payload,
-                prev=prev,
-                hash=digest,
+            if anchor is None or self._tail is None:
+                return False
+            anchor_seq, anchor_hash = int(anchor.get("seq", -1)), str(anchor.get("hash"))
+            if (anchor_seq, anchor_hash) == self._tail:
+                if self.verify().ok:
+                    return False
+                raise SessionIntegrityError(
+                    f"cannot recover {self.path}: the hash chain is not intact",
+                    hint="run `panda session verify`; restore a backup",
+                )
+            if anchor_seq != self._tail[0] - 1:
+                raise SessionIntegrityError(
+                    f"cannot recover {self.path}: the log is {self._tail[0] - anchor_seq} "
+                    "events away from its anchor",
+                    hint="only a single unanchored event is recoverable; restore a backup",
+                )
+            report = self.verify()
+            if {issue.code for issue in report.errors} - {"anchor_mismatch"}:
+                raise SessionIntegrityError(
+                    f"cannot recover {self.path}: the hash chain is not intact",
+                    hint="run `panda session verify`; restore a backup",
+                )
+            events = list(self.events())
+            if events[-2].hash != anchor_hash:
+                raise SessionIntegrityError(
+                    f"cannot recover {self.path}: the anchor does not name the previous event"
+                )
+            adopted = events[-1]
+            self._append_locked(
+                "session.recovered",
+                {
+                    "adopted_seq": adopted.seq,
+                    "adopted_hash": adopted.hash,
+                    "adopted_type": adopted.type,
+                    "adopted_ts": adopted.ts,
+                    "anchor_seq": anchor_seq,
+                },
+                check_anchor=False,
             )
+            return True
 
     def close(self, status: str = "completed", data: dict[str, Any] | None = None) -> SessionEvent:
         if self.is_closed():
@@ -501,13 +596,12 @@ class SessionLog:
         )
 
     def is_closed(self) -> bool:
+        # O(1): the tail is tracked in memory and refreshed on size change (PERF-001).
         try:
-            last_type = None
-            for event in self.events():
-                last_type = event.type
-            return last_type == "session.end"
-        except (OSError, SessionIntegrityError, json.JSONDecodeError):
+            self._refresh_tail()
+        except (OSError, SessionIntegrityError):
             return False
+        return self._tail_type == "session.end"
 
     def summary(self) -> SessionSummary:
         label = ""

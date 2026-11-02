@@ -17,6 +17,7 @@ import typer
 from panda_cli import render
 from panda_cli.terminal import reset_terminal as _reset_terminal
 from panda_cli.terminal import snapshot_console_mode
+from panda_core.agent import _shrink
 from panda_core.credentials import (
     clear_all,
     clear_api_key,
@@ -484,7 +485,7 @@ def run_command(
 
     if dry_run:
         runtime = _runtime(workspace, log, selected_model, max_steps, private, auto)
-        log.append("run.plan", {**run_data, "tools": runtime.tools.names()})
+        log.append("run.plan", _shrink({**run_data, "tools": runtime.tools.names()}))
         _close_quietly(log, "planned")
         typer.echo(f"model: {selected_model}")
         provider = workspace.config.provider
@@ -948,6 +949,29 @@ def session_verify(
     else:
         typer.echo("no sessions found")
     raise typer.Exit(0 if all(item.ok for item in verifications) else 1)
+
+
+@session_app.command("recover")
+@handle
+def session_recover(
+    session_id: str = typer.Argument(..., help="Session id or 'latest'."),
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Adopt a single event left unanchored by a crash and record `session.recovered`."""
+
+    workspace = _load_workspace(root)
+    log = SessionLog.resolve(
+        workspace.sessions_dir, session_id, redact_enabled=workspace.config.logging.redact
+    )
+    recovered = log.recover()
+    payload = {"ok": True, "session_id": log.session_id, "recovered": recovered}
+    if json_output:
+        render.print_json(payload)
+    elif recovered:
+        typer.echo(f"recovered {log.session_id}: one unanchored event adopted and recorded")
+    else:
+        typer.echo(f"nothing to recover in {log.session_id}")
 
 
 @session_app.command("close")

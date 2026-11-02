@@ -160,6 +160,7 @@ the environment variable name is.
 | `panda session show <id>` | Show events and verification state. |
 | `panda session verify [id]` | Verify one session or all sessions. |
 | `panda session close <id>` | Append a terminal `session.end` event. |
+| `panda session recover <id>` | Adopt one unanchored event after a crash and record `session.recovered`. |
 | `panda policy check <action> <resource>` | Evaluate one action. |
 | `panda policy explain <action> <resource>` | Show the matching rules. |
 | `panda policy show` | Print the effective policy. |
@@ -366,6 +367,22 @@ model and turn count. Redaction runs before hashing and persistence. `--private`
 keeps task text out of every record.
 
 `panda session verify` exits `1` if any session fails verification.
+
+**Appending is strict.** A new event is written only when the anchor names exactly
+the current tail. An anchor behind the tail (a crash between the write and the
+anchor, or an event forged into the file) stops the writer with a session-integrity
+error (exit `4`) instead of being absorbed by the next append. `panda session
+recover <id>` is the explicit repair: it adopts **one** unanchored event after
+checking the whole hash chain, and records a `session.recovered` event
+(`adopted_seq`, `adopted_hash`, `adopted_type`, `adopted_ts`, `anchor_seq`) so the
+adopted event stays visible. It does nothing on a healthy session (exit `0`) and
+refuses with exit `4` when more than one event is unanchored, the log is shorter
+than the anchor, or the chain is not intact.
+
+**Limit of the guarantee.** The chain and the anchor detect edits that are not
+coordinated. Someone who can write both the log and the anchor can rebuild the whole
+chain and `verify` will pass. Closing that needs a signature or MAC whose key lives
+outside the workspace; it is on the roadmap, not promised here.
 
 ## 10. MCP export (optional)
 

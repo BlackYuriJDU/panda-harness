@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Ledger (SES-001, SES-002, SES-003, PERF-001): an event forged into the log with a
+  valid chain was legitimized by the next legitimate append, and a crash between the
+  write and the anchor was absorbed silently. `append` now requires the anchor to
+  equal the tail and raises a session-integrity error otherwise; the new
+  `panda session recover <id>` adopts a single unanchored event and records
+  `session.recovered`. `os.write` is looped until the line is complete, the tail is
+  read backwards so a last event larger than 128 KiB no longer breaks `open`,
+  `run.plan` is shrunk like every other event, and `is_closed()` is O(1).
+  Known limit, now documented: a writer of both log and anchor can still rebuild
+  the chain.
 - Validator routes (SEC-002) and MCP policy (MCP-001, MCP-002): the `validate` tool
   and the MCP `validate` and `study_show` ran with no policy check, so a rewritten
   validator was executable without approval through three routes. `validate` is now
@@ -74,6 +84,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **New command:** `panda session recover <id>`. After a crash the writer stops
+  until it is run; this is deliberate.
 - **Breaking for custom endpoints:** a workspace file with a non-official
   `provider.base_url` or `provider.api_key_env` is now rejected. `panda init
   --force` resets it to the defaults.
