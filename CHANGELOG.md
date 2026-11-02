@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Search tools (SEC-003): `grep` and `list_files` authorized only the workspace
+  root, so they returned the contents and names of `.env`, `*.pem` and other files
+  that `read_file` refuses. Each hit is now checked with the same `read` rule, under
+  the file's own name and its symlink target; refused files are omitted and counted
+  in `omitted_by_policy`. A file that would need approval is omitted, never asked
+  about per file.
 - Credential files (SEC-005): `.git/config`, `.netrc`, `.npmrc`, `.pypirc`,
   `.git-credentials`, `credentials.json`, `.aws/credentials`, `.docker/config.json`,
   `*.p12`, `*.pfx`, `*.kdbx`, `*.keystore`, `*.jks` and `secrets.*` are `hard_deny`

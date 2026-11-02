@@ -373,6 +373,22 @@ def _iter_files(root: Path, pattern: str, limit: int) -> list[Path]:
     return found
 
 
+def _readable_by_policy(ctx: ToolContext, root: Path, candidate: Path) -> bool:
+    """True when `read` is plainly allowed for this file, under both its names.
+
+    Search tools authorize the workspace once, so each hit is checked here with
+    the same rule `read_file` uses. A symlink is judged by its target as well as
+    its own name. `ask` counts as not readable: a search never prompts per file.
+    """
+
+    names = {candidate.relative_to(root).as_posix()}
+    try:
+        names.add(candidate.resolve().relative_to(root.resolve()).as_posix())
+    except (OSError, ValueError):
+        return False
+    return all(ctx.policy.decide("read", name).effect == "allow" for name in names)
+
+
 class ToolRegistry:
     def __init__(self, ctx: ToolContext):
         self.ctx = ctx
@@ -513,14 +529,20 @@ class ToolRegistry:
             return blocked
         found = _iter_files(self.ctx.workspace.root, pattern, limit)
         entries: list[str] = []
+        omitted = 0
+        root = self.ctx.workspace.root
         for candidate in found:
-            relative = candidate.relative_to(self.ctx.workspace.root.resolve()).as_posix()
+            if not _readable_by_policy(self.ctx, root, candidate):
+                omitted += 1
+                continue
+            relative = candidate.relative_to(root.resolve()).as_posix()
             entries.append(relative + ("/" if candidate.is_dir() else ""))
         return _ok(
             "list_files",
             {
                 "pattern": pattern,
                 "count": len(entries),
+                "omitted_by_policy": omitted,
                 "entries": entries,
                 "rule": decision.rule_id if decision else None,
             },
@@ -544,10 +566,14 @@ class ToolRegistry:
             return blocked
         matches: list[str] = []
         files_scanned = 0
+        omitted = 0
         truncated = False
         root = self.ctx.workspace.root.resolve()
         for candidate in _iter_files(self.ctx.workspace.root, glob, 5_000):
             if not candidate.is_file() or candidate.stat().st_size > MAX_READ_BYTES:
+                continue
+            if not _readable_by_policy(self.ctx, root, candidate):
+                omitted += 1
                 continue
             files_scanned += 1
             try:
@@ -572,6 +598,7 @@ class ToolRegistry:
                 "pattern": pattern,
                 "glob": glob,
                 "files_scanned": files_scanned,
+                "omitted_by_policy": omitted,
                 "count": len(matches),
                 "matches": matches,
                 "truncated": truncated,
