@@ -202,3 +202,86 @@ def test_grep_judges_a_symlink_by_its_target(workspace: Workspace) -> None:
         result = call(registry, tool, **args)
         assert "innocent.md" not in result.content
         assert "TOKEN=" not in result.content
+
+
+# --------------------------------------------------------------------------- SEC-010 / SEC-011
+POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX symlinks")
+MARK = "OUTSIDE_SYNTH_SECRET_STUDY_55e2"
+
+
+def _outside(tmp_path) -> Path:  # noqa: F821
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text(f"---\nstudy_id: gse160208\n---\n{MARK}\n", encoding="utf-8")
+    return outside
+
+
+def _repoint_index(workspace: Workspace, target: str) -> None:
+    index = workspace.root / "corpus" / "studies" / "INDEX.md"
+    text = index.read_text(encoding="utf-8").replace("(gse160208.md)", f"({target})")
+    index.write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("variant", ["absolute", "dotdot", "dotdot-deep"])
+def test_study_show_refuses_an_index_link_that_leaves_the_studies_dir(
+    workspace: Workspace, tmp_path, variant: str
+) -> None:
+    outside = _outside(tmp_path)
+    target = {
+        "absolute": str(outside / "secret.md"),
+        "dotdot": "../../../outside/secret.md",
+        "dotdot-deep": "sub/../../../../outside/secret.md",
+    }[variant]
+    _repoint_index(workspace, target)
+    registry, _ = make_registry(workspace)
+    result = call(registry, "study_show", study_id="gse160208")
+    assert not result.ok
+    assert MARK not in result.content
+
+
+@POSIX_ONLY
+def test_study_show_refuses_a_symlinked_card(workspace: Workspace, tmp_path) -> None:
+    outside = _outside(tmp_path)
+    card = workspace.root / "corpus" / "studies" / "gse160208.md"
+    card.unlink()
+    card.symlink_to(outside / "secret.md")
+    registry, _ = make_registry(workspace)
+    result = call(registry, "study_show", study_id="gse160208")
+    assert not result.ok
+    assert MARK not in result.content
+
+
+def test_study_show_authorizes_the_card_path(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[str, str]] = []
+    real = PolicyEngine.decide
+
+    def spy(self, action, resource):
+        seen.append((action, resource))
+        return real(self, action, resource)
+
+    monkeypatch.setattr(PolicyEngine, "decide", spy)
+    registry, _ = make_registry(workspace)
+    call(registry, "study_show", study_id="gse160208")
+    assert ("read", "corpus/studies/gse160208.md") in seen
+
+
+def test_neg_study_show_still_reads_a_regular_card(workspace: Workspace) -> None:
+    registry, _ = make_registry(workspace)
+    result = call(registry, "study_show", study_id="gse160208")
+    assert result.ok and "GSE160208" in result.content
+
+
+@POSIX_ONLY
+def test_claim_tools_ignore_a_symlink_to_a_file_outside(workspace: Workspace, tmp_path) -> None:
+    outside = _outside(tmp_path)
+    claims = workspace.root / "corpus" / "claims"
+    claims.mkdir(exist_ok=True)
+    (claims / "real.md").write_text("---\nclaim_id: real\n---\nok\n", encoding="utf-8")
+    (claims / "leak.md").symlink_to(outside / "secret.md")
+    registry, _ = make_registry(workspace)
+    for tool, args in (("claim_list", {}), ("claim_show", {"claim_id": "gse160208"})):
+        assert MARK not in call(registry, tool, **args).content
+    listing = call(registry, "claim_list")
+    assert listing.ok and listing.data["total"] == 1

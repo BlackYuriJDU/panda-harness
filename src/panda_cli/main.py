@@ -1101,7 +1101,7 @@ def study_show(
 
     workspace = _load_workspace(root)
     study = find_study(workspace.root, study_id)
-    card = load_study_card(study)
+    card = load_study_card(study, workspace.root)
     if json_output:
         payload = study.to_dict()
         payload["frontmatter"] = card["frontmatter"]

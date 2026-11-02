@@ -8,6 +8,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Study cards and claims (SEC-010, SEC-011): `study_show` followed whatever link
+  `corpus/studies/INDEX.md` held, which the agent can rewrite, and `claim_*`
+  followed symlinks out of the workspace. An INDEX link that is absolute or
+  contains `..` is now a configuration error, the card path goes through the
+  `read` policy, and symlinked cards and claims are refused or skipped.
 - Search tools (SEC-003): `grep` and `list_files` authorized only the workspace
   root, so they returned the contents and names of `.env`, `*.pem` and other files
   that `read_file` refuses. Each hit is now checked with the same `read` rule, under

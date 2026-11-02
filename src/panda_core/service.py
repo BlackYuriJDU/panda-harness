@@ -183,7 +183,7 @@ class PandaService:
 
     def study_show(self, study_id: str) -> dict[str, Any]:
         study = find_study(self.workspace.root, study_id)
-        card = load_study_card(study)
+        card = load_study_card(study, self.workspace.root)
         payload = study.to_dict()
         payload["frontmatter"] = card["frontmatter"]
         payload["body"] = card["body"][:8000]

@@ -19,11 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from panda_core.atomic import atomic_write_text
-from panda_core.errors import PandaError
+from panda_core.errors import ConfigError, PandaError
 from panda_core.policy import Decision, PolicyEngine
 from panda_core.process import run_command
 from panda_core.provider import status_snapshot
 from panda_core.registry import find_study, load_registry, load_study_card, parse_frontmatter
+from panda_core.safe_read import ensure_plain_path
 from panda_core.session import SessionLog
 from panda_core.validator import Validator
 from panda_core.workspace import Workspace
@@ -617,8 +618,19 @@ class ToolRegistry:
 
     async def _study_show(self, args: dict[str, Any]) -> ToolResult:
         study_id = _string_arg(args, "study_id")
-        study = find_study(self.ctx.workspace.root, study_id)
-        card = load_study_card(study)
+        root = self.ctx.workspace.root
+        study = find_study(root, study_id)
+        if study.path:
+            try:
+                relative = Path(study.path).relative_to(root).as_posix()
+            except ValueError:
+                raise ToolInputError("study card is outside the workspace") from None
+            _, blocked = await _authorize(
+                self.ctx, tool="study_show", action="read", resource=relative
+            )
+            if blocked:
+                return blocked
+        card = load_study_card(study, root)
         payload = study.to_dict()
         payload["frontmatter"] = card["frontmatter"]
         payload["body"] = _cap(card["body"], 8_000)
@@ -870,7 +882,14 @@ class ToolRegistry:
         if not directory.is_dir():
             raise ToolInputError("claims directory not found: corpus/claims")
         records: list[dict[str, Any]] = []
+        root = self.ctx.workspace.root
         for path in sorted(directory.glob("*.md")):
+            try:
+                ensure_plain_path(root, path)
+            except ConfigError:
+                continue  # a link (SEC-011)
+            if not _readable_by_policy(self.ctx, root, path):
+                continue
             text = path.read_text(encoding="utf-8", errors="replace")
             try:
                 frontmatter, body = parse_frontmatter(text)
