@@ -215,7 +215,8 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   (`[contexto resumido: N mensagens]`, with the tools used) and a `context.trim`
   event records how many messages were removed and the SHA-256 of each.
 - An unexpected exception in a tool becomes a failed tool result; any other
-  unexpected exception still writes a `turn.end` with status `error`. Tool calls
+  unexpected exception, and any typed error such as a provider failure, still writes a
+  `turn.end` with status `error`. Tool calls
   left without a result by a cancellation or an error are answered with a failed
   result, so the conversation stays valid.
 

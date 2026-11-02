@@ -541,9 +541,8 @@ class Agent:
             raise
         except PandaError as exc:
             self._close_dangling_tool_calls("error")
-            # Typed errors (provider, policy) keep their documented shape: an
-            # `error` event and no `turn.end`.
             self._log("error", {"code": exc.code, "message": exc.message}, best_effort=True)
+            self._end_turn_quietly(turn, "error", steps, tool_calls)
             self._emit("error", code=exc.code, message=exc.message)
             raise
         except Exception as exc:

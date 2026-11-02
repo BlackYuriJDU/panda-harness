@@ -260,7 +260,9 @@ def test_provider_error_is_logged_and_reraised(workspace) -> None:
         asyncio.run(agent.run_turn("fail"))
     types = event_types(session)
     assert "error" in types
-    assert "turn.end" not in types
+    # Every turn is closed in the ledger, also when the provider fails (AGT-001).
+    assert types[-1] == "turn.end"
+    assert [e for e in session.events() if e.type == "turn.end"][-1].data["status"] == "error"
 def test_cancellation_is_logged_and_bounded(workspace) -> None:
     class HangingProvider:
         async def stream(self, messages, tools=None, model=None, session_id=None):
