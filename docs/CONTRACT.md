@@ -317,6 +317,14 @@ workspace, secret paths, and traversal are refused by policy or by path
 resolution, not by prompt text. `write_file`, `edit_file`, and `run_shell` are
 the non-read-only tools and require a policy `allow` (or an approved `ask`).
 
+**Process limits.** A command runs in its own process group with stdin closed. The
+timeout, a cancellation of the tool call (Ctrl+C, `--timeout`) and output beyond the
+per-stream cap (4 MB) each stop the whole group, so a child started by the command
+cannot outlive the call; children left behind by a command that exited are stopped
+too. A command stopped for exceeding the cap returns `output_truncated: true`. On
+Windows the process tree is stopped with `taskkill /T`; Job Objects are not used and
+that path is not verified on a Windows host.
+
 ## 8. Policy and approvals
 
 Policy is a JSON rule set (`schema_version: 1`) with ordered rules. The **last

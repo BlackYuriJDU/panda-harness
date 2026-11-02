@@ -13,6 +13,7 @@ import difflib
 import json
 import os
 import re
+import threading
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -815,14 +816,20 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        result = await asyncio.to_thread(
-            run_command, argv, cwd=cwd, timeout=timeout, env=_scrubbed_env()
-        )
+        cancel = threading.Event()
+        try:
+            result = await asyncio.to_thread(
+                run_command, argv, cwd=cwd, timeout=timeout, env=_scrubbed_env(), cancel=cancel
+            )
+        except asyncio.CancelledError:
+            cancel.set()  # the thread kills the process group; do not wait for it
+            raise
         payload = {
             "argv": argv,
             "cwd": cwd_relative,
             "returncode": result.returncode,
             "timed_out": result.timed_out,
+            "output_truncated": result.output_truncated,
             "duration_ms": result.duration_ms,
             "stdout": _cap(result.stdout, self.ctx.output_limit // 2),
             "stderr": _cap(result.stderr, self.ctx.output_limit // 2),

@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
+import sys
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 _SHIM_SUFFIXES = {".cmd", ".bat", ".ps1"}
@@ -23,6 +29,8 @@ class CommandResult:
     stderr: str
     duration_ms: int
     timed_out: bool = False
+    output_truncated: bool = False
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
@@ -106,65 +114,153 @@ def resolve_executable(value: str | Sequence[str]) -> str | None:
     return prefix[0] if prefix else None
 
 
+DEFAULT_MAX_OUTPUT_BYTES = 4_000_000
+_POLL_SECONDS = 0.05
+
+
+def _pump(stream: Any, sink: bytearray, limit: int, over: threading.Event) -> None:
+    """Copy a pipe into `sink`, keeping at most `limit` bytes (SEC-008)."""
+
+    try:
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                return
+            room = limit - len(sink)
+            if room > 0:
+                sink += chunk[:room]
+            if len(chunk) > room:
+                over.set()
+    except (OSError, ValueError):
+        return
+
+
+def _kill_tree(process: subprocess.Popen[bytes]) -> None:
+    """Kill the command and everything it started.
+
+    POSIX: the command leads its own session, so the whole group is signalled.
+    Windows: `taskkill /T` walks the tree; Job Objects are not used and this path
+    is not verified on a Windows host (WIN-001).
+    """
+
+    if sys.platform == "win32":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(  # noqa: S603
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],  # noqa: S607
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        with contextlib.suppress(OSError):
+            process.kill()
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        process.kill()
+
+
 def run_command(
     command: Sequence[str],
     *,
     cwd: Path | None = None,
     timeout: float | None = None,
     env: dict[str, str] | None = None,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    cancel: threading.Event | None = None,
+    input_text: str | None = None,
 ) -> CommandResult:
-    import time
+    """Run a command with a hard timeout, an output cap and cancellation.
+
+    The command runs in its own process group. A timeout, a set `cancel` event, or
+    output beyond `max_output_bytes` per stream stops the whole group, so a
+    grandchild cannot outlive the call. Children left behind by a command that
+    exited normally are stopped too.
+    """
 
     started = time.monotonic()
+    group: dict[str, Any] = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}  # type: ignore[attr-defined,unused-ignore]
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(  # noqa: S603
             list(command),
             cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
-            check=False,
-        )
-        elapsed = int((time.monotonic() - started) * 1000)
-        return CommandResult(
-            command=list(command),
-            returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            duration_ms=elapsed,
-        )
-    except subprocess.TimeoutExpired as exc:
-        elapsed = int((time.monotonic() - started) * 1000)
-        stdout = (
-            exc.stdout.decode("utf-8", "replace")
-            if isinstance(exc.stdout, bytes)
-            else (exc.stdout or "")
-        )
-        stderr = (
-            exc.stderr.decode("utf-8", "replace")
-            if isinstance(exc.stderr, bytes)
-            else (exc.stderr or "")
-        )
-        return CommandResult(
-            command=list(command),
-            returncode=124,
-            stdout=stdout,
-            stderr=stderr,
-            duration_ms=elapsed,
-            timed_out=True,
+            **group,
         )
     except OSError as exc:
-        elapsed = int((time.monotonic() - started) * 1000)
         return CommandResult(
             command=list(command),
             returncode=127,
             stdout="",
             stderr=str(exc),
-            duration_ms=elapsed,
+            duration_ms=int((time.monotonic() - started) * 1000),
         )
+
+    over = threading.Event()
+    out, err = bytearray(), bytearray()
+    threads = [
+        threading.Thread(target=_pump, args=(process.stdout, out, max_output_bytes, over)),
+        threading.Thread(target=_pump, args=(process.stderr, err, max_output_bytes, over)),
+    ]
+    if input_text is not None:
+        threads.append(threading.Thread(target=_feed, args=(process, input_text)))
+    for thread in threads:
+        thread.daemon = True
+        thread.start()
+
+    deadline = started + timeout if timeout else None
+    timed_out = cancelled = False
+    while True:
+        try:
+            process.wait(timeout=_POLL_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if cancel is not None and cancel.is_set():
+            cancelled = True
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        if over.is_set():
+            break
+    _kill_tree(process)  # also reaps children left behind by a command that exited
+    process.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
+
+    def text(buffer: bytearray) -> str:
+        return bytes(buffer).decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+    returncode = 124 if timed_out else 130 if cancelled else process.returncode
+    return CommandResult(
+        command=list(command),
+        returncode=returncode,
+        stdout=text(out),
+        stderr=text(err),
+        duration_ms=int((time.monotonic() - started) * 1000),
+        timed_out=timed_out,
+        output_truncated=over.is_set(),
+        cancelled=cancelled,
+    )
+
+
+def _feed(process: subprocess.Popen[bytes], text: str) -> None:
+    with contextlib.suppress(OSError, ValueError):
+        if process.stdin is not None:
+            process.stdin.write(text.encode("utf-8"))
+            process.stdin.close()
 
 
 def parse_version(text: str) -> tuple[int, int, int] | None:

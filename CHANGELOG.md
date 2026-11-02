@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Process control (SEC-008): a timeout killed only the direct child, Ctrl+C cancelled
+  the turn but the command kept running, `asyncio.wait_for` could not bound a running
+  tool, and output was captured without a limit. `run_command` now runs the command
+  in its own process group, kills the group on timeout, cancellation or an output cap
+  (4 MB per stream, `output_truncated`), closes stdin, and `run_shell` propagates the
+  cancellation to the process.
 - Fail-closed ledger (PROV-001): `Agent._log` swallowed ledger failures, so with an
   invalid anchor the turn ended `completed`, `write_file` wrote and nothing was
   recorded. A ledger failure now raises a session-integrity error (exit `4`) before
