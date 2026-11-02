@@ -15,11 +15,21 @@ All notable changes to this project are documented here. The format follows
   closes the key-exfiltration route for `panda run`, `panda chat` and
   `panda models` when opening a corpus received from a third party.
 
+- Symlinks in workspace files (TRUST-005): `.panda/instructions.md`,
+  `.panda/config.json`, `.panda/policy.json` and the validator script are read
+  through a single helper (`panda_core.safe_read`) that refuses a symbolic link
+  anywhere below the root and opens with `O_NOFOLLOW`. A link such as
+  `.panda/instructions.md -> ~/.ssh/id_ed25519` no longer puts a local file in
+  the system prompt, and a linked validator is not executed. Instructions are now
+  redacted before they reach the prompt.
+
 ### Changed
 
 - **Breaking for custom endpoints:** a workspace file with a non-official
   `provider.base_url` or `provider.api_key_env` is now rejected. `panda init
   --force` resets it to the defaults.
+- **Breaking for symlinked workspace files:** copy the target into the
+  workspace instead of linking it.
 
 ## [0.2.0a4] — 2026-10-30
 

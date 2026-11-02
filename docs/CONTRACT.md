@@ -98,6 +98,14 @@ enabled legacy export both produce a warning line.
 
 `.panda/config.json` is validated with Pydantic (`extra="forbid"`). Defaults:
 
+**Symbolic links.** The files the workspace names -- `.panda/config.json`,
+`.panda/policy.json`, the instructions file, and the validator script -- must be
+regular files reached through regular directories. A symbolic link anywhere
+below the workspace root is refused with exit `2` (`config_error`); nothing is
+read or executed through it. Instructions are redacted before they enter the
+system prompt. On Windows the `lstat` walk applies but `O_NOFOLLOW` does not
+exist; junction handling there is not verified.
+
 **Workspace trust boundary.** `.panda/config.json` is meant to be committed, so a
 corpus received from a third party controls it. When the file is loaded, only the
 official provider is accepted: `provider.base_url` must be `https` on

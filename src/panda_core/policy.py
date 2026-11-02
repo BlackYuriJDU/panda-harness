@@ -16,6 +16,7 @@ from typing import Any, Literal
 
 from panda_core.atomic import atomic_write_json
 from panda_core.errors import ConfigError, PolicyDenied
+from panda_core.safe_read import read_workspace_file
 
 Effect = Literal["allow", "deny", "ask", "hard_deny"]
 Risk = Literal["low", "medium", "high", "critical"]
@@ -280,7 +281,7 @@ def load_policy(path: Path) -> Policy:
             hint="run `panda init` to generate the default policy",
         )
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_workspace_file(path.parent.parent, path))
     except json.JSONDecodeError as exc:
         raise ConfigError(f"invalid policy JSON in {path}: {exc.msg}") from exc
     try:

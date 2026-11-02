@@ -190,6 +190,8 @@ failing check as a stop condition.
 | Restrictive user rules are re-appended last | A merge must never weaken an explicit restriction. |
 | Missing anchor is a warning; mismatch is an error | Legacy logs stay readable; tampering is not tolerated. |
 | `doctor` never creates directories | Diagnostics must not mutate the corpus. |
+| The workspace is untrusted input: provider endpoint and key variable are fixed at load | `.panda/config.json` travels with the corpus; it must not choose where the key goes. |
+| Files the workspace names are read without following symlinks | `safe_read` refuses a link anywhere below the root and opens with `O_NOFOLLOW`; applies to config, policy, instructions and the validator script. |
 | MCP is optional | The core remains installable where the SDK's native deps are unavailable. |
 
 ## Session ledger

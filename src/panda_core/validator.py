@@ -7,6 +7,7 @@ validator, parses its JSON contract, and maps the result to stable exit codes.
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from typing import Any
 
 from panda_core.errors import ConfigError, DependencyError, ExecutionTimeout, ProtocolError
 from panda_core.process import run_command, split_command
+from panda_core.safe_read import ensure_plain_path
 from panda_core.version import __version__
 
 CHECK_NAMES = (
@@ -156,6 +158,11 @@ class Validator:
         return self._node_version
 
     def run(self, *, release: bool = False) -> ValidationReport:
+        script = Path(os.path.abspath(self.script))
+        if script.is_relative_to(self.root):
+            # Executing a workspace-named script through a symlink would run
+            # code the corpus points at, wherever it lives (TRUST-005).
+            ensure_plain_path(self.root, script)
         if not self.script.is_file():
             raise ConfigError(
                 f"validator not found: {self.script}",

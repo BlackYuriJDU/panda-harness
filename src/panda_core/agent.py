@@ -28,6 +28,7 @@ from panda_core.provider import (
     Usage,
     UsageEvent,
 )
+from panda_core.safe_read import read_workspace_file
 from panda_core.session import SessionLog
 from panda_core.tools import ApprovalRequest, ToolRegistry, ToolResult
 from panda_core.workspace import Workspace
@@ -150,10 +151,12 @@ def _messages_chars(messages: list[dict[str, Any]]) -> int:
 
 def _read_instructions(workspace: Workspace, limit: int = DEFAULT_SYSTEM_CHARS) -> str:
     path: Path = workspace.instructions_path
-    if not path.is_file():
+    if not (path.is_file() or path.is_symlink()):
         return "(no workspace instructions file)"
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # A symlink raises ConfigError (TRUST-005); the content is redacted
+        # before it reaches the system prompt.
+        text = read_workspace_file(workspace.root, path, redact=True)
     except OSError:
         return "(workspace instructions unreadable)"
     return text[:limit] + ("\n[truncated]" if len(text) > limit else "")

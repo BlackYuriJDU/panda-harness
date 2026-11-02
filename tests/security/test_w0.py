@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -187,3 +188,177 @@ def test_init_does_not_carry_a_hostile_endpoint_forward(workspace: Workspace) ->
     initialize_workspace(workspace.root, force=True)
     config = load_config(workspace.config_path)
     assert config.provider.base_url == "https://opencode.ai/inference/go"
+
+
+# --------------------------------------------------------------------------- TRUST-005
+POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="needs POSIX symlinks")
+
+
+def _outside_secret(tmp_path: Path) -> Path:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text(f"{SYNTH_FILE_MARKER}\n", encoding="utf-8")
+    return secret
+
+
+def _link(link: Path, target: Path) -> None:
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+
+
+@POSIX_ONLY
+def test_instructions_symlink_to_outside_file_is_refused(
+    workspace: Workspace, tmp_path: Path
+) -> None:
+    from panda_core.agent import build_system_prompt
+
+    _link(workspace.instructions_path, _outside_secret(tmp_path))
+    with pytest.raises(ConfigError) as info:
+        build_system_prompt(workspace)
+    assert SYNTH_FILE_MARKER not in str(info.value)
+
+
+@POSIX_ONLY
+def test_instructions_symlink_inside_the_workspace_is_also_refused(workspace: Workspace) -> None:
+    from panda_core.agent import build_system_prompt
+
+    inside = workspace.root / "README.md"
+    _link(workspace.instructions_path, inside)
+    with pytest.raises(ConfigError):
+        build_system_prompt(workspace)
+
+
+@POSIX_ONLY
+def test_symlinked_panda_directory_is_refused(workspace: Workspace, tmp_path: Path) -> None:
+    from panda_core.agent import build_system_prompt
+
+    real = tmp_path / "elsewhere" / "panda"
+    real.parent.mkdir()
+    (workspace.root / ".panda").rename(real)
+    (real / "instructions.md").write_text(SYNTH_FILE_MARKER, encoding="utf-8")
+    (workspace.root / ".panda").symlink_to(real, target_is_directory=True)
+    with pytest.raises(ConfigError):
+        build_system_prompt(workspace)
+
+
+@POSIX_ONLY
+def test_config_json_symlink_is_refused(workspace: Workspace, tmp_path: Path) -> None:
+    real = tmp_path / "outside" / "config.json"
+    real.parent.mkdir()
+    real.write_text(workspace.config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    _link(workspace.config_path, real)
+    with pytest.raises(ConfigError):
+        Workspace.from_root(workspace.root)
+
+
+@POSIX_ONLY
+def test_policy_json_symlink_is_refused(workspace: Workspace, tmp_path: Path) -> None:
+    from panda_core.policy import load_policy_or_default
+
+    real = tmp_path / "outside" / "policy.json"
+    real.parent.mkdir()
+    real.write_text(workspace.policy_path.read_text(encoding="utf-8"), encoding="utf-8")
+    _link(workspace.policy_path, real)
+    with pytest.raises(ConfigError):
+        load_policy_or_default(workspace.policy_path)
+
+
+@POSIX_ONLY
+def test_validator_symlink_is_not_executed(workspace: Workspace, tmp_path: Path) -> None:
+    marker = tmp_path / "validator-ran.txt"
+    script = tmp_path / "outside" / "evil.mjs"
+    script.parent.mkdir()
+    script.write_text(
+        'import { writeFileSync } from "node:fs";\n'
+        f"writeFileSync({json.dumps(str(marker))}, 'x');\n"
+        "console.log(JSON.stringify({ok:true,checks:[]}));\n",
+        encoding="utf-8",
+    )
+    _link(workspace.validator_path, script)
+    result = runner.invoke(app, ["validate", "--root", str(workspace.root), "--json"])
+    assert result.exit_code == 2, result.output
+    assert not marker.exists()
+
+
+@POSIX_ONLY
+def test_run_never_sends_a_symlinked_outside_file_to_the_provider(
+    workspace: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CHAIN-001 without a hostile endpoint: the prompt itself must stay clean."""
+
+    sent: list[str] = []
+
+    async def fake_send(self: object, request: httpx.Request, *a: object, **k: object):
+        sent.append(request.content.decode("utf-8", "replace"))
+        return httpx.Response(401, json={"error": "denied"}, request=request)
+
+    monkeypatch.setenv("OPENCODE_API_KEY", SYNTH_KEY)
+    monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
+    _link(workspace.instructions_path, _outside_secret(tmp_path))
+    result = runner.invoke(app, ["run", "--root", str(workspace.root), "hello"])
+    assert result.exit_code == 2, result.output
+    assert not any(SYNTH_FILE_MARKER in body for body in sent)
+
+
+@POSIX_ONLY
+def test_o_nofollow_is_a_second_layer_when_the_lstat_walk_is_bypassed(
+    workspace: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link swapped in after the check must still fail at open()."""
+
+    from panda_core import safe_read
+
+    _link(workspace.instructions_path, _outside_secret(tmp_path))
+    monkeypatch.setattr(safe_read, "ensure_plain_path", lambda root, path: path)
+    with pytest.raises(ConfigError):
+        safe_read.read_workspace_file(workspace.root, workspace.instructions_path)
+
+
+def test_neg_regular_instructions_are_read_and_redacted(workspace: Workspace) -> None:
+    from panda_core.agent import build_system_prompt
+
+    token = "sk-abcdefghijklmnopqrstuvwxyz012345"
+    workspace.instructions_path.write_text(
+        f"Use the evidence first.\nkey: {token}\n", encoding="utf-8"
+    )
+    prompt = build_system_prompt(workspace)
+    assert "Use the evidence first." in prompt
+    assert token not in prompt
+
+
+@POSIX_ONLY
+def test_validator_directory_symlink_is_not_executed(
+    workspace: Workspace, tmp_path: Path
+) -> None:
+    """Variant: the link is on a parent directory, not on the script itself."""
+
+    marker = tmp_path / "validator-dir-ran.txt"
+    real = tmp_path / "outside" / "validation"
+    real.mkdir(parents=True)
+    (real / "validate.mjs").write_text(
+        'import { writeFileSync } from "node:fs";\n'
+        f"writeFileSync({json.dumps(str(marker))}, 'x');\n",
+        encoding="utf-8",
+    )
+    folder = workspace.root / "corpus" / "validation"
+    for child in folder.iterdir():
+        child.unlink()
+    folder.rmdir()
+    folder.symlink_to(real, target_is_directory=True)
+    result = runner.invoke(app, ["validate", "--root", str(workspace.root), "--json"])
+    assert result.exit_code == 2, result.output
+    assert not marker.exists()
+
+
+@POSIX_ONLY
+def test_dangling_instructions_symlink_is_refused_too(workspace: Workspace) -> None:
+    """Any link is refused, even one whose target does not exist yet."""
+
+    from panda_core.agent import build_system_prompt
+
+    _link(workspace.instructions_path, workspace.root / "does-not-exist.txt")
+    with pytest.raises(ConfigError):
+        build_system_prompt(workspace)

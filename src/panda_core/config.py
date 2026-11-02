@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from panda_core.errors import ConfigError
+from panda_core.safe_read import read_workspace_file
 from panda_core.version import __version__
 
 DEFAULT_MODEL = "opencode-go/deepseek-v4.1-flash"
@@ -260,7 +261,7 @@ def _enforce_provider_boundary(settings: ProviderSettings, path: Path) -> None:
 
 def load_config(path: Path) -> PandaConfig:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_workspace_file(path.parent.parent, path))
     except OSError as exc:
         raise ConfigError(f"cannot read config: {path}", hint="run `panda init`") from exc
     except json.JSONDecodeError as exc:
