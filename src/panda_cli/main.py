@@ -26,6 +26,7 @@ from panda_core.credentials import (
     mask_key,
     set_api_key,
 )
+from panda_core.display import sanitize_display
 from panda_core.errors import ConfigError, ExecutionTimeout, PandaError, UsageError
 from panda_core.limits import DEFAULT_MAX_STEPS
 from panda_core.session import SessionLog, list_sessions
@@ -504,13 +505,14 @@ def run_command(
         if json_output:
             return
         if event.kind == "text_delta":
-            typer.echo(event.data.get("text", ""), nl=False)
+            typer.echo(sanitize_display(str(event.data.get("text", ""))), nl=False)
             streamed["any"] = True
         elif event.kind == "tool_call":
-            typer.echo(f"\n[tool] {event.data.get('name')}", err=True)
+            typer.echo(f"\n[tool] {sanitize_display(str(event.data.get('name')))}", err=True)
         elif event.kind == "tool_result":
             state = "blocked" if event.data.get("blocked") else "ok"
-            typer.echo(f"[tool] {event.data.get('name')}: {state}", err=True)
+            name = sanitize_display(str(event.data.get("name")))
+            typer.echo(f"[tool] {name}: {state}", err=True)
 
     async def _execute() -> Any:
         runtime = _runtime(

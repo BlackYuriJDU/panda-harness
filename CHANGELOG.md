@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Approval display (APR-003, UI-002): the REPL passed model text to Rich with markup on,
+  so `[conceal]` hid part of a command, `[link=...]` made a hyperlink and `[/x]` raised
+  an error, and the REPL and `panda run` wrote raw terminal control sequences (clipboard,
+  title, clear screen) from the model. All of it is printed literally and sanitized
+  (`panda_core.display.sanitize_display`); bidi and zero-width characters are shown as
+  `<U+XXXX>`.
+- `--auto` (APR-004): it approved every `ask`, including `git push`, against the agent's
+  own rule "never push". Publishing asks (`shell-push`, `shell-git-push`, `git-push`)
+  are now `never_auto`: `--auto` does not approve them.
 - Validator (VAL-001, VAL-002): `parse_report` accepted `{"ok": true, "checks": []}`,
   a report with every check skipped, and reports missing required checks, so a broken
   or rewritten validator could pass. The nine unconditional checks must now be present
@@ -136,6 +145,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **Breaking for `--auto`:** `git push` is no longer approved by it; answer the prompt.
 - **New command:** `panda session recover <id>`. After a crash the writer stops
   until it is run; this is deliberate.
 - **Breaking for custom endpoints:** a workspace file with a non-official

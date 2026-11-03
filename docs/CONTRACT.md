@@ -200,8 +200,16 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   the model call (exit `4` with a hint naming the environment variable).
 - A **turn** is one user message plus up to `--max-steps` model steps
   (default `24`) with tool calls in between.
-- `--auto` approves every `ask` decision for the process. Without a human at a
-  prompt, `ask` is denied.
+- `--auto` approves the `ask` decisions for the process, **except those in the
+  `never_auto` class**: publishing (`git push`, rules `shell-push`, `shell-git-push`,
+  `git-push`) is never approved by `--auto` and stays denied unless a person answers
+  the prompt. Destructive and force operations are `hard_deny`, which `--auto` cannot
+  approve either. Without a human at a prompt, `ask` is denied.
+- **What is shown is what runs.** Text from the model, tools and the workspace is
+  printed literally in the REPL and in `panda run`: Rich markup is not interpreted,
+  terminal control sequences (OSC 52 clipboard, window title, `ESC[2J`, carriage
+  returns, C1 controls) are removed, and invisible bidirectional or zero-width
+  characters are shown as `<U+XXXX>`.
 - `--dry-run` records `run.plan`, prints model/provider/tools/session, closes the
   session as `planned`, and never calls the provider.
 - `--private` persists only the task hash and length; the text is not written.

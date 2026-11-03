@@ -41,6 +41,11 @@ def _env_names() -> list[str]:
     )
 
 
+# Rules whose `ask` a person must answer: `--auto` does not approve them, so the
+# rule "never push" in the agent's instructions holds even without a human.
+NEVER_AUTO_RULES = frozenset({"shell-push", "shell-git-push", "git-push"})
+
+
 class ChatRuntime:
     def __init__(
         self,
@@ -113,7 +118,8 @@ class ChatRuntime:
     # ---- approvals ----
     async def _approve(self, request: ApprovalRequest) -> bool:
         if self.auto:
-            return True
+            # `--auto` approves ordinary asks, never publishing ones (APR-004).
+            return request.rule_id not in NEVER_AUTO_RULES
         if self._approver is not None:
             return bool(await self._approver(request))
         return False
