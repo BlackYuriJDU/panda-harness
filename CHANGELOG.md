@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- `--private` (PRIV-001): it hid the task but the model's prose, which often repeats it, was
+  stored. The assistant's text is now stored as SHA-256 and length too. Tool arguments stay
+  recorded, because they are the provenance; the CONTRACT now says exactly that.
 - Legacy OpenCode export (LEG-001): the generated envelope no longer pre-approves
   `git diff`, `git log`, `git show`, `git branch` or the validator script (the same prefix
   hole as SEC-001); merging no longer lets a user's `ask` override a generated `deny`;
@@ -29,6 +32,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Documentation matches the code (DOC-001): event names are `message.user` /
+  `message.assistant`, `panda auth` is in the command table, the CONTRACT has a reference
+  of every event the code writes, `SECURITY.md` supports `0.2.x`, and the agent's rule 7
+  now says what the policy does (a person approves a push; `--auto` never does).
+  `tests/test_contract.py` compares the CONTRACT with the registered commands, the ledger
+  events, the hard denies and the version, so the two cannot drift again.
 - Dead policy actions (DEAD-001) are now explicit: `ENFORCED_ACTIONS` and `PLANNED_ACTIONS`
   in `panda_core.policy`, documented in the CONTRACT and guarded by tests.
 

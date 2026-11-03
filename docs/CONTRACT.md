@@ -177,6 +177,9 @@ the environment variable name is.
 | `panda policy check <action> <resource>` | Evaluate one action. |
 | `panda policy explain <action> <resource>` | Show the matching rules. |
 | `panda policy show` | Print the effective policy. |
+| `panda auth set` | Store a provider key outside the workspace (prompted by default; an exported variable still wins). |
+| `panda auth status` | Show where the key would come from. Never prints it. |
+| `panda auth clear` | Remove the stored key. |
 | `panda study list` | List the study registry. |
 | `panda study show <id>` | Show one study card. |
 | `panda mcp serve` | Run the optional MCP server (stdio or loopback HTTP). |
@@ -212,7 +215,10 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   characters are shown as `<U+XXXX>`.
 - `--dry-run` records `run.plan`, prints model/provider/tools/session, closes the
   session as `planned`, and never calls the provider.
-- `--private` persists only the task hash and length; the text is not written.
+- `--private` keeps the task text and the assistant's prose out of the ledger: only their
+  SHA-256 and length are stored. Tool arguments (`tool.call`) and tool results are still
+  recorded because they are the provenance, and they can quote the task; `session.start`
+  still records the working directory and the git state.
 - `--json` suppresses streaming and prints one result object
   (`status`, `text`, `steps`, `tool_calls`, `usage`, `context_tokens`,
   `context_window`, `context_ratio`, `session_id`).
@@ -462,10 +468,26 @@ canonical record without `hash`; `prev` is the previous record's hash. The ancho
 pins the tail `(seq, hash)`, so truncation is detectable. A missing anchor is a
 warning for legacy logs; a mismatched anchor is an error.
 
-A chat session records `session.start`, `user.message`, `assistant.message`,
+A chat session records `session.start`, `message.user`, `message.assistant`,
 `tool.call`, `tool.result`, `approval.*`, and a terminal `session.end` with the
 model and turn count. Redaction runs before hashing and persistence. `--private`
-keeps task text out of every record.
+keeps the task text and the assistant's prose out of the ledger (see §4.1).
+
+**Event reference.** These are all the event types the code writes:
+
+| Event | Written by | Meaning |
+|---|---|---|
+| `session.start` / `session.end` | session | Opens and closes a ledger. |
+| `session.recovered` | `panda session recover` | One unanchored event was adopted. |
+| `turn.start` / `turn.end` | agent | A turn; `turn.end` carries `status`, usage and `tree_sha256`. |
+| `message.user` / `message.assistant` | agent | The user message and each model step. |
+| `tool.call` / `tool.result` | agent | A tool call and its result, with file hashes for writes. |
+| `approval.request` / `approval.decision` | agent | An `ask` and its answer. |
+| `context.trim` | agent | Messages removed from the model context, with their hashes. |
+| `error` | agent | A typed error that ended the turn. |
+| `run.start` / `run.plan` / `run.end` / `run.error` | `panda run` | The headless run (`run.plan` for `--dry-run`). |
+| `validate.start` / `validate.result` / `validate.error` | `panda validate`, MCP | A validator run. |
+| `mcp.connect` / `policy.decision` / `note` | MCP service | An MCP connection, a denied or checked policy decision, a note. |
 
 `panda session verify` exits `1` if any session fails verification.
 

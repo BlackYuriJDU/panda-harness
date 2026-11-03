@@ -6,7 +6,8 @@ Panda is an alpha project. Security reports are welcome and taken seriously.
 
 | Version | Supported |
 |---|---|
-| `0.1.x` (alpha) | Best effort |
+| `0.2.x` (alpha) | Best effort |
+| `0.1.x` | Not supported |
 
 ## Reporting a vulnerability
 
@@ -60,8 +61,8 @@ Panda does **not** protect against:
 - Append-only JSONL with a SHA-256 hash chain and tail anchor.
 - Redaction before hashing and persistence.
 - Environment variable **names** are recorded, never values.
-- `--private` avoids storing task text; `logging.log_tasks = false` disables it
-  globally.
+- `--private` avoids storing the task text and the assistant's prose (tool arguments are
+  still recorded as provenance); `logging.log_tasks = false` disables task text globally.
 - `.panda/sessions/` and `.panda/backups/` are gitignored by default.
 
 ### Secrets

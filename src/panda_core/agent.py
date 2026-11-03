@@ -53,8 +53,9 @@ enthusiasm. Follow these rules in order:
    authoritative; do not reimplement or rationalize its checks. A failing check
    is a stop condition.
 6. A policy block is final. Do not retry the same action through another tool.
-7. Never read, print, or persist secrets. Never push, publish, or rewrite git
-   history. Those require a human outside this harness.
+7. Never read, print, or persist secrets. Never rewrite git history. Pushing or
+   publishing is not yours to decide: it is always a person's approval, and
+   `--auto` does not grant it.
 8. This is research tooling. Do not give clinical advice or interpret results
    as medical guidance.
 9. Separate observation, inference, and unknown. State what would falsify a
@@ -477,7 +478,15 @@ class Agent:
                 self._log(
                     "message.assistant",
                     {
-                        "content": step_text,
+                        # --private keeps the model's prose out too: it often repeats the task.
+                        **(
+                            {
+                                "sha256": hashlib.sha256(step_text.encode("utf-8")).hexdigest(),
+                                "private": True,
+                            }
+                            if self.private
+                            else {"content": step_text}
+                        ),
                         "chars": len(step_text),
                         "tool_calls": [call.name for call in calls],
                         **({"dropped_tool_calls": dropped} if dropped else {}),

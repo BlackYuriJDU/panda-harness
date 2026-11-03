@@ -418,3 +418,36 @@ def test_a_planned_action_has_no_tool_that_consults_it() -> None:
     text = source.read_text(encoding="utf-8")
     consulted = set(re.findall(r'action="([a-z_]+)"', text))
     assert not consulted & PLANNED_ACTIONS, consulted & PLANNED_ACTIONS
+
+
+# --------------------------------------------------------------------------- PRIV-001
+def test_private_mode_keeps_the_assistant_text_out_of_the_ledger(workspace) -> None:
+    from test_w2a import make_agent
+
+    from panda_core.provider import DoneEvent, TextDelta
+
+    task = "PRIVATE_TASK_the_gene_list_for_patient_zero"
+    echoed = f"You asked about: {task}"
+    agent, session, _, _ = make_agent(
+        workspace, [[TextDelta(echoed), DoneEvent(finish_reason="stop")]]
+    )
+    agent.private = True
+    asyncio.run(agent.run_turn(task))
+    ledger = session.path.read_text(encoding="utf-8")
+    assert task not in ledger
+    assistant = [e for e in session.events() if e.type == "message.assistant"][0]
+    assert assistant.data["private"] is True and len(assistant.data["sha256"]) == 64
+    assert assistant.data["chars"] == len(echoed)
+
+
+def test_a_normal_turn_still_records_the_assistant_text(workspace) -> None:
+    from test_w2a import make_agent
+
+    from panda_core.provider import DoneEvent, TextDelta
+
+    agent, session, _, _ = make_agent(
+        workspace, [[TextDelta("visible answer"), DoneEvent(finish_reason="stop")]]
+    )
+    asyncio.run(agent.run_turn("task"))
+    assistant = [e for e in session.events() if e.type == "message.assistant"][0]
+    assert assistant.data["content"] == "visible answer"

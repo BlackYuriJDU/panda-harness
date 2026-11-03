@@ -371,11 +371,12 @@ def test_the_allow_button_obeys_the_same_gate(
     monkeypatch.setattr("panda_cli.cockpit.ARM_DELAY_SECONDS", 60.0)
 
     async def script(pilot, screen, decisions):
-        await pilot.click("#allow")
+        allow = screen.query_one("#allow")
+        allow.press()  # same Button.Pressed path as a click, without depending on layout
         await pilot.pause()
         assert decisions == []
         screen._armed_at = 0.0
-        await pilot.click("#allow")
+        allow.press()
         await pilot.pause()
 
     assert run_modal(workspace, approval("pytest -q"), script) == [True]

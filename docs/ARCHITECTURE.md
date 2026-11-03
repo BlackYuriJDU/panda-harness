@@ -136,7 +136,7 @@ its value.
 
 One turn is:
 
-1. append `user.message` to the ledger (subject to `--private`);
+1. append `message.user` to the ledger (subject to `--private`);
 2. build the system prompt from the corpus rules, validator state, provider,
    model, and active study;
 3. stream a completion; emit `text_delta` events to the UI;
@@ -144,7 +144,7 @@ One turn is:
    `PolicyEngine` first), append `tool.call` / `tool.result`, and feed the result
    back;
 5. repeat until the model answers without tool calls or `max_steps` is reached;
-6. append `assistant.message` and return a `TurnResult` with usage and context
+6. append `message.assistant` after each step and return a `TurnResult` with usage and context
    estimate.
 
 Context is trimmed by character budget derived from `provider.context_window`,
@@ -267,7 +267,8 @@ the same rendering path when the terminal supports it.
 - Session metadata records environment **names** (`PANDA_*`, `OPENCODE_*`),
   never values.
 - Redaction runs before hashing and persistence.
-- `--private` records only the task hash and length.
+- `--private` records only the hash and length of the task and of the assistant's prose;
+  tool arguments are still recorded as provenance.
 - `logging.log_tasks = false` suppresses task text globally.
 - The ledger is gitignored by default.
 - Tool arguments and results are truncated before being written to the ledger
