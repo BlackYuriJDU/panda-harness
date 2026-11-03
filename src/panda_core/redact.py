@@ -31,6 +31,30 @@ _SAFE_COUNT_KEYS = {
     "available_tokens",
 }
 
+# `NAME=value`, `NAME: value`, `NAME = "value"` where NAME contains a credential word.
+# The name may be wrapped in other words (`DB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`), which
+# a `\b` before the word never matched because `_` is a word character (SEC-004).
+_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?P<name>[A-Za-z0-9_.-]{0,40}?(?:api[_-]?key|access[_-]?key|secret|token|password"
+    r"|passwd|private[_-]?key|credential)[A-Za-z0-9_.-]{0,40})(?P<sep>[ \t]{0,3}[=:][ \t]{0,3})"
+    r"(?P<quote>[\"']?)"
+    r"(?P<value>[^&\s\"']{6,})"
+)
+
+_registered: set[str] = set()
+
+
+def register_secret(value: str) -> None:
+    """Remember a credential this process holds, so it is removed wherever it appears.
+
+    Pattern matching cannot know every key format; the exact value of the key the
+    harness loaded can be removed whatever it looks like. Short values are ignored.
+    """
+
+    if len(value) >= 8:
+        _registered.add(value)
+
+
 _SECRET_VALUE_RES = (
     re.compile(r"\bsk-or-v1-[A-Za-z0-9]{16,}\b"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{24,}\b"),
@@ -38,7 +62,10 @@ _SECRET_VALUE_RES = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
     re.compile(r"\btvly-[A-Za-z0-9]{20,}\b"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
-    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd)=([^&\s\"']{6,})"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\bgh[ousr]_[A-Za-z0-9]{20,}\b"),
     re.compile(
         r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?"
         r"-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
@@ -54,14 +81,22 @@ def _is_secret_key(key: str) -> bool:
     return bool(_SECRET_KEY_RE.search(normalized))
 
 
+def _redact_assignment(match: re.Match[str]) -> str:
+    name = match.group("name")
+    if name.lower().replace("-", "_") in _SAFE_COUNT_KEYS:
+        return match.group(0)
+    return f"{name}{match.group('sep')}{match.group('quote')}{REDACTED}"
+
+
 def redact_text(value: str) -> str:
     text = value
+    for secret in sorted(_registered, key=len, reverse=True):
+        text = text.replace(secret, REDACTED)
     for pattern in _SECRET_VALUE_RES:
-        if pattern.pattern.startswith("(?i)\\b(api"):
-            text = pattern.sub(lambda m: f"{m.group(1)}={REDACTED}", text)
-        else:
-            text = pattern.sub(REDACTED, text)
-    return text
+        text = pattern.sub(REDACTED, text)
+    if "=" not in text and ":" not in text:
+        return text  # the assignment pattern needs a separator
+    return _ASSIGNMENT_RE.sub(_redact_assignment, text)
 
 
 def redact(value: Any) -> Any:
@@ -86,3 +121,4 @@ def redact_env_names(names: list[str] | tuple[str, ...]) -> list[str]:
     """Environment variable names are safe to log; values never are."""
 
     return sorted({str(name) for name in names})
+

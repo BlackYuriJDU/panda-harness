@@ -56,7 +56,7 @@ from panda_core.protocols import (
     is_supported_model,
     model_protocol,
 )
-from panda_core.redact import redact_text
+from panda_core.redact import redact_text, register_secret
 from panda_core.version import __version__
 
 ANTHROPIC_VERSION = "2023-06-01"
@@ -1080,6 +1080,8 @@ class OpenCodeProvider:
 
     def _require_api_key(self) -> str:
         key = self.api_key()
+        if key:
+            register_secret(key)
         if not key:
             raise ProviderError(
                 f"{self.settings.api_key_env} is not set and no stored key exists "

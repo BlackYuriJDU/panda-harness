@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Redaction (SEC-004): the `NAME=value` rule used `\b`, which does not occur after `_`, so
+  `DB_PASSWORD=`, `AWS_SECRET_ACCESS_KEY=` and `OPENCODE_API_KEY=` leaked into the ledger
+  and into tool output sent to the provider. It now matches any name that contains a
+  credential word (`NAME=v`, `NAME: v`, `NAME = "v"`), adds `AKIA…`, `AIza…`, `xox?-…` and
+  `gh?_…`, and removes the exact key the provider loaded (`register_secret`). The pattern
+  is length-bounded so hostile input stays linear.
 - Approval prompt in the cockpit (APR-002, APR-001, UI-001): the modal cut the preview at
   16 lines with no sign of it, so the tail of a diff or command was never seen, and
   `y` approved instantly, including a `y` typed into the composer as the modal opened.
