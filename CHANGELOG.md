@@ -4,7 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.2.0a5 hardening
+## [0.2.0a5] — 2026-11-03 (hardening)
+
+A security-hardening release that follows an independent audit of `0.2.0a4` (53 findings).
+`0.2.0a4` should not be published. Nothing is added to the product surface except
+`panda session recover`; most entries below make existing behavior stricter.
 
 ### Security
 
@@ -213,6 +217,26 @@ All notable changes to this project are documented here. The format follows
   its path in `.panda/config.json`.
 - **Breaking for symlinked workspace files:** copy the target into the
   workspace instead of linking it.
+
+### Verified
+
+- Baseline `231e48f` (0.2.0a4): `341 passed, 3 skipped`. This release: `771 passed, 3 skipped`
+  on Linux (Python 3.13), 406 of them in `tests/security`, each written to fail on `231e48f`
+  first. `ruff`, `compileall` and `mypy --platform linux` / `--platform win32` are clean;
+  `pip-audit` reports no known vulnerabilities for the resolved dependencies; `python -m
+  build` and `twine check` pass.
+- 4 existing test assertions changed, each with the owner's approval and its source in the
+  commit message: a policy default for `node ...validate.mjs`, a provider error now writing
+  `turn.end`, a missing required validator check, and the approval modal's arming delay.
+
+### Not verified
+
+- Windows (process-tree kill with `taskkill`, junctions, `O_NOFOLLOW` absence, path case).
+- The approval modal and `y` typed ahead in a real terminal; only Textual's pilot was used.
+- Any call to a real provider; adapters are covered by fixtures and `MockTransport`.
+- The `release.yml`, `ci.yml` `audit` job and Dependabot run on GitHub; only their syntax and
+  structure were checked locally.
+- Actions are pinned by tag, not by commit SHA.
 
 ## [0.2.0a4] — 2026-10-30
 
