@@ -400,6 +400,14 @@ files such as `.git/config`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`,
 `*.kdbx`, `*.keystore` and `secrets.*`, at the root and nested),
 force-push, history rewrites, recursive deletion, and release publishing.
 
+**The approval prompt shows what will run, or the action is not approved.** In the
+cockpit the preview is scrollable, shows how many lines are still hidden below, and
+`y`/Allow does nothing until the whole preview has been seen. A preview the tool
+shortened (`[truncated N chars]`) is flagged as such. Approving is armed 0.4 s after
+the prompt opens, so a `y` typed ahead is ignored, and a `high` or `critical` risk
+needs `y` twice (any other key cancels the first). `n`, `Esc` and Deny are immediate.
+Text in the prompt is sanitized and never interpreted as markup.
+
 An `ask` becomes an approval request with a single decision:
 **allow once** in the cockpit modal or the REPL prompt. There is no "remember"
 and no global allow. In `panda run` without `--auto`, an `ask` is denied and the

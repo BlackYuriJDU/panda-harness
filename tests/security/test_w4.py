@@ -228,3 +228,182 @@ def test_a_refused_auto_push_is_recorded_in_the_ledger(workspace) -> None:
     asyncio.run(runtime.agent._approve(request))
     decisions = [e for e in runtime.session.events() if e.type == "approval.decision"]
     assert decisions and decisions[-1].data["approved"] is False
+
+
+# --------------------------------------------------------------------------- cockpit modal
+from panda_cli.cockpit import ApprovalScreen, PandaCockpit  # noqa: E402
+
+ARMED = 0.6  # longer than the arming delay
+
+
+def run_modal(workspace, request, script):
+    """Open the modal, run `script(pilot, screen, decisions)`, return the decisions."""
+
+    decisions: list[bool] = []
+
+    async def scenario() -> None:
+        app = PandaCockpit(workspace)
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = ApprovalScreen(request)
+            app.push_screen(screen, callback=decisions.append)
+            await pilot.pause()
+            await script(pilot, screen, decisions)
+
+    asyncio.run(scenario())
+    return decisions
+
+
+def long_diff(lines: int = 60) -> str:
+    body = [f"+line {n}" for n in range(lines - 1)]
+    return "\n".join([*body, "+FINAL_PAYLOAD_LINE"])
+
+
+def status_text(screen) -> str:
+    widget = screen.query_one("#approval-status")
+    renderable = widget.render()
+    return getattr(renderable, "plain", str(renderable))
+
+
+def test_a_long_preview_reports_the_hidden_lines(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.pause(0.3)
+        assert "hidden" in status_text(screen)
+        assert screen.query_one("#approval-preview-scroll").max_scroll_y > 0
+
+    run_modal(workspace, approval(long_diff(), preview_kind="diff"), script)
+
+
+def test_approval_waits_until_the_end_of_a_long_preview_has_been_seen(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.pause(ARMED)
+        await pilot.press("y")
+        await pilot.pause()
+        assert decisions == [], "approved without seeing the tail of the diff"
+        screen.query_one("#approval-preview-scroll").scroll_end(animate=False)
+        await pilot.pause(0.3)
+        assert "hidden" not in status_text(screen)
+        await pilot.press("y")
+        await pilot.pause()
+
+    assert run_modal(workspace, approval(long_diff(), preview_kind="diff"), script) == [True]
+
+
+def test_the_final_line_is_what_the_operator_ends_up_seeing(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        scroll = screen.query_one("#approval-preview-scroll")
+        scroll.scroll_end(animate=False)
+        await pilot.pause(0.3)
+        assert scroll.scroll_y == scroll.max_scroll_y
+        await pilot.press("n")
+        await pilot.pause()
+
+    run_modal(workspace, approval(long_diff(), preview_kind="diff"), script)
+
+
+def test_a_short_preview_has_nothing_hidden(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.pause(ARMED)
+        assert "hidden" not in status_text(screen)
+        await pilot.press("y")
+        await pilot.pause()
+
+    assert run_modal(workspace, approval("git status"), script) == [True]
+
+
+# --------------------------------------------------------------------------- UI-001
+def test_a_y_typed_as_the_modal_opens_does_not_approve(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.press("y")
+        await pilot.pause()
+        assert decisions == []
+        await pilot.pause(ARMED)
+        await pilot.press("y")
+        await pilot.pause()
+
+    assert run_modal(workspace, approval("pytest -q"), script) == [True]
+
+
+def test_high_risk_needs_a_second_confirmation(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.pause(ARMED)
+        await pilot.press("y")
+        await pilot.pause()
+        assert decisions == [] and "again" in status_text(screen)
+        await pilot.press("y")
+        await pilot.pause()
+
+    request = approval("git push origin main", risk="high")
+    assert run_modal(workspace, request, script) == [True]
+
+
+def test_high_risk_confirmation_is_cancelled_by_any_other_key(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.pause(ARMED)
+        await pilot.press("y")
+        await pilot.press("x")
+        await pilot.press("y")
+        await pilot.pause()
+        assert decisions == []
+        await pilot.press("n")
+        await pilot.pause()
+
+    request = approval("git push origin main", risk="critical")
+    assert run_modal(workspace, request, script) == [False]
+
+
+@pytest.mark.parametrize("key", ["n", "escape"])
+def test_denying_never_waits(workspace, key: str) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.press(key)
+        await pilot.pause()
+
+    assert run_modal(workspace, approval(long_diff(), preview_kind="diff"), script) == [False]
+
+
+def test_the_allow_button_obeys_the_same_gate(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.click("#allow")
+        await pilot.pause()
+        assert decisions == []
+        await pilot.pause(ARMED)
+        await pilot.click("#allow")
+        await pilot.pause()
+
+    assert run_modal(workspace, approval("pytest -q"), script) == [True]
+
+
+def test_the_deny_button_is_immediate(workspace) -> None:
+    async def script(pilot, screen, decisions):
+        await pilot.click("#deny")
+        await pilot.pause()
+
+    assert run_modal(workspace, approval("pytest -q"), script) == [False]
+
+
+# --------------------------------------------------------------------------- APR-001
+def test_the_truncation_marker_is_shown_and_flagged(workspace) -> None:
+    preview = long_diff(12) + "\n[truncated 4321 chars]"
+
+    async def script(pilot, screen, decisions):
+        await pilot.pause(0.3)
+        text = status_text(screen)
+        assert "truncated" in text
+        shown = screen.query_one("#approval-preview").render()
+        assert "[truncated 4321 chars]" in getattr(shown, "plain", str(shown))
+
+    run_modal(workspace, approval(preview, preview_kind="diff"), script)
+
+
+def test_the_modal_strips_control_sequences_and_shows_markup_literally(workspace) -> None:
+    hostile = f"echo hi{OSC_CLIPBOARD}{CLEAR_SCREEN} [bold]x[/bold]"
+
+    async def script(pilot, screen, decisions):
+        await pilot.pause(0.2)
+        shown = screen.query_one("#approval-preview").render()
+        plain = getattr(shown, "plain", str(shown))
+        assert ESC not in plain and "U1lOVEhfU0VDUkVU" not in plain
+        assert "[bold]x[/bold]" in plain
+        await pilot.press("n")
+        await pilot.pause()
+
+    run_modal(workspace, approval(hostile, resource=hostile), script)

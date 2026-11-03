@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Approval prompt in the cockpit (APR-002, APR-001, UI-001): the modal cut the preview at
+  16 lines with no sign of it, so the tail of a diff or command was never seen, and
+  `y` approved instantly, including a `y` typed into the composer as the modal opened.
+  The preview now scrolls with a `+N lines hidden` counter and approval stays locked
+  until the end has been seen, a truncated preview is flagged, approval is armed after
+  0.4 s, and `high`/`critical` risk needs a second `y`. Deny stays immediate.
 - Approval display (APR-003, UI-002): the REPL passed model text to Rich with markup on,
   so `[conceal]` hid part of a command, `[link=...]` made a hyperlink and `[/x]` raised
   an error, and the REPL and `panda run` wrote raw terminal control sequences (clipboard,

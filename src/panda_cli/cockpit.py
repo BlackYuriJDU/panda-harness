@@ -33,6 +33,7 @@ from panda_cli import mascot
 from panda_cli.brand import PALETTE, spark_lines
 from panda_cli.runtime import ChatRuntime
 from panda_core.agent import DEFAULT_MAX_STEPS
+from panda_core.display import sanitize_display
 from panda_core.errors import PandaError
 from panda_core.registry import find_study, load_registry
 from panda_core.session import SessionLog
@@ -146,6 +147,10 @@ class ValidationPanel(Static):
                 for error in check.get("errors", [])[:2]:
                     line.append(f"\n    {_short(str(error), 120)}", style=SHADOW)
         return line
+ARM_DELAY_SECONDS = 0.4
+CONFIRM_WINDOW_SECONDS = 5.0
+
+
 class ApprovalScreen(ModalScreen[bool]):
     """One approval decision. Nothing executes until this returns True."""
 
@@ -179,11 +184,23 @@ class ApprovalScreen(ModalScreen[bool]):
         height: auto;
         margin: 1 0 0 0;
     }
+    #approval-preview-scroll {
+        height: auto;
+        max-height: 16;
+        margin: 1 0 0 0;
+        border: round #3A3A3A;
+    }
+    #approval-preview-scroll:focus {
+        border: round #F5A623;
+    }
     #approval-preview {
         color: #C9C9D9;
-        max-height: 16;
         height: auto;
-        margin: 1 0;
+    }
+    #approval-status {
+        height: auto;
+        color: #F5A623;
+        margin: 0 0 1 0;
     }
     #approval-buttons {
         height: 3;
@@ -197,27 +214,31 @@ class ApprovalScreen(ModalScreen[bool]):
     def __init__(self, request: ApprovalRequest) -> None:
         super().__init__()
         self.request = request
+        self._armed_at = time.monotonic() + ARM_DELAY_SECONDS
+        self._confirm_until = 0.0
 
     def compose(self) -> ComposeResult:
         request = self.request
         summary = Text()
         summary.append("tool     ", style=SHADOW)
-        summary.append(request.tool, style=f"bold {WHITE}")
+        summary.append(sanitize_display(request.tool), style=f"bold {WHITE}")
         summary.append("\naction   ", style=SHADOW)
-        summary.append(request.action, style=WHITE)
+        summary.append(sanitize_display(request.action), style=WHITE)
         summary.append("  ", style=WHITE)
-        summary.append(request.resource, style=WHITE)
+        summary.append(sanitize_display(request.resource), style=WHITE)
         summary.append("\nrule     ", style=SHADOW)
-        summary.append(request.rule_id or "-", style=WHITE)
+        summary.append(sanitize_display(request.rule_id or "-"), style=WHITE)
         summary.append("   risk ", style=SHADOW)
-        summary.append(request.risk, style=AMBER if request.risk in {"high", "critical"} else WHITE)
+        summary.append(request.risk, style=AMBER if self._high_risk else WHITE)
         summary.append("\nreason   ", style=SHADOW)
-        summary.append(request.reason or "-", style=SHADOW)
-        preview = Text(request.preview or "(no preview)", style=SHADOW)
+        summary.append(sanitize_display(request.reason or "-"), style=SHADOW)
+        # Text, never markup: what is shown is exactly what will run (APR-002/003).
+        preview = Text(sanitize_display(request.preview or "(no preview)"), style=SHADOW)
         yield Vertical(
             Static(Text("APPROVAL REQUIRED", style=f"bold {AMBER}"), id="approval-title"),
             Static(summary, id="approval-summary"),
-            Static(preview, id="approval-preview"),
+            VerticalScroll(Static(preview, id="approval-preview"), id="approval-preview-scroll"),
+            Static("", id="approval-status"),
             Horizontal(
                 Button("Allow", id="allow"),
                 Button("Deny", id="deny", variant="warning"),
@@ -226,10 +247,64 @@ class ApprovalScreen(ModalScreen[bool]):
             id="approval-dialog",
         )
 
+    # ---- gate: nothing is approved before it has been seen and meant ----
+    @property
+    def _high_risk(self) -> bool:
+        return self.request.risk in {"high", "critical"}
+
+    def on_mount(self) -> None:
+        self.query_one("#approval-preview-scroll", VerticalScroll).focus()
+        self.set_interval(0.1, self._refresh_status)
+        self._refresh_status()
+
+    def _hidden_lines(self) -> int:
+        scroll = self.query_one("#approval-preview-scroll", VerticalScroll)
+        return max(0, int(round(scroll.max_scroll_y - scroll.scroll_y)))
+
+    def _refresh_status(self) -> None:
+        try:
+            status = self.query_one("#approval-status", Static)
+        except NoMatches:
+            return
+        now = time.monotonic()
+        parts: list[str] = []
+        hidden = self._hidden_lines()
+        if "[truncated " in (self.request.preview or "")[-80:]:
+            parts.append("preview truncated by the tool; the real content is longer")
+        if now < self._armed_at:
+            parts.append("approval unlocks in a moment")
+        elif hidden:
+            parts.append(
+                f"+{hidden} lines hidden below: scroll (↓, PageDown, End) to read all of it "
+                "before approving"
+            )
+        elif self._confirm_until > now:
+            parts.append(f"risk {self.request.risk}: press y again to approve, n to deny")
+        else:
+            parts.append("y allow · n deny")
+        status.update(Text("\n".join(parts)))
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key not in {"y", "n", "escape"}:
+            self._confirm_until = 0.0  # any other key cancels a pending confirmation
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "allow")
+        if event.button.id == "allow":
+            self.action_allow()
+        else:
+            self.dismiss(False)
 
     def action_allow(self) -> None:
+        now = time.monotonic()
+        if now < self._armed_at:
+            return  # a key typed ahead of the modal must not approve (UI-001)
+        if self._hidden_lines():
+            self._refresh_status()
+            return  # the operator has not seen the whole preview (APR-002)
+        if self._high_risk and self._confirm_until <= now:
+            self._confirm_until = now + CONFIRM_WINDOW_SECONDS
+            self._refresh_status()
+            return
         self.dismiss(True)
 
     def action_deny(self) -> None:
