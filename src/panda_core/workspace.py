@@ -243,6 +243,14 @@ class Workspace:
             result = subprocess.run(
                 ["git", "status", "--porcelain=v2", "--branch"],
                 cwd=self.root,
+                # `.git/config` travels with the corpus: do not let it name a program
+                # (core.fsmonitor) that this read-only boot probe would execute.
+                env={
+                    **os.environ,
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                    "GIT_CONFIG_VALUE_0": "false",
+                },
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

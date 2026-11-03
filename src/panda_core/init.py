@@ -201,16 +201,20 @@ def initialize_workspace(
         result.opencode_path = target
 
     config_dir = root / CONFIG_DIR
+    new_config = json.dumps(config.to_jsonable(), ensure_ascii=False, indent=2) + "\n"
+    config_differs = (
+        config_path.is_file() and config_path.read_text(encoding="utf-8") != new_config
+    )
     if not dry_run:
         config_dir.mkdir(parents=True, exist_ok=True)
-        if config_path.is_file():
-            _backup(config_path, root / CONFIG_DIR / "backups")
+        if config_differs:
+            _backup(config_path, root / CONFIG_DIR / "backups")  # only when it will change
 
     _write_json_if_changed(
         config_path,
         config.to_jsonable(),
         result=result,
-        force=True,
+        force=config_differs,  # an identical config is left alone (INIT-001)
     )
 
     policy_path = root / CONFIG_DIR / POLICY_FILE
@@ -241,7 +245,7 @@ def initialize_workspace(
     gitignore = config_dir / ".gitignore"
     if _merge_gitignore(
         gitignore,
-        ["sessions/", "backups/", "*.lock"],
+        ["sessions/", "backups/", "logs/", "*.lock"],
         dry_run=dry_run,
     ):
         action = "would update" if dry_run else "updated"

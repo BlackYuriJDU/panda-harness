@@ -48,7 +48,18 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(  # type: ignore[attr-defined]
+                        handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+                    )
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"could not acquire lock: {path}") from exc
+                    time.sleep(0.05)
         try:
             yield
         finally:

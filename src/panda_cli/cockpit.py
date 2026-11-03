@@ -35,6 +35,7 @@ from panda_cli.runtime import ChatRuntime
 from panda_core.agent import DEFAULT_MAX_STEPS
 from panda_core.display import sanitize_display
 from panda_core.errors import PandaError
+from panda_core.redact import redact_text
 from panda_core.registry import find_study, load_registry
 from panda_core.session import SessionLog
 from panda_core.tools import ApprovalRequest
@@ -802,11 +803,13 @@ class PandaCockpit(App[None]):
     def _write_crash_log(self, exc: BaseException, where: str) -> Path | None:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        entry = f"[{stamp}] {where}: {type(exc).__name__}: {exc}\n{body}\n"
+        # A traceback can carry a key or a path; redact it and keep the file private.
+        entry = redact_text(f"[{stamp}] {where}: {type(exc).__name__}: {exc}\n{body}\n")
         for path in self._log_targets():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as handle:
+                fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as handle:
                     handle.write(entry)
             except OSError:
                 continue

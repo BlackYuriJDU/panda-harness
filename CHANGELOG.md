@@ -8,6 +8,23 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Git boot probe (TRUST-004): `git status` at startup ran whatever program `core.fsmonitor`
+  in the corpus's `.git/config` named. The probe now forces `core.fsmonitor=false`.
+- Locks and writes (SEC-009): the POSIX `file_lock` could block forever (now a timeout, as on
+  Windows); `write_file`/`edit_file` reset a file's mode to 0644 (an executable lost its bit,
+  a 0600 file became world-readable; the mode is now kept); and a file changed while waiting
+  for approval was overwritten from the stale read (now refused: "the file changed while
+  waiting for approval").
+- Crash log (PRIV-002): the cockpit crash log wrote tracebacks unredacted with default
+  permissions into a folder that was not git-ignored. It is redacted, created `0600`, and
+  `logs/` is in `.panda/.gitignore`.
+- Dependency floor (DEP-001): the `mcp` extra is `>=1.30,<2`; older versions in the previous
+  range carry published advisories (DNS rebinding, session binding, DoS).
+
+### Fixed
+
+- `panda init` rewrote `config.json` and made a backup on every run (INIT-001). It now touches
+  the file, and backs it up, only when the content changes.
 - Redaction (SEC-004): the `NAME=value` rule used `\b`, which does not occur after `_`, so
   `DB_PASSWORD=`, `AWS_SECRET_ACCESS_KEY=` and `OPENCODE_API_KEY=` leaked into the ledger
   and into tool output sent to the provider. It now matches any name that contains a

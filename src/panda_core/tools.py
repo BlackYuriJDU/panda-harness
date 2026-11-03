@@ -13,6 +13,7 @@ import difflib
 import hashlib
 import json
 import re
+import stat
 import sys
 import threading
 from collections.abc import Awaitable, Callable, Sequence
@@ -695,7 +696,9 @@ class ToolRegistry:
             raise ToolInputError(f"path is a directory: {relative}")
         before = ""
         hash_before: str | None = None
+        file_mode = 0o644
         if path.is_file():
+            file_mode = stat.S_IMODE(path.stat().st_mode)
             try:
                 raw_before = path.read_bytes()
             except OSError as exc:
@@ -713,9 +716,15 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
+        current = file_sha256(path) if path.is_file() else None
+        if current != hash_before:
+            return _fail(
+                "write_file",
+                "the file changed while waiting for approval; read it again and retry",
+            )
         changed = before != content
         if changed:
-            atomic_write_text(path, content, mode=0o644)
+            atomic_write_text(path, content, mode=file_mode)
             try:
                 written = _read_exact(path)
             except OSError as exc:
@@ -752,6 +761,7 @@ class ToolRegistry:
         if path.stat().st_size > MAX_WRITE_BYTES:
             raise ToolInputError(f"file exceeds {MAX_WRITE_BYTES} bytes")
         raw = path.read_bytes()
+        file_mode = stat.S_IMODE(path.stat().st_mode)
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -782,7 +792,12 @@ class ToolRegistry:
         if blocked:
             return blocked
         data = (after.replace("\n", ending) if ending != "\n" else after).encode("utf-8")
-        atomic_write_bytes(path, data, mode=0o644)
+        if not path.is_file() or path.read_bytes() != raw:
+            return _fail(
+                "edit_file",
+                "the file changed while waiting for approval; read it again and retry",
+            )
+        atomic_write_bytes(path, data, mode=file_mode)
         try:
             written = _read_exact(path)  # no newline translation, so CRLF is compared as is
         except OSError as exc:
