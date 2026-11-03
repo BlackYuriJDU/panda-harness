@@ -311,12 +311,17 @@ def test_a_short_preview_has_nothing_hidden(workspace) -> None:
 
 
 # --------------------------------------------------------------------------- UI-001
-def test_a_y_typed_as_the_modal_opens_does_not_approve(workspace) -> None:
+def test_a_y_typed_as_the_modal_opens_does_not_approve(
+    workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A long delay makes "just opened" independent of how fast this machine is.
+    monkeypatch.setattr("panda_cli.cockpit.ARM_DELAY_SECONDS", 60.0)
+
     async def script(pilot, screen, decisions):
         await pilot.press("y")
         await pilot.pause()
         assert decisions == []
-        await pilot.pause(ARMED)
+        screen._armed_at = 0.0  # the modal has now been open long enough
         await pilot.press("y")
         await pilot.pause()
 
@@ -360,12 +365,16 @@ def test_denying_never_waits(workspace, key: str) -> None:
     assert run_modal(workspace, approval(long_diff(), preview_kind="diff"), script) == [False]
 
 
-def test_the_allow_button_obeys_the_same_gate(workspace) -> None:
+def test_the_allow_button_obeys_the_same_gate(
+    workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("panda_cli.cockpit.ARM_DELAY_SECONDS", 60.0)
+
     async def script(pilot, screen, decisions):
         await pilot.click("#allow")
         await pilot.pause()
         assert decisions == []
-        await pilot.pause(ARMED)
+        screen._armed_at = 0.0
         await pilot.click("#allow")
         await pilot.pause()
 
