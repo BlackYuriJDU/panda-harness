@@ -70,12 +70,14 @@ def test_parse_rejects_missing_checks() -> None:
 
 def test_parse_warns_on_missing_and_extra_checks() -> None:
     payload = report_payload()
-    payload["checks"] = [check for check in payload["checks"] if check["name"] != "secrets"]
+    # `public-face` is the conditional check; a missing unconditional one is a
+    # contract failure now (VAL-001, tests/security/test_w3.py).
+    payload["checks"] = [check for check in payload["checks"] if check["name"] != "public-face"]
     payload["checks"].append(
         {"name": "custom", "ok": True, "skipped": False, "reason": "", "errors": []}
     )
     report = parse_report(json.dumps(payload))
-    assert any("secrets" in warning for warning in report.warnings)
+    assert any("public-face" in warning for warning in report.warnings)
     assert any("custom" in warning for warning in report.warnings)
 
 

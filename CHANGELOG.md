@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Validator (VAL-001, VAL-002): `parse_report` accepted `{"ok": true, "checks": []}`,
+  a report with every check skipped, and reports missing required checks, so a broken
+  or rewritten validator could pass. The nine unconditional checks must now be present
+  and run, or it is a protocol error (exit `4`). The validator also inherited the whole
+  environment, including `OPENCODE_API_KEY`; it now gets the scrubbed environment (the
+  same one `run_shell` uses, keeping `PANDA_*` settings).
 - Adapters (ADP-001, ADP-002): a `tool_use` or `function_call` left without a result by
   a cancelled or failed turn made Anthropic and Responses reject the replayed history,
   and trimming could leave a Gemini history starting with a `model` turn. The history is

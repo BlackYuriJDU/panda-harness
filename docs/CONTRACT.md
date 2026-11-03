@@ -75,6 +75,19 @@ Expected layout:
 └── opencode.json            # legacy, only if `init --opencode` was used
 ```
 
+### 3.0 Validator contract
+
+The validator prints one JSON report: `ok`, and a `checks` array of `{name, ok,
+skipped, reason, errors, warnings}`. Panda does not re-implement the checks, but it
+refuses a report that proves nothing: the nine unconditional checks (`schema`, `study`,
+`track`, `evidence`, `numbers`, `claims`, `findings`, `license`, `secrets`) must be
+present and must not be skipped, otherwise it is a protocol error (exit `4`) and
+`{"ok": true, "checks": []}` is not a pass. `public-face` is conditional: it may be
+skipped or absent, with a warning. The validator runs with the harness environment
+minus credentials: names such as `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, the
+`OPENCODE_`/`OPENROUTER_` prefixes and known provider variables are removed, while
+`PANDA_*` settings are kept.
+
 ### 3.1 Initialization
 
 `panda init`:

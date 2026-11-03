@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from panda_core.errors import ConfigError, DependencyError, ExecutionTimeout, ProtocolError
-from panda_core.process import run_command, split_command
+from panda_core.process import run_command, scrubbed_env, split_command
 from panda_core.safe_read import ensure_plain_path
 from panda_core.version import __version__
 
@@ -184,7 +184,13 @@ class Validator:
             command.append("--release")
 
         started = time.monotonic()
-        result = run_command(command, cwd=self.root, timeout=self.timeout)
+        # The validator is workspace code: it gets settings (PANDA_*) but no credentials.
+        result = run_command(
+            command,
+            cwd=self.root,
+            timeout=self.timeout,
+            env=scrubbed_env(keep_prefixes=("PANDA_",)),
+        )
         duration_ms = int((time.monotonic() - started) * 1000)
         if result.timed_out:
             raise ExecutionTimeout(
@@ -283,6 +289,25 @@ def parse_report(stdout: str) -> ValidationReport:
 
     warnings: list[str] = []
     names = [check.name for check in checks]
+    # A report that omits or skips a check every corpus must pass proves nothing
+    # (VAL-001): `{"ok": true, "checks": []}` is a contract failure, not a pass.
+    by_name = {check.name: check for check in checks}
+    absent = [name for name in UNCONDITIONAL_CHECKS if name not in by_name]
+    skipped = [name for name in UNCONDITIONAL_CHECKS if name in by_name and by_name[name].skipped]
+    if absent or skipped:
+        raise ProtocolError(
+            "validator report breaks the contract: required checks "
+            + "; ".join(
+                part
+                for part in (
+                    "missing: " + ", ".join(absent) if absent else "",
+                    "skipped: " + ", ".join(skipped) if skipped else "",
+                )
+                if part
+            ),
+            hint="the validator must run every unconditional check; fix the validator",
+            details={"missing": absent, "skipped": skipped},
+        )
     missing = [name for name in CHECK_NAMES if name not in names]
     extra = [name for name in names if name not in CHECK_NAMES]
     if missing:

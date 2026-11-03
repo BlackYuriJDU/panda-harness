@@ -114,6 +114,49 @@ def resolve_executable(value: str | Sequence[str]) -> str | None:
     return prefix[0] if prefix else None
 
 
+_SECRET_ENV_NAMES = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GEMINI_API_KEY",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GOOGLE_API_KEY",
+        "OPENAI_API_KEY",
+    }
+)
+_SECRET_ENV_PREFIXES = ("PANDA_", "OPENCODE_", "OPENROUTER_")
+_SECRET_ENV_SUFFIXES = (
+    "_KEY",
+    "_TOKEN",
+    "_SECRET",
+    "_PASSWORD",
+    "_PASSWD",
+    "_CREDENTIALS",
+)
+
+
+def scrubbed_env(*, keep_prefixes: tuple[str, ...] = ()) -> dict[str, str]:
+    """The environment a child process may inherit, without credentials.
+
+    Names that look like credentials are always removed. `keep_prefixes` only lifts
+    the blanket removal of an entire prefix (such as `PANDA_`, which holds settings,
+    not secrets); it never keeps a name that ends like a credential.
+    """
+
+    env: dict[str, str] = {}
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if upper in _SECRET_ENV_NAMES or upper.endswith(_SECRET_ENV_SUFFIXES):
+            continue
+        if upper.startswith(_SECRET_ENV_PREFIXES) and not upper.startswith(keep_prefixes):
+            continue
+        env[name] = value
+    return env
+
+
 DEFAULT_MAX_OUTPUT_BYTES = 4_000_000
 _POLL_SECONDS = 0.05
 

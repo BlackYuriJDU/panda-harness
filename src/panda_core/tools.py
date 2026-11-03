@@ -12,7 +12,6 @@ import asyncio
 import difflib
 import hashlib
 import json
-import os
 import re
 import sys
 import threading
@@ -24,7 +23,7 @@ from typing import Any
 from panda_core.atomic import atomic_write_bytes, atomic_write_text
 from panda_core.errors import ConfigError, PandaError
 from panda_core.policy import Decision, PolicyEngine
-from panda_core.process import run_command
+from panda_core.process import run_command, scrubbed_env
 from panda_core.provider import status_snapshot
 from panda_core.registry import find_study, load_registry, load_study_card, parse_frontmatter
 from panda_core.safe_read import ensure_plain_path
@@ -145,44 +144,10 @@ def _cap(text: str, limit: int) -> str:
     return text[:limit] + f"\n[truncated {len(text) - limit} chars]"
 
 
-_SECRET_ENV_NAMES = frozenset(
-    {
-        "ANTHROPIC_API_KEY",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GEMINI_API_KEY",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GOOGLE_API_KEY",
-        "OPENAI_API_KEY",
-    }
-)
-_SECRET_ENV_PREFIXES = ("PANDA_", "OPENCODE_", "OPENROUTER_")
-_SECRET_ENV_SUFFIXES = (
-    "_KEY",
-    "_TOKEN",
-    "_SECRET",
-    "_PASSWORD",
-    "_PASSWD",
-    "_CREDENTIALS",
-)
-
-
 def _scrubbed_env() -> dict[str, str]:
     """Child processes never inherit harness or provider credentials."""
 
-    env: dict[str, str] = {}
-    for name, value in os.environ.items():
-        upper = name.upper()
-        if upper in _SECRET_ENV_NAMES:
-            continue
-        if upper.startswith(_SECRET_ENV_PREFIXES):
-            continue
-        if upper.endswith(_SECRET_ENV_SUFFIXES):
-            continue
-        env[name] = value
-    return env
+    return scrubbed_env()
 
 
 def _line_ending(text: str) -> str:
