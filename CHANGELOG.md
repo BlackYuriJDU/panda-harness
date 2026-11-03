@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Legacy OpenCode export (LEG-001): the generated envelope no longer pre-approves
+  `git diff`, `git log`, `git show`, `git branch` or the validator script (the same prefix
+  hole as SEC-001); merging no longer lets a user's `ask` override a generated `deny`;
+  `launch_opencode` no longer passes the whole environment (credentials removed); and
+  `environment_status` reports `OPENCODE_API_KEY`, not the obsolete `OPENROUTER_API_KEY`.
+  The functions that have no caller remain, with their tests, and are listed for removal.
 - Git boot probe (TRUST-004): `git status` at startup ran whatever program `core.fsmonitor`
   in the corpus's `.git/config` named. The probe now forces `core.fsmonitor=false`.
 - Locks and writes (SEC-009): the POSIX `file_lock` could block forever (now a timeout, as on
@@ -20,6 +26,11 @@ All notable changes to this project are documented here. The format follows
   `logs/` is in `.panda/.gitignore`.
 - Dependency floor (DEP-001): the `mcp` extra is `>=1.30,<2`; older versions in the previous
   range carry published advisories (DNS rebinding, session binding, DoS).
+
+### Changed
+
+- Dead policy actions (DEAD-001) are now explicit: `ENFORCED_ACTIONS` and `PLANNED_ACTIONS`
+  in `panda_core.policy`, documented in the CONTRACT and guarded by tests.
 
 ### Fixed
 

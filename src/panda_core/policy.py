@@ -314,6 +314,26 @@ def default_policy() -> Policy:
     return Policy(rules=rules, default="ask")
 
 
+# Actions a tool or the agent really consults, and actions the default policy declares but
+# nothing consults yet. A rule for a planned action protects nothing today (DEAD-001): a
+# `release-publish` hard deny, for instance, guards a tool that does not exist.
+ENFORCED_ACTIONS = frozenset({"read", "write", "edit", "shell", "validate"})
+PLANNED_ACTIONS = frozenset(
+    {
+        "delete",
+        "git",
+        "network",
+        "webfetch",
+        "websearch",
+        "release",
+        "spend",
+        "tool",
+        "question",
+        "external_read",
+        "external_write",
+    }
+)
+
 _EFFECTS = frozenset({"allow", "ask", "deny", "hard_deny"})
 
 _CONTROL_PLANE_RULE = _rule(

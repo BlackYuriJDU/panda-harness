@@ -20,6 +20,7 @@ from panda_core.process import (
     command_version,
     resolve_command_prefix,
     resolve_executable,
+    scrubbed_env,
     split_command,
 )
 from panda_core.workspace import Workspace
@@ -120,12 +121,9 @@ def build_permissions() -> list[dict[str, str]]:
         {"action": "edit", "resource": "colaboracao/*", "effect": "ask"},
         # Shell: ask by default, allow read-only commands, deny destructive ones.
         {"action": "shell", "resource": "*", "effect": "ask"},
+        # Only `git status` is pre-approved: diff, log, show and branch can write with
+        # --output or read other files with rev:path, and a prefix rule cannot tell (LEG-001).
         {"action": "shell", "resource": "git status *", "effect": "allow"},
-        {"action": "shell", "resource": "git diff *", "effect": "allow"},
-        {"action": "shell", "resource": "git log *", "effect": "allow"},
-        {"action": "shell", "resource": "git show *", "effect": "allow"},
-        {"action": "shell", "resource": "git branch *", "effect": "allow"},
-        {"action": "shell", "resource": "node corpus/validation/validate.mjs *", "effect": "allow"},
         {"action": "shell", "resource": "panda validate *", "effect": "allow"},
         {"action": "shell", "resource": "git push *", "effect": "ask"},
         {"action": "shell", "resource": "git push *--force*", "effect": "deny"},
@@ -324,10 +322,21 @@ def merge_opencode_config(
     generated_rules = generated.get("permissions", [])
     combined = _unique_rules([*existing_rules, *generated_rules])
     # Never weaken a user's explicit restriction: re-append deny/ask rules last.
+    generated_denies = {
+        (rule.get("action"), rule.get("resource"))
+        for rule in generated_rules
+        if isinstance(rule, dict) and rule.get("effect") == "deny"
+    }
     restrictive = [
         rule
         for rule in existing_rules
-        if isinstance(rule, dict) and rule.get("effect") in {"deny", "ask"}
+        if isinstance(rule, dict)
+        and rule.get("effect") in {"deny", "ask"}
+        # An `ask` placed last would override a generated `deny` for the same pattern.
+        and not (
+            rule.get("effect") == "ask"
+            and (rule.get("action"), rule.get("resource")) in generated_denies
+        )
     ]
     merged["permissions"] = _unique_rules([*combined, *restrictive])
     if generated_rules:
@@ -466,7 +475,7 @@ def launch_opencode(
     resolved_command = list(command)
     if resolved_command[: len(binary)] == binary:
         resolved_command = [*prefix, *resolved_command[len(binary) :]]
-    env = os.environ.copy()
+    env = scrubbed_env(keep_prefixes=("PANDA_",))  # no provider or cloud credentials
     env.update(
         {
             "PANDA_ROOT": str(workspace.root),
@@ -520,7 +529,7 @@ def config_status(workspace: Workspace) -> dict[str, Any]:
 
 def environment_status() -> dict[str, bool]:
     return {
-        "OPENROUTER_API_KEY": bool(os.environ.get("OPENROUTER_API_KEY")),
+        "OPENCODE_API_KEY": bool(os.environ.get("OPENCODE_API_KEY")),
         "NO_COLOR": bool(os.environ.get("NO_COLOR")),
     }
 

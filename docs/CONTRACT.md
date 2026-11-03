@@ -428,6 +428,14 @@ and `git branch --list` with a closed set of flags and no `rev:path`, absolute o
 `git push origin fix-foo` is `ask`, no longer `hard_deny`. `node
 corpus/validation/validate.mjs` is no longer pre-approved: use the `validate` tool.
 
+**Enforced and planned actions.** Only `read`, `write`, `edit`, `shell` and `validate` are
+consulted by tools. The default policy still declares rules for `delete`, `git`, `network`,
+`webfetch`, `websearch`, `release`, `spend`, `tool`, `question`, `external_read` and
+`external_write`; they are **planned**: `panda policy check` answers them, but nothing
+enforces them yet, so for example the `release-publish` hard deny protects no tool today.
+The sets are `ENFORCED_ACTIONS` and `PLANNED_ACTIONS` in `panda_core.policy`, and a test
+fails if a declared action is in neither or if a planned action starts being consulted.
+
 **Built-in floor.** `.panda/policy.json` is workspace data and may be hostile, so
 the engine always adds a floor of `hard_deny` rules after loading it: every
 `hard_deny` of the built-in policy (secret and credential reads, force-push and

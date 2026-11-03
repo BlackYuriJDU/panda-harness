@@ -280,3 +280,141 @@ def test_the_mcp_floor_excludes_the_versions_with_advisories() -> None:
     match = re.search(r'"mcp>=(\d+)\.(\d+)(?:\.\d+)?,<2"', text)
     assert match, "the mcp extra must declare a floor and a ceiling"
     assert (int(match.group(1)), int(match.group(2))) >= (1, 30)
+
+
+# --------------------------------------------------------------------------- LEG-001
+def _last_rule(rules: list[dict], action: str, resource: str) -> dict | None:
+    import fnmatch
+
+    matched = None
+    for rule in rules:
+        if fnmatch.fnmatchcase(action, rule["action"]) and fnmatch.fnmatchcase(
+            resource, rule["resource"]
+        ):
+            matched = rule
+    return matched
+
+
+def test_the_legacy_envelope_no_longer_pre_approves_git_that_can_write_or_leak() -> None:
+    from panda_core.opencode import build_permissions
+
+    rules = build_permissions()
+    for command in (
+        "git diff --output=README.md",
+        "git show HEAD:.env",
+        "git log -p --output=x",
+        "git branch -D main",
+        "node corpus/validation/validate.mjs x",
+    ):
+        assert _last_rule(rules, "shell", command)["effect"] != "allow", command
+    assert _last_rule(rules, "shell", "git status --short")["effect"] == "allow"
+    assert _last_rule(rules, "shell", "git push origin main --force")["effect"] == "deny"
+
+
+def test_merging_never_turns_a_generated_deny_into_a_user_ask() -> None:
+    from panda_core.opencode import merge_opencode_config
+
+    deny = {"action": "read", "resource": "*.env", "effect": "deny"}
+    generated = {
+        "$schema": "x",
+        "model": "m",
+        "default_agent": "a",
+        "permissions": [{"action": "*", "resource": "*", "effect": "deny"}, deny],
+        "mcp": {"servers": {"panda": {"command": ["panda"]}}},
+        "agents": {"panda": {}},
+    }
+    existing = {"permissions": [{"action": "read", "resource": "*.env", "effect": "ask"}]}
+    merged, _, _ = merge_opencode_config(existing, generated)
+    assert _last_rule(merged["permissions"], "read", "prod.env")["effect"] == "deny"
+
+
+@POSIX
+def test_launch_opencode_does_not_pass_credentials(
+    workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from panda_core import opencode
+
+    seen: dict[str, str] = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(kwargs["env"])
+
+        class Done:
+            returncode = 0
+
+        return Done()
+
+    monkeypatch.setenv("OPENCODE_API_KEY", "SYNTH_SECRET_A")
+    monkeypatch.setenv("GITHUB_TOKEN", "SYNTH_SECRET_B")
+    monkeypatch.setattr("panda_core.opencode.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "panda_core.opencode.resolve_command_prefix", lambda binary: ["/bin/true"]
+    )
+    opencode.launch_opencode(
+        workspace, ["opencode", "run"], session_id="s_abcdef", session_path=tmp_path / "s.jsonl"
+    )
+    assert "OPENCODE_API_KEY" not in seen and "GITHUB_TOKEN" not in seen
+    assert seen["PANDA_SESSION_ID"] == "s_abcdef" and "PATH" in seen
+
+
+def test_the_legacy_status_names_the_current_key_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    from panda_core.opencode import environment_status
+
+    monkeypatch.setenv("OPENCODE_API_KEY", "x" * 12)
+    assert environment_status()["OPENCODE_API_KEY"] is True
+    assert "OPENROUTER_API_KEY" not in environment_status()
+
+
+# --------------------------------------------------------------------------- DEAD-001
+def test_every_declared_policy_action_is_enforced_or_marked_planned() -> None:
+    from panda_core.policy import ENFORCED_ACTIONS, PLANNED_ACTIONS, default_policy
+
+    declared = {action for rule in default_policy().rules for action in rule.actions}
+    undeclared = declared - ENFORCED_ACTIONS - PLANNED_ACTIONS
+    assert not undeclared, undeclared
+    assert not ENFORCED_ACTIONS & PLANNED_ACTIONS
+
+
+def test_the_enforced_actions_are_really_consulted_by_the_tools(
+    workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_w2b import approve_all, make_registry
+
+    from panda_core.policy import ENFORCED_ACTIONS, PolicyEngine
+
+    seen: set[str] = set()
+    real = PolicyEngine.decide
+    real_shell = PolicyEngine.decide_shell
+
+    def spy(self, action, resource):
+        seen.add(action)
+        return real(self, action, resource)
+
+    def spy_shell(self, argv, **kwargs):
+        seen.add("shell")
+        return real_shell(self, argv, **kwargs)
+
+    monkeypatch.setattr(PolicyEngine, "decide", spy)
+    monkeypatch.setattr(PolicyEngine, "decide_shell", spy_shell)
+    registry, _ = make_registry(workspace, approver=approve_all)
+    calls = [
+        ("read_file", {"path": "README.md"}),
+        ("write_file", {"path": "corpus/z.md", "content": "x"}),
+        ("edit_file", {"path": "corpus/z.md", "old_string": "x", "new_string": "y"}),
+        ("run_shell", {"argv": ["git", "status"]}),
+        ("validate", {}),
+    ]
+    for name, args in calls:
+        asyncio.run(registry.call(name, args))
+    assert seen >= ENFORCED_ACTIONS, ENFORCED_ACTIONS - seen
+
+
+def test_a_planned_action_has_no_tool_that_consults_it() -> None:
+    import re
+
+    from panda_core.policy import PLANNED_ACTIONS
+
+    source = Path(__file__).resolve().parents[2].joinpath("src/panda_core/tools.py")
+    text = source.read_text(encoding="utf-8")
+    consulted = set(re.findall(r'action="([a-z_]+)"', text))
+    assert not consulted & PLANNED_ACTIONS, consulted & PLANNED_ACTIONS
