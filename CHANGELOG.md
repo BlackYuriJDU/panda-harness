@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
+- Release pipeline (SUP-001): `release.yml` had `contents: write` for the whole workflow and
+  built and published without running the tests (the a4 release job was green on a commit
+  whose CI was red). It is now read-only by default and runs `test` -> `build` -> `publish`,
+  where only `publish` has `contents: write`, only for `v*` tags, and still as a draft. CI
+  gains a `pip-audit` job and `.github/dependabot.yml` proposes weekly updates for actions
+  and Python dependencies. Actions are still pinned by tag, not by commit SHA.
 - `--private` (PRIV-001): it hid the task but the model's prose, which often repeats it, was
   stored. The assistant's text is now stored as SHA-256 and length too. Tool arguments stay
   recorded, because they are the provenance; the CONTRACT now says exactly that.
