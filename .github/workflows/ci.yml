@@ -1,8 +1,8 @@
 name: CI
 
 on:
+  # Every branch: the hardening branches must run the Windows matrix before main.
   push:
-    branches: [main]
   pull_request:
     branches: [main]
 
