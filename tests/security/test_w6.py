@@ -251,3 +251,19 @@ def test_exclude_pathspecs_follow_the_read_policy() -> None:
     assert ":(top,exclude,icase)*.env" in specs
     assert ":(top,exclude,icase)*/.ssh/*" in specs
     assert all(spec.startswith(":(top,exclude,icase)") for spec in specs)
+
+
+# --------------------------------------------------------------------------- Windows CI (W6)
+def test_child_output_in_the_windows_code_page_is_not_mangled() -> None:
+    from panda_core.process import decode_output
+
+    # First Windows CI run of this branch: cp1252 output became U+FFFD.
+    assert decode_output("olá\n".encode("cp1252"), fallback="cp1252") == "olá\n"
+    assert decode_output("olá\n".encode("utf-8"), fallback="cp1252") == "olá\n"
+
+
+def test_a_utf8_sequence_cut_by_the_output_cap_only_loses_its_tail() -> None:
+    from panda_core.process import decode_output
+
+    data = "ab í".encode()[:-1]  # the cap cut the two-byte "í" in half
+    assert decode_output(data, fallback="cp1252") == "ab �"

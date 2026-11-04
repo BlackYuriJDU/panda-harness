@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import locale
 import os
 import re
 import shlex
@@ -203,6 +204,25 @@ def _kill_tree(process: subprocess.Popen[bytes]) -> None:
         process.kill()
 
 
+def decode_output(data: bytes, *, fallback: str | None = None) -> str:
+    """Decode a child's output: UTF-8 if it is UTF-8, else the system code page.
+
+    On Windows a child writing to a pipe uses the ANSI code page (cp1252), so
+    `olá` arrived as `ol\ufffd` (first run of the Windows CI on this branch).
+    A UTF-8 sequence cut by the output cap only loses its tail.
+    """
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.start >= len(data) - 3 and exc.reason == "unexpected end of data":
+            return data[: exc.start].decode("utf-8") + "\ufffd"
+        encoding = fallback or (locale.getpreferredencoding(False) if os.name == "nt" else None)
+        if encoding and encoding.lower().replace("-", "") not in {"utf8"}:
+            return data.decode(encoding, errors="replace")
+        return data.decode("utf-8", errors="replace")
+
+
 def run_command(
     command: Sequence[str],
     *,
@@ -284,7 +304,7 @@ def run_command(
                 stream.close()
 
     def text(buffer: bytearray) -> str:
-        return bytes(buffer).decode("utf-8", errors="replace").replace("\r\n", "\n")
+        return decode_output(bytes(buffer)).replace("\r\n", "\n")
 
     returncode = 124 if timed_out else 130 if cancelled else process.returncode
     return CommandResult(
