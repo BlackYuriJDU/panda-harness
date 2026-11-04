@@ -1,0 +1,634 @@
+# Trilha C — pontos cegos (Fase 3) + checklist Windows (Fase 6). Commit 704f387. Prosa em pt-BR.
+findings:
+  - id: "R2-300"
+    kind: new
+    title: "Descoberta de workspace sobe por todos os ancestrais sem checar dono: .panda/ plantado em /tmp ou C:\\ vira o workspace do usuário (classe CVE-2022-24765 do git)"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-300"
+    class: ["trust-boundary", "workspace-discovery", "prompt-injection-surface", "owasp:LLM01", "trifecta:untrusted_content", "windows"]
+    boundary: "B1"
+    preconditions: "Outra conta local consegue criar diretório num ancestral comum (C:\\ no Windows é gravável por usuários autenticados por padrão; /tmp no Linux). Usuário roda `panda`/`panda run`/`panda validate` num subdiretório sem .panda próprio."
+    locations:
+      - "src/panda_core/workspace.py:35-37@704f387"
+      - "src/panda_core/workspace.py:40-53@704f387"
+      - "src/panda_core/workspace.py:130-157@704f387"
+      - "src/panda_core/workspace.py:366-371@704f387"
+    claim: "find_workspace_root/Workspace.load aceitam o primeiro ancestral com .panda/config.json (ou corpus/validation/validate.mjs) sem comparar dono nem parar em fronteira de diretório pessoal; o instructions.md, a política e o validador de outra conta passam a valer."
+    evidence:
+      - {leg: A, method: static, detail: "_candidates() = [cwd, *cwd.parents] (workspace.py:35-37); load() retorna o primeiro candidate com config (:136-139) e, sem config, o primeiro com DEFAULT_VALIDATOR (:147-149). Nenhum os.stat().st_uid/ACL é consultado; safe_read só recusa symlink."}
+      - {leg: B, method: executed, command: "pytest poc/C/test_c_blindspots.py::test_ancestor_workspace_owned_by_other_user_is_not_adopted", output_excerpt: "AssertionError: workspace adopted from an ancestor owned by uid 4242 (root == .../shared)"}
+    falsification: "O threat model diz 'o usuário controla a máquina'; mas o corpus já é tratado como hostil e o git tratou exatamente este caso (C:\\.git) como vulnerabilidade. Testado com chown para uid 4242: adotado."
+    impact: "Injeção de prompt persistente (instructions.md do atacante no system prompt), ledger gravado em diretório do atacante (vazamento da conversa), e no fallback do validador o `validate` (allow sem aprovação) executa validate.mjs do atacante com node."
+    fix: {approach: "Parar a subida no primeiro diretório cujo dono difere do usuário atual (POSIX st_uid; Windows: dono via GetSecurityInfo ou recusar raiz de volume) e em $HOME; opcional PANDA_CEILING_DIRECTORIES como GIT_CEILING_DIRECTORIES.", sketch: "for c in candidates: if os.name!='nt' and c.stat().st_uid!=os.getuid(): break", risk: "baixo: workspaces legítimos pertencem ao usuário", rollback: "variável de ambiente para desligar a checagem"}
+    tests_to_add: ["tests/security/test_w0.py::test_ancestor_workspace_owned_by_other_user_is_not_adopted"]
+    related: ["TRUST-001", "TRUST-005", "R2-104"]
+  - id: "R2-301"
+    kind: new
+    title: "Cofre de credenciais: arquivo temporário nasce com o umask (0644) e só depois vira 0600; cofre existente com 0644 é aceito em silêncio"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-301"
+    class: ["secret-handling", "toctou", "owasp:LLM02"]
+    boundary: "B7"
+    preconditions: "Máquina multiusuário; diretório do cofre atravessável por outros (XDG_DATA_HOME/PANDA_CREDENTIALS_FILE em local compartilhado, ou ~ com 0755, comum em Linux)."
+    locations:
+      - "src/panda_core/atomic.py:86-101@704f387"
+      - "src/panda_core/credentials.py:69-110@704f387"
+      - "src/panda_core/credentials.py:117-127@704f387"
+    claim: "atomic_write_text abre o tmp com open(...,'w') (modo 0666&~umask), escreve e faz fsync da chave, e só então chama os.chmod(tmp, 0o600); _read_keys não verifica o modo do arquivo existente."
+    evidence:
+      - {leg: A, method: static, detail: "atomic.py:92-97: open(tmp,'w') -> write -> fsync -> chmod (suprimindo OSError). credentials.py:71 path.read_text sem stat."}
+      - {leg: B, method: executed, command: "pytest poc/C/test_c_blindspots.py -k credential_store", output_excerpt: "temp modes seen: ['0o644'] ; loose vault mode accepted silently (420 & 63)"}
+    falsification: "A janela é curta e o diretório pai costuma ser privado; mas um leitor pode abrir o fd durante a janela e mantê-lo. Medido: o conteúdo com a chave já está no disco em 0644 no fsync."
+    impact: "Chave do provedor legível por outra conta local durante a janela (ou para sempre, se o cofre foi copiado com 0644). Também vale para os arquivos de .panda/ e backups escritos pelo mesmo helper."
+    fix: {approach: "Criar o tmp com os.open(tmp, O_WRONLY|O_CREAT|O_EXCL, mode) e fdopen; criar o diretório do cofre com 0700; em _read_keys avisar/recusar se st_mode & 0o077 (POSIX).", sketch: "fd = os.open(tmp, os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,'O_BINARY',0), mode)", risk: "baixo", rollback: "reverter helper"}
+    tests_to_add: ["tests/test_credentials.py::test_credential_store_temp_file_is_never_world_readable", "tests/test_credentials.py::test_credential_store_existing_loose_permissions_are_refused"]
+    related: ["SEC-009"]
+  - id: "R2-302"
+    kind: new
+    title: "Leitores evidence/claim/number não têm limite de tamanho: arquivo inteiro vai para a memória e registro/frontmatter inteiro volta ao modelo e ao ledger"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-302"
+    class: ["resource-exhaustion", "context-flooding", "owasp:LLM01"]
+    boundary: "B1/B3"
+    preconditions: "Corpus hostil com corpus/evidence/evidence.jsonl, corpus/numbers.json ou corpus/claims/*.md grandes; ferramentas read-only, sem aprovação."
+    locations:
+      - "src/panda_core/tools.py:309-322@704f387"
+      - "src/panda_core/tools.py:325-346@704f387"
+      - "src/panda_core/tools.py:912-923@704f387"
+      - "src/panda_core/tools.py:925-948@704f387"
+      - "src/panda_core/tools.py:980-992@704f387"
+      - "src/panda_core/tools.py:1030-1041@704f387"
+    claim: "_read_jsonl/_numbers_records/_claim_records usam read_text() sem MAX_READ_BYTES (read_file e grep têm) e rodam síncronos no event loop; evidence_show/number_show devolvem o registro sem _cap e claim_show só corta o body (frontmatter integral)."
+    evidence:
+      - {leg: A, method: static, detail: "tools.py:313 path.read_text sem stat; :922 _ok(... 'evidence': record) sem _cap; :990 só payload['body'] é cortado; contraste com read_file :486-490 (MAX_READ_BYTES)."}
+      - {leg: B, method: executed, command: "pytest poc/C/test_c_blindspots.py -k 'evidence or claim'", output_excerpt: "evidence_show returned 600117 chars ; claim_show returned 300098 chars ; evidence_list parsed a file larger than MAX_READ_BYTES"}
+    falsification: "O output_limit do agente pode cortar depois; verificado que ToolResult.content sai do registry sem corte e o run_shell é o único que aplica output_limit."
+    impact: "DoS de memória/CPU do cockpit (event loop travado), estouro de contexto e custo de tokens; um registro gigante empurra a tarefa para fora da janela (AGT-002) e grava MBs no ledger por chamada."
+    fix: {approach: "Checar st_size <= MAX_READ_BYTES antes de ler, rodar em asyncio.to_thread e aplicar _cap(_json(record), output_limit) em *_show e nos campos de *_list.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/security/test_w1.py::test_evidence_show_output_is_bounded", "tests/security/test_w1.py::test_claim_frontmatter_output_is_bounded", "tests/security/test_w1.py::test_evidence_reader_refuses_oversized_file"]
+    related: ["R2-216", "AGT-002"]
+  - id: "REF-300"
+    kind: refuted
+    title: "Hipótese: FIFO no lugar de config.json/policy.json/instructions.md trava o boot em os.open (read_workspace_file sem O_NONBLOCK)"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_core/safe_read.py:74@704f387", "src/panda_core/workspace.py:138@704f387", "src/panda_core/policy.py:363@704f387", "src/panda_core/agent.py:160@704f387"]
+    claim: "Um FIFO trava o open() antes do S_ISREG."
+    evidence:
+      - {leg: A, method: static, detail: "Todos os chamadores filtram antes com Path.is_file() (FIFO -> False) ou is_symlink(); só uma troca concorrente entre is_file e open alcançaria o open bloqueante."}
+    falsification: "Resta a janela TOCTOU (exige processo concorrente). Sugestão de endurecimento: O_NONBLOCK no os.open de safe_read, custo zero."
+  - id: "REF-301"
+    kind: refuted
+    title: "Hipótese: em Python 3.12 o glob '**' segue links de diretório em laço e list_files/grep explodem exponencialmente"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_core/tools.py:349-363@704f387"]
+    claim: "sorted(root.glob(pattern)) é ansioso e segue symlink de diretório."
+    evidence:
+      - {leg: B, method: independent, command: "python3.12 e python3.13: sorted(Path('g').glob('corpus/**/*')) com dois links '..' em laço", output_excerpt: "3.12.3 paths 23 secs 0.0 ; 3.13.18 paths 23 secs 0.0"}
+    falsification: "Nem 3.12 nem 3.13 seguem links em '**'. O custo de varrer .git/node_modules antes do filtro IGNORED_DIRS continua (já em R2-216)."
+  - id: "R2-303"
+    kind: new
+    title: "config.instructions escolhe qualquer arquivo do workspace para o system prompt sem consultar a política de leitura: o piso read-secrets/read-credential-files não vale nesse canal (C-1)"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-303"
+    class: ["policy-bypass", "secret-handling", "owasp:LLM02", "owasp:LLM01", "trifecta:private_data"]
+    boundary: "B1"
+    preconditions: "Corpus hostil com .panda/config.json {\"instructions\": \".git/config\"} (ou outro arquivo sensível dentro do workspace); usuário apenas abre o cockpit ou roda `panda run`. Sem tool call, sem aprovação."
+    locations:
+      - "src/panda_core/config.py:205@704f387"
+      - "src/panda_core/config.py:216-219@704f387"
+      - "src/panda_core/workspace.py:196-197@704f387"
+      - "src/panda_core/agent.py:158-168@704f387"
+      - "src/panda_core/policy.py:162-176@704f387"
+    claim: "_relative_posix_path só proíbe caminho absoluto e '..'; _read_instructions lê o arquivo com read_workspace_file(redact=True) sem decide('read', ...). O único filtro é o redator, que não cobre token em URL (R2-217): .git/config com url https://user:token@host chega inteiro ao prompt enviado ao provedor."
+    evidence:
+      - {leg: A, method: static, detail: "agent.py:165 read_workspace_file(workspace.root, path, redact=True) — nenhum PolicyEngine no caminho; policy.py:166 lista .git/config como hard_deny para 'read'."}
+      - {leg: B, method: executed, command: "pytest poc/C/test_c_blindspots.py -k instructions_cannot_name", output_excerpt: "FAILED [.git/config] AssertionError: .git/config reached the system prompt ('https://bob:SYNTH_SECRET_GH_TOKEN_abc123@...'); PASSED [deploy/id_ed25519], PASSED [conf/secrets.yaml] (pegos só pelo redator)"}
+    falsification: "O destino é o provedor que o próprio usuário escolheu, não o atacante; mas o segredo passa a estar no contexto do modelo, que o corpus pode instruir a gravar em arquivo do corpus/commit (sem aprovação em corpus/*) — o piso existe justamente para que o modelo nunca o veja."
+    impact: "Token de git/credencial dentro do workspace entra no system prompt, no provedor e (se o modelo repetir) no ledger, contornando um hard_deny que o operador acredita ser inquebrável."
+    fix: {approach: "Antes de ler instructions, exigir engine.decide('read', relative).effect == 'allow' (piso incluso) e, melhor, restringir instructions a .panda/*.md ou corpus/**/*.md.", sketch: "if PolicyEngine(policy).decide('read', rel).effect != 'allow': return '(instructions refused by policy)'", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/security/test_w0.py::test_config_instructions_cannot_name_a_file_the_read_floor_denies"]
+    related: ["TRUST-005", "R2-217", "R2-108"]
+  - id: "R2-304"
+    kind: new
+    title: "Orçamento do agente vem do arquivo do corpus: provider.context_window=10M desliga o trim (36M chars), max_output_tokens=1M, max_retries=5, timeout 3600 s"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-304"
+    class: ["resource-exhaustion", "cost-amplification", "owasp:LLM10"]
+    boundary: "B1"
+    preconditions: "Corpus hostil com bloco provider no .panda/config.json (mesmo arquivo que o round 1 restringiu só em base_url/api_key_env)."
+    locations:
+      - "src/panda_core/config.py:82-87@704f387"
+      - "src/panda_core/agent.py:217@704f387"
+      - "src/panda_core/agent.py:317-319@704f387"
+      - "src/panda_core/provider.py:1319@704f387"
+      - "src/panda_core/provider.py:1151@704f387"
+    claim: "_enforce_provider_boundary cobre só destino da chave; limites de custo e de contexto (context_window até 10_000_000, max_output_tokens até 1_000_000, max_retries 5, timeout 3600) são aceitos do workspace e o AGT-002 (trim) passa a nunca disparar."
+    evidence:
+      - {leg: A, method: static, detail: "agent.py:319 budget = context_window*4*0.9; config.py:83 le=10_000_000; nenhum teto de usuário."}
+      - {leg: B, method: executed, command: "pytest poc/C/test_c_blindspots.py::test_workspace_config_cannot_disable_context_trim", output_excerpt: "AssertionError: trim budget 36000000 chars chosen by the corpus"}
+    falsification: "O provedor rejeita requisições maiores que a janela real (erro, não custo); mas até esse limite cada passo reenvia o histórico inteiro e pede 1M tokens de saída, e com 5 retries/3600 s um turno trava por horas."
+    impact: "Custo e latência controlados pelo corpus (ação planejada 'spend' sem consumidor); DoS do turno; AGT-002 anulado."
+    fix: {approach: "Tratar orçamento como escopo de usuário: o workspace só pode reduzir (min(user_default, workspace)); context_window efetivo = min(config, janela conhecida do modelo).", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/security/test_w0.py::test_workspace_config_cannot_disable_context_trim"]
+    related: ["TRUST-001", "AGT-002", "DEAD-001"]
+  - id: "R2-305"
+    kind: new
+    title: "`panda init` segue symlinks do corpus: cria arquivo fora do workspace (link pendente), com --force sobrescreve o alvo e copia o conteúdo dele para .panda/backups/ legível por read_file; merge do .gitignore anexa a arquivo externo"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-305"
+    class: ["symlink", "write-outside-workspace", "data-loss", "policy-bypass", "owasp:LLM02"]
+    boundary: "B1"
+    preconditions: "Corpus hostil com .panda/instructions.md (ou config.instructions) e/ou .panda/.gitignore como symlink; usuário roda `panda init` (o README manda) ou `panda init --force` (sugerido pelo hint do doctor para política inválida e pela recusa de symlink)."
+    locations:
+      - "src/panda_core/init.py:63-74@704f387"
+      - "src/panda_core/init.py:112-121@704f387"
+      - "src/panda_core/init.py:231-240@704f387"
+      - "src/panda_core/opencode.py:406-410@704f387"
+      - "src/panda_core/opencode.py:242-249@704f387"
+      - "src/panda_core/doctor.py:165@704f387"
+    claim: "init usa Path.is_file/read_text/write_text e shutil.copy2, que seguem symlink; nenhuma chamada a ensure_plain_path na escrita. TRUST-005 protegeu só a leitura."
+    evidence:
+      - {leg: A, method: static, detail: "opencode.py:409 path.write_text(README_INSTRUCTIONS) no caminho do link; init.py:73 copy2(path, destination) copia o ALVO; init.py:120 write_text no .gitignore; policy de leitura avalia o nome '.panda/backups/<stamp>/instructions.md' (read-default allow)."}
+      - {leg: B, method: executed, command: "pytest poc/C/test_c_blindspots.py -k init_ ; script ib/: initialize_workspace(force=True) + read_file", output_excerpt: "created a file outside the workspace ; init --force overwrote a file outside the workspace ('# Panda harness instructions') ; appended through .panda/.gitignore ; read_file .panda/backups/20261103T191334Z/instructions.md -> True '1  SYNTH_SECRET_X'"}
+    falsification: "O conteúdo escrito é fixo (texto de instruções, 4 linhas de gitignore), então não há execução de código; mas há perda de dados fora do workspace e o backup lava um segredo (qualquer arquivo do usuário) para um nome que o piso de leitura não reconhece."
+    impact: "Sobrescrita/criação de arquivos do usuário fora do corpus; exfiltração para o contexto do modelo via backup (read_file allow, sem aprovação)."
+    fix: {approach: "Na init, chamar ensure_plain_path(root, p) antes de ler/copiar/escrever qualquer arquivo de .panda/ e de config.instructions; escrever com atomic_write_* (os.replace troca o link, não o alvo); _backup com copy2(follow_symlinks=False) ou recusar link; .panda/backups/** como hard_deny de leitura no piso.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/security/test_w5.py::test_init_does_not_create_files_through_a_dangling_symlink", "tests/security/test_w5.py::test_init_force_does_not_overwrite_or_copy_a_symlink_target", "tests/security/test_w5.py::test_init_gitignore_merge_does_not_write_through_symlink"]
+    related: ["TRUST-005", "INIT-001", "R2-209"]
+  - id: "R2-306"
+    kind: new
+    title: "Tabelas do CLI (study list, policy show, validate, doctor, session show/list, models) passam str do corpus/ledger/provedor ao Rich como markup: [link=...] vira hiperlink OSC 8 invisível e '[/]' derruba o comando"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-306"
+    class: ["terminal-injection", "markup-injection", "owasp:LLM05"]
+    boundary: "B1/B5 -> B6"
+    preconditions: "Texto controlado pelo corpus (INDEX.md, policy.json, relatório do validador, ledger versionado em .panda/sessions) ou pelo provedor (ids de /v1/models) exibido por comandos do CLI."
+    locations:
+      - "src/panda_cli/render.py:93@704f387"
+      - "src/panda_cli/render.py:120@704f387"
+      - "src/panda_cli/render.py:154-160@704f387"
+      - "src/panda_cli/render.py:208@704f387"
+      - "src/panda_cli/render.py:221-227@704f387"
+      - "src/panda_cli/render.py:245-250@704f387"
+      - "src/panda_cli/render.py:271@704f387"
+      - "src/panda_cli/render.py:448-453@704f387"
+    claim: "Table.add_row recebe str e o Rich renderiza células str com console markup ligado (render.console() não passa markup=False); só os campos embrulhados em Text() ficam literais. APR-003 corrigiu o modal do REPL, não estas rotas."
+    evidence:
+      - {leg: A, method: static, detail: "render.py:25-26 Console(highlight=False, emoji=False) sem markup=False; :271 table.add_row(study.id, ..., study.license[:40], study.question[:60]) com str; :221 rules_table usa rule.id/actions/resources do policy.json do corpus."}
+      - {leg: B, method: executed, command: "pytest poc/C/test_c_blindspots.py -k markup", output_excerpt: "corpus text became an OSC 8 hyperlink (']8;id=...;https://evil.invalid/x\\\\see protocol') ; rules_table: MarkupError (crash)"}
+    falsification: "R2-122/R2-223 já cobrem ESC cru nessas rotas; aqui o vetor é diferente (markup Rich, não bytes de controle): sanitize_display não remove '[' e não resolveria."
+    impact: "Hiperlink enganoso no terminal do operador (texto 'see protocol' apontando para URL do atacante); negação de `panda policy show`/`study list` com um colchete; estilo que esconde texto (cor igual ao fundo)."
+    fix: {approach: "Console(markup=False) em render.console() e em print_error, ou envolver toda célula em Text(sanitize_display(str(v))).", risk: "baixo (verificar strings internas que usam markup)", rollback: "reverter"}
+    tests_to_add: ["tests/test_cli.py::test_study_table_does_not_interpret_corpus_text_as_rich_markup", "tests/test_cli.py::test_rules_table_survives_markup_in_a_workspace_rule"]
+    related: ["APR-003", "UI-002", "R2-122", "R2-223", "R2-221"]
+  - id: "R2-307"
+    kind: variant
+    title: "Crash log do cockpit segue symlink do corpus (.panda/logs/cockpit.log) e o fallback em /tmp abre arquivo pré-criado por outro usuário (O_CREAT sem O_EXCL/O_NOFOLLOW)"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-305"
+    class: ["symlink", "write-outside-workspace", "secret-handling", "owasp:LLM02"]
+    boundary: "B1/B7"
+    preconditions: "Corpus com .panda/logs/cockpit.log -> arquivo do usuário; qualquer exceção de UI (um config inválido do próprio corpus dispara 'setup'). Fallback: diretório do workspace não gravável e /tmp/panda-cockpit.log pré-criado 0666 por outra conta."
+    locations:
+      - "src/panda_cli/cockpit.py:796-817@704f387"
+    claim: "_write_crash_log abre com os.open(path, O_WRONLY|O_APPEND|O_CREAT, 0o600): segue symlink e não garante dono/modo de arquivo existente; o 0600 só vale na criação."
+    evidence:
+      - {leg: A, method: static, detail: "cockpit.py:811 sem O_NOFOLLOW/O_EXCL; :797 TEMP/TMP ou tempfile.gettempdir() (/tmp compartilhado em Linux)."}
+      - {leg: B, method: executed, command: "pytest poc/C/test_c_blindspots.py::test_cockpit_crash_log_does_not_follow_a_corpus_symlink", output_excerpt: "crash log appended to a file outside the workspace ('+ [2026-11-03T19:15:21+0000] setup: RuntimeError: SYNTH_SECRET_TRACE line')"}
+    falsification: "O texto é redigido e começa com '[timestamp]'; não achei forma de injetar uma linha de shell válida. Impacto fica em integridade de arquivo externo e vazamento de traceback para local escolhido pelo atacante."
+    impact: "Anexa tracebacks (caminhos, mensagens com dados do corpus, eventuais segredos não pegos pelo redator) em arquivo arbitrário do usuário ou em arquivo legível por outra conta."
+    fix: {approach: "ensure_plain_path antes; os.open com O_NOFOLLOW e, no /tmp, diretório privado (tempfile.mkdtemp ou ~/.cache/panda) ou O_EXCL + checagem de st_uid.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/security/test_w5.py::test_cockpit_crash_log_does_not_follow_a_corpus_symlink"]
+    related: ["PRIV-002", "R2-305"]
+  - id: "R2-308"
+    kind: new
+    title: "file_lock abre o lockfile com open('a+b') seguindo symlink e grava um byte NUL no alvo se ele estiver vazio"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-305"
+    class: ["symlink", "write-outside-workspace"]
+    boundary: "B1"
+    preconditions: "Corpus envia .panda/sessions/<id>.lock como link para arquivo vazio do usuário e o operador roda um comando que trava aquela sessão (recover/close/append)."
+    locations: ["src/panda_core/atomic.py:29-34@704f387", "src/panda_core/session.py:166@704f387"]
+    claim: "open(path, 'a+b') segue o link e handle.write(b'\\0') quando tell()==0."
+    evidence:
+      - {leg: A, method: static, detail: "atomic.py:30-33; lock_path = path.with_suffix('.lock') dentro de .panda/sessions (gravável pelo corpus)."}
+      - {leg: B, method: executed, command: "file_lock(Path('fl/ws/.panda/sessions/s1.lock')) com link para fl/home/empty.cfg", output_excerpt: "b'\\x00'"}
+    falsification: "Só afeta arquivo vazio e grava 1 byte; impacto baixo, mas é escrita fora do workspace."
+    impact: "Corrompe arquivo vazio externo (ex.: marcador/config vazio)."
+    fix: {approach: "os.open(path, O_RDWR|O_CREAT|O_NOFOLLOW, 0o600) e recusar não-regular.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_session.py::test_file_lock_does_not_follow_symlink"]
+    related: ["R2-305", "SEC-009"]
+  - id: "R2-309"
+    kind: new
+    title: "_backup do export OpenCode não tem contador: dois `panda init --opencode` no mesmo segundo sobrescrevem o backup do original"
+    severity: P4
+    confidence: medium
+    status: probable
+    evidence_level: E1
+    root_cause: "RC-309"
+    class: ["data-loss", "dead-code-drift"]
+    boundary: "n/a"
+    preconditions: "Execuções repetidas em < 1 s (scripts/CI)."
+    locations: ["src/panda_core/opencode.py:242-249@704f387", "src/panda_core/init.py:63-74@704f387"]
+    claim: "init._backup ganhou contador (INIT-001); a cópia duplicada em opencode._backup não, e shutil.copy2 sobrescreve o destino."
+    evidence:
+      - {leg: A, method: static, detail: "opencode.py:246 destination = backups_dir/stamp/path.name sem laço de colisão; init.py:68-71 tem o laço."}
+    falsification: "Não executado; janela de 1 s torna raro."
+    impact: "Perda do backup do opencode.json original do usuário."
+    fix: {approach: "Remover a duplicata e reutilizar init._backup.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_opencode.py::test_backup_does_not_overwrite_same_second"]
+    related: ["LEG-001", "INIT-001"]
+  - id: "R2-310"
+    kind: new
+    title: "Lista de modelos do provedor (B5) não é validada: id com ESC/OSC chega ao terminal em `panda models`//models; 'created: Infinity' derruba `panda models` com traceback (fora do contrato de exit codes)"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-310"
+    class: ["terminal-injection", "fail-open-error-handling", "exit-code-contract"]
+    boundary: "B5 -> B6"
+    preconditions: "Resposta de /v1/models adulterada (provedor comprometido, proxy TLS corporativo, ou base_url loopback de teste)."
+    locations: ["src/panda_core/provider.py:1198-1217@704f387", "src/panda_cli/main.py:780-795@704f387", "src/panda_cli/main.py:61-82@704f387", "src/panda_cli/render.py:448-453@704f387", "src/panda_cli/cockpit.py:1057-1066@704f387"]
+    claim: "model_id = str(item.get('id')) sem regex; int(created) para float inf levanta OverflowError, que nem _collect_models (só PandaError) nem @handle (PandaError/OSError/KeyboardInterrupt) tratam."
+    evidence:
+      - {leg: A, method: static, detail: "provider.py:1205 e :1213; main.py:791 except PandaError; handle() main.py:66-79."}
+      - {leg: B, method: executed, command: "s310.py: OpenCodeProvider(client=MockTransport).list_models()", output_excerpt: "esc: ok ['evil\\x1b]8;;https://x.invalid\\x07m'] ; inf: raised OverflowError cannot convert float infinity to integer"}
+    falsification: "Exige resposta adulterada do provedor (B5 confiável por TLS); por isso P4."
+    impact: "Hiperlink/sequência de terminal vinda da rede; crash com traceback em vez de exit 4."
+    fix: {approach: "Validar id com ^[A-Za-z0-9._:/-]{1,128}$, descartar o resto; created só se int finito; @handle com except Exception -> exit 6.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_provider.py::test_list_models_drops_ids_with_control_characters", "tests/test_cli.py::test_models_survives_infinite_created"]
+    related: ["R2-221", "R2-306", "UI-002"]
+  - id: "R2-311"
+    kind: new
+    title: "Cockpit re-renderiza RichMarkdown do buffer inteiro a cada delta (≥60 ms): custo quadrático em respostas longas congela a UI"
+    severity: P4
+    confidence: medium
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-311"
+    class: ["resource-exhaustion", "ui-dos"]
+    boundary: "B5 -> B6"
+    preconditions: "Resposta longa do modelo (centenas de KB), induzível por prompt injection ('repita o arquivo X')."
+    locations: ["src/panda_cli/cockpit.py:867-875@704f387", "src/panda_cli/cockpit.py:959-964@704f387"]
+    claim: "Cada text_delta após 60 ms constrói RichMarkdown(''.join(buffer)) do zero."
+    evidence:
+      - {leg: A, method: static, detail: "cockpit.py:873-875 update(RichMarkdown(''.join(self._assistant_buffer)))."}
+      - {leg: B, method: independent, command: "s311.py: Console.print(Markdown(text)) 20k/80k/320k chars", output_excerpt: "20000 chars 0.023 s ; 80000 chars 0.084 s ; 320000 chars 0.251 s (por render; um stream de 1 MB faz centenas de renders)"}
+    falsification: "Textual pode coalescer updates; mesmo assim cada render é O(n) no event loop."
+    impact: "Cockpit sem resposta (Ctrl+C atrasado) durante saídas longas."
+    fix: {approach: "Renderizar markdown só no final ou por blocos fechados; durante o stream, Text simples do último trecho.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_cockpit.py::test_streaming_render_is_incremental"]
+    related: ["R2-221"]
+  - id: "R2-312"
+    kind: new
+    title: "Encerramento grava session.end com status 'completed' mesmo após cancelamento/erro e ChatRuntime.close engole qualquer exceção do ledger"
+    severity: P4
+    confidence: high
+    status: probable
+    evidence_level: E1
+    root_cause: "RC-312"
+    class: ["fail-open-error-handling", "ledger-accuracy"]
+    boundary: "n/a"
+    preconditions: "Operador sai do cockpit (Ctrl+Q) depois de um turno cancelado/bloqueado, ou com o ledger falhando."
+    locations: ["src/panda_cli/cockpit.py:1206-1214@704f387", "src/panda_cli/runtime.py:252-258@704f387"]
+    claim: "action_quit_app/on_unmount chamam runtime.close('completed') incondicionalmente; close faz contextlib.suppress(Exception) em session.close."
+    evidence:
+      - {leg: A, method: static, detail: "cockpit.py:1208 e :1214 status fixo; runtime.py:257 suppress(Exception)."}
+    falsification: "O ledger mantém turn.end com o status real; o session.end é só resumo. Não executado."
+    impact: "Resumo de sessão enganoso; falha de fechamento sem aviso (C-3 pede que falha do ledger seja visível)."
+    fix: {approach: "Passar o status do último turno (cancelled/error) e registrar/avisar a falha de close (crash log + mensagem).", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_cockpit.py::test_quit_after_cancel_records_cancelled"]
+    related: ["PROV-001", "AGT-004"]
+  - id: "R2-313"
+    kind: new
+    title: "panda_cli é pacote de namespace (sem __init__.py): `python -m panda_cli` num corpus que traga panda_cli/entry.py executa o código do corpus; a 'isolação do cwd' do entry.py chega tarde"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-313"
+    class: ["code-execution", "supply-chain", "import-hijack", "trust-boundary"]
+    boundary: "B1"
+    preconditions: "Alguém executa `python -m panda_cli ...` com cwd dentro do corpus: o fallback default_panda_command() (sem `panda` no PATH) grava esse comando no MCP do opencode.json legado, e o cliente MCP o lança no diretório do projeto; também testes/fixtures e usuários que seguem __main__.py."
+    locations:
+      - "src/panda_cli/__main__.py:1-6@704f387"
+      - "src/panda_cli/entry.py:1-8@704f387"
+      - "src/panda_cli/entry.py:85-98@704f387"
+      - "src/panda_core/opencode.py:87-93@704f387"
+      - "pyproject.toml:[tool.mypy] namespace_packages@704f387"
+    claim: "Sem src/panda_cli/__init__.py, o diretório panda_cli/ do cwd vira a primeira porção do namespace (sys.path[0] = cwd em -m), então panda_cli.entry é importado do corpus antes de _sanitize_sys_path rodar."
+    evidence:
+      - {leg: A, method: static, detail: "git ls-files não lista src/panda_cli/__init__.py; __main__.py faz 'from panda_cli.entry import main' — resolvido via _NamespacePath na ordem de sys.path."}
+      - {leg: B, method: executed, command: "cd hj (contém só panda_cli/entry.py) && python -m panda_cli --version", output_excerpt: "HIJACKED_FROM_CORPUS_CWD ; panda_cli.__path__ = _NamespacePath(['/tmp/claude-0/trackC/hj/panda_cli', '/home/user/panda-audit-src/src/panda_cli'])"}
+    falsification: "`python -m X` com cwd hostil é inseguro para qualquer pacote se o corpus trouxer X/__init__.py; aqui basta um arquivo parcial e o projeto afirma isolamento. O console script `panda` não é afetado (sys.path[0] = bin/)."
+    impact: "Execução de código do corpus ao iniciar o servidor MCP via o comando gerado pelo próprio Panda (fallback), sem aprovação."
+    fix: {approach: "Adicionar src/panda_cli/__init__.py (pacote regular vence porções de namespace) e usar [sys.executable, '-P', '-m', 'panda_cli'] (ou -I) no default_panda_command; documentar só o console script.", risk: "baixo (verificar mypy namespace_packages)", rollback: "reverter"}
+    tests_to_add: ["tests/test_entry.py::test_python_dash_m_ignores_panda_cli_portion_in_cwd"]
+    related: ["LEG-001", "TRUST-002"]
+  - id: "REF-302"
+    kind: refuted
+    title: "Hipótese: usage/custo malformado do provedor (string, NaN) derruba o turno do cockpit via mascot/_metrics_text"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_core/agent.py:243-247@704f387", "src/panda_core/provider.py:157-206@704f387", "src/panda_cli/mascot.py:393-397@704f387"]
+    claim: "int()/format de valores do provedor no callback quebra o turno."
+    evidence:
+      - {leg: A, method: static, detail: "Agent._emit envolve o callback em contextlib.suppress(Exception); usage é normalizado em provider.py (_cost_value); clamped() trata NaN via min/max."}
+    falsification: "O suppress torna erros de UI silenciosos (nem crash log): observabilidade, não segurança."
+  - id: "R2-314"
+    kind: new
+    title: "sdist inclui tests/ mas não fixtures/: a suíte rodada a partir do sdist falha (9 testes de schema)"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-314"
+    class: ["packaging", "supply-chain"]
+    boundary: "B8"
+    preconditions: "Distribuidor/empacotador (conda-forge, Debian) roda os testes do sdist."
+    locations: ["pyproject.toml:[tool.hatch.build.targets.sdist] include@704f387", "tests/test_schemas.py:11-13@704f387"]
+    claim: "A lista include do sdist tem /tests e /schemas mas não /fixtures, de onde test_schemas.py lê os casos válidos/inválidos."
+    evidence:
+      - {leg: A, method: static, detail: "include = [/src,/schemas,/docs,/assets,/tools,/.github,/tests,...] sem /fixtures; FIXTURES = ROOT/'fixtures'/'schemas'."}
+      - {leg: B, method: executed, command: "python -m build (cópia em /tmp/claude-0/trackC/src-copy); tar xzf sdist; pytest tests/test_schemas.py tests/test_assets.py", output_excerpt: "comm git-vs-sdist: 8 arquivos fixtures/schemas/* ausentes ; 9 failed, 27 passed"}
+    falsification: "Wheel não é afetado; sem stray files (__pycache__/.mypy_cache ficaram fora porque o .gitignore é respeitado)."
+    impact: "Verificação a jusante do pacote publicado falha; reduz a confiança no artefato."
+    fix: {approach: "Adicionar \"/fixtures\" ao include do sdist e um job de CI que extrai o sdist e roda pytest.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_workflows.py::test_sdist_contains_every_path_tests_read"]
+    related: ["SUP-001"]
+  - id: "R2-315"
+    kind: new
+    title: "Schemas públicos não são amarrados ao produtor: nenhum teste valida linhas reais do ledger contra panda.session.event.v1; 'format: date-time' não é checado; três schemas (fanout, harness.proposal, metric) não têm produtor no código"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-315"
+    class: ["tests-as-spec", "contract-drift"]
+    boundary: "n/a"
+    preconditions: "Mudança futura no formato do evento."
+    locations: ["tests/test_schemas.py:15-58@704f387", "schemas/panda.session.event.v1.schema.json:12@704f387", "src/panda_core/session.py:344-366@704f387"]
+    claim: "test_schemas só compara schemas com fixtures escritas à mão; Draft202012Validator sem FormatChecker aceita ts='not-a-date'; grep por fanout/harness.proposal/panda.metric em src/ não acha produtor."
+    evidence:
+      - {leg: A, method: static, detail: "único uso de jsonschema é tests/test_schemas.py; nenhum em src/ ou em test_session.py."}
+      - {leg: B, method: independent, command: "SessionLog.create + append + close; validar cada linha com e sem FormatChecker", output_excerpt: "session.start/note/session.end: [] (conformes hoje) ; default validator accepts bad ts: True"}
+    falsification: "Hoje o produtor está conforme; o achado é sobre o teste não proteger a regra 'schemas mudam só por emenda de contrato'."
+    impact: "Drift silencioso entre ledger e schema publicado; schemas mortos sugerem funcionalidade inexistente."
+    fix: {approach: "Teste que gera um ledger real (todos os 23 tipos) e valida com format_checker; marcar os 3 schemas sem produtor como 'planned' no CONTRACT.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_schemas.py::test_real_ledger_lines_match_event_schema"]
+    related: ["DOC-001", "DEAD-001"]
+  - id: "R2-316"
+    kind: new
+    title: "Testes de isolamento do cwd (test_module_entry_survives_shadowing_cwd / console_script) são vazios: usam --version, que retorna antes de importar typer; o mutante sem _sanitize_sys_path passa"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-316"
+    class: ["vacuous-test", "tests-as-spec"]
+    boundary: "n/a"
+    preconditions: "n/a"
+    locations: ["tests/test_entry.py:84-117@704f387", "src/panda_cli/entry.py:85-98@704f387"]
+    claim: "main() trata --version sem importar typer/pydantic; os shadows typer.py/pydantic.py do teste nunca são importados, então o teste não exercita _sanitize_sys_path."
+    evidence:
+      - {leg: A, method: static, detail: "entry.py:88-92 retorna antes de 'from panda_cli.main import main'."}
+      - {leg: B, method: executed, command: "mutante em /tmp/claude-0/trackC/src-copy (sanitize removido) + PYTHONPATH; python -m panda_cli --version | version, cwd com typer.py hostil", output_excerpt: "--version -> 'panda 0.2.0a5' (passa) ; version -> 'RuntimeError: shadowed typer' (o teste não vê)"}
+    falsification: "test_sanitize_sys_path_drops_cwd_and_empty testa a função isolada; falta o teste ponta a ponta com subcomando real."
+    impact: "Regressão do isolamento passaria no CI; também não cobre R2-313 (porção de namespace)."
+    fix: {approach: "Rodar `python -m panda_cli version` e `panda version` no diretório com shadows + um panda_cli/entry.py hostil.", risk: "baixo", rollback: "n/a"}
+    tests_to_add: ["tests/test_entry.py::test_module_entry_survives_shadowing_cwd_for_a_subcommand"]
+    related: ["R2-313"]
+  - id: "R2-317"
+    kind: variant
+    title: "Windows: classificador normaliza só .exe/.cmd/.bat; 'git.exe.', 'git.exe ', 'GIT~1.EXE', 'git.exe::$DATA', 'git.com' rebaixam push --force/reset --hard/clean -fdx (e rm.exe. -rf) de hard_deny para ask"
+    severity: P2
+    confidence: medium
+    status: probable
+    evidence_level: E2
+    root_cause: "RC-317"
+    class: ["policy-bypass", "windows", "owasp:LLM06"]
+    boundary: "B2"
+    preconditions: "Windows; modelo steered escolhe argv[0] com ponto/espaço final, nome 8.3, ::$DATA ou .com; o pedido vira 'ask' (com --auto, aprovado — ver R2-500; sem --auto, a prévia mostra 'git.exe. push --force')."
+    locations: ["src/panda_core/shell_policy.py:60-65@704f387", "src/panda_core/policy.py:442-472@704f387", "src/panda_core/process.py:231-239@704f387"]
+    claim: "_program faz basename+lower e tira só .exe/.cmd/.bat; o Win32 (CreateProcess/RtlDosPathNameToNtPathName) remove pontos e espaços finais e aceita nomes curtos 8.3, então o mesmo git.exe roda com um nome que o classificador não reconhece."
+    evidence:
+      - {leg: A, method: static, detail: "shell_policy.py:61-64; argv[0] vai cru para subprocess.Popen (process.py:231) -> CreateProcess."}
+      - {leg: B, method: independent, command: "PolicyEngine(default_policy()).decide_shell([a0,'push','--force']) para a0 em git.exe./git.exe /GIT~1.EXE/git.exe::$DATA/git.com/C:/Program Files/Git/cmd/git.exe.", output_excerpt: "todos -> ask ; controles: git.exe, GIT.EXE, git.bat, C:\\\\PROGRA~1\\\\Git\\\\cmd\\\\git.exe -> hard_deny ; rm.exe. -rf corpus -> ask"}
+    falsification: "Não executado no Windows: falta confirmar que CreateProcess('git.exe.') e ('GIT~1.EXE') executam o git (esperado pelas regras de normalização Win32 [memory: unverified]). REF-201 testou git.exe/GIT/caminho, não estas grafias."
+    impact: "Força/limpeza destrutiva deixa de ser hard_deny no Windows (C-5); com --auto, sem humano."
+    fix: {approach: "Em _program: rstrip('. '), cortar ':'/'::$DATA', tratar .com, e resolver argv[0] com shutil.which (com PATH sem cwd) + os.path.realpath/GetLongPathName antes de classificar; classificar pelo basename do executável resolvido.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/security/test_w1.py::test_windows_program_spellings_keep_hard_deny"]
+    related: ["SEC-001", "SEC-007", "REF-201", "R2-202", "R2-500"]
+  - id: "R2-318"
+    kind: variant
+    title: "Windows: node do doctor/validate é resolvido por shutil.which, que busca o cwd primeiro e aceita .cmd/.bat (PATHEXT); o shim .cmd do corpus é expandido para um .exe do corpus (TRUST-002 no Windows)"
+    severity: P2
+    confidence: medium
+    status: probable
+    evidence_level: E2
+    root_cause: "RC-214"
+    class: ["code-execution", "windows", "trust-boundary"]
+    boundary: "B1"
+    preconditions: "Windows, cwd do processo = raiz do corpus (uso normal), NoDefaultCurrentDirectoryInExePath não definido (padrão); corpus traz node.cmd (ou node.exe/node.bat) com \"%dp0%\\payload.exe\". `panda doctor` (ou validate) roda."
+    locations: ["src/panda_core/process.py:57-109@704f387", "src/panda_core/process.py:316-326@704f387", "src/panda_core/doctor.py:127-134@704f387", "src/panda_core/workspace.py:331@704f387", "/usr/lib/python3.12/shutil.py:1515-1571 (stdlib)"]
+    claim: "resolve_command_prefix usa shutil.which(candidate); no win32 o stdlib insere os.curdir no início do PATH quando NeedCurrentDirectoryForExePathW é verdadeiro e testa PATHEXT (.BAT/.CMD); _expand_windows_shim então lê o .cmd do corpus e devolve o .exe que ele cita."
+    evidence:
+      - {leg: A, method: static, detail: "process.py:98 shutil.which; :76-87 regex '\"([^\"]+\\.exe)\"' e substituição de %dp0%; stdlib shutil.py:1567-1571 path.insert(0, curdir)."}
+      - {leg: B, method: independent, command: "sys.platform='win32', _win_path_needs_curdir=True (padrão Windows), PATH=../bin com node.exe, cwd com node.cmd + payload.exe; resolve_command_prefix(['node'])", output_excerpt: "shutil.which('node') -> ./node.cmd ; resolve_command_prefix('node') -> ['payload.exe']"}
+    falsification: "Emulado em Linux (FS sensível a caixa exigiu PATHEXT minúsculo e '/' no shim). O validate já executa código do corpus por definição; o ganho do atacante está no doctor (prometido como 'só o node roda') e na sonda de versão. A correção sugerida em R2-214 (usar shutil.which) não resolve sem remover o cwd."
+    impact: "Executável do corpus roda em `panda doctor` sem aprovação no Windows."
+    fix: {approach: "Passar path= explícito a shutil.which (PATH do ambiente sem '.' e sem entradas relativas) ou definir NoDefaultCurrentDirectoryInExePath=1 no processo; recusar resolução dentro do workspace; não expandir shims fora de diretórios do PATH.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_process.py::test_windows_which_never_resolves_inside_the_workspace"]
+    related: ["R2-214", "TRUST-002", "WIN-001"]
+  - id: "R2-319"
+    kind: new
+    title: "Windows: os.open sem O_BINARY abre em modo texto do CRT: ledger grava CRLF e read_workspace_file para no primeiro Ctrl-Z (0x1A)"
+    severity: P4
+    confidence: low
+    status: hypothesis
+    evidence_level: E1
+    root_cause: "RC-319"
+    class: ["windows", "platform-difference"]
+    boundary: "B1"
+    preconditions: "Windows."
+    locations: ["src/panda_core/session.py:366-372@704f387", "src/panda_core/safe_read.py:74-82@704f387", "src/panda_cli/cockpit.py:811-813@704f387"]
+    claim: "CPython os.open não acrescenta O_BINARY (io.FileIO acrescenta), então no Windows o descritor herda o modo texto padrão (_fmode=_O_TEXT): os.write traduz LF->CRLF e os.read trata 0x1A como EOF [memory: unverified]."
+    evidence:
+      - {leg: A, method: static, detail: "session.py:367 flags = O_APPEND|O_CREAT|O_WRONLY; safe_read.py:74 O_RDONLY|_NO_FOLLOW; nenhum getattr(os,'O_BINARY',0) no código (grep)."}
+    falsification: "Se o Windows de 231e48f passou nos testes, CRLF no ledger é tolerado (json.loads aceita \\r). A truncagem em 0x1A afeta só divergência Linux/Windows (policy.json truncado falha fechado). Rodar no Windows para confirmar."
+    impact: "Bytes do ledger diferem entre plataformas; config/instructions lidos parcialmente no Windows."
+    fix: {approach: "flags |= getattr(os, 'O_BINARY', 0) em todos os os.open.", risk: "baixo", rollback: "reverter"}
+    tests_to_add: ["tests/test_session.py::test_ledger_lines_end_with_lf_on_every_platform", "tests/test_config.py::test_ctrl_z_does_not_truncate_workspace_file"]
+    related: ["WIN-001"]
+  - id: "R2-320"
+    kind: new
+    title: "Windows: _kill_tree roda taskkill /T depois que o comando já saiu: a árvore não é encontrada e netos deixados para trás sobrevivem (contrato diz que são parados)"
+    severity: P3
+    confidence: low
+    status: hypothesis
+    evidence_level: E1
+    root_cause: "RC-212"
+    class: ["windows", "process-containment"]
+    boundary: "B2"
+    preconditions: "Windows; comando aprovado que inicia filho em segundo plano e sai (ex.: `cmd /c start /b ...`, launcher que retorna)."
+    locations: ["src/panda_core/process.py:181-199@704f387", "src/panda_core/process.py:216-222@704f387", "src/panda_core/process.py:277@704f387"]
+    claim: "No caminho normal, process.wait() já retornou quando _kill_tree chama taskkill /PID <pid> /T /F; um processo terminado não aparece no snapshot de processos, então /T não acha os filhos (o Windows não re-parenta órfãos) [memory: unverified]. CREATE_NEW_PROCESS_GROUP não confina; não há Job Object."
+    evidence:
+      - {leg: A, method: static, detail: "process.py:263-277 sai do laço quando o processo termina e só então chama _kill_tree; docstring de run_command (:220-221) promete 'Children left behind by a command that exited normally are stopped too'."}
+    falsification: "No POSIX o killpg funciona após a saída do líder (R2-107/R2-212 tratam setsid). Precisa de execução no Windows."
+    impact: "Processo em segundo plano sobrevive ao turno no Windows (C-8)."
+    fix: {approach: "Job Object com JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE atribuído logo após o CreateProcess (CREATE_SUSPENDED + AssignProcessToJobObject + ResumeThread).", risk: "médio", rollback: "voltar ao taskkill"}
+    tests_to_add: ["tests/test_process.py::test_windows_grandchild_of_exited_command_is_killed"]
+    related: ["SEC-008", "R2-107", "R2-212", "WIN-001"]
+windows_checklist:
+  - item: "W-01 ADS em caminhos secretos (.env::$DATA, .env:$DATA, server.pem::$DATA, .git/config::$DATA, credentials.json::$DATA, id_rsa:stream) vs globs de leitura e safe_read"
+    code_location: "src/panda_core/policy.py:146-176@704f387; src/panda_core/tools.py:176-191@704f387 (resolve_inside); src/panda_core/policy.py:474-476@704f387"
+    predicted_behavior: "Nível string (emulado): .env::$DATA, .env:$DATA, server.pem::$DATA, .git/config::$DATA, credentials.json::$DATA, _netrc::$DATA -> allow; id_rsa:stream e secrets.yaml::$DATA -> hard_deny (glob com * no fim). read_file passa antes por Path.resolve(): se ntpath.realpath/GetFinalPathNameByHandleW devolver o caminho SEM o sufixo de stream, a política vê '.env' e nega; se mantiver o sufixo, o conteúdo de .env sai por read_file sem aprovação. Comportamento do GetFinalPathNameByHandleW com stream não verificado [memory: unverified]."
+    risk: "P1 se resolve() mantiver '::$DATA' (bypass do piso de segredos sem aprovação); nenhum se normalizar."
+    windows_command: "echo SYNTH_SECRET_X> .env & python -c \"from pathlib import Path;print(Path('.env::$DATA').resolve())\" ; depois: pytest -k ads (teste: read_file {'path': '.env::$DATA'} deve ser blocked; idem 'deploy/server.pem::$DATA', '.git/config::$DATA')"
+    status: emulated
+  - item: "W-02 Nomes com ponto/espaço final (.env., '.env ', server.pem., .git/config., corpus/validation./validate.mjs, .panda./policy.json)"
+    code_location: "src/panda_core/tools.py:176-191@704f387; src/panda_core/policy.py:40-49@704f387"
+    predicted_behavior: "Nível string (emulado): '.env ' e 'server.pem.' e '.git/config.' -> allow; '.env.' -> hard_deny; write 'corpus/validation./validate.mjs' -> allow (write-scopes), '.panda./policy.json' -> deny. No Windows, resolve() de arquivo/diretório existente passa pelo kernel, que remove ponto/espaço final do segmento, e devolve o nome real: política vê o nome canônico. Risco só em caminhos que NÃO passam por resolve (policy_check com fallback, argv do shell)."
+    risk: "Baixo para read_file/write_file (normalizados); médio para decisões por string (policy_check/MCP explicam errado)."
+    windows_command: "python -c \"from pathlib import Path;print(Path('.env ').resolve(), Path('corpus/validation./validate.mjs').resolve())\" ; pytest teste: read_file '.env ' e write_file 'corpus/validation./validate.mjs' devem ser bloqueados"
+    status: emulated
+  - item: "W-03 Junção dentro de .panda/ e de corpus/validation vs ensure_plain_path"
+    code_location: "src/panda_core/safe_read.py:40-60@704f387; src/panda_core/validator.py:118,175@704f387"
+    predicted_behavior: "ensure_plain_path usa os.lstat + stat.S_ISLNK; no CPython Windows só IO_REPARSE_TAG_SYMLINK vira S_IFLNK, junção (MOUNT_POINT) fica S_IFDIR e não é recusada; não há uso de os.path.isjunction nem st_reparse_tag; O_NOFOLLOW=0. Coberto por R2-211."
+    risk: "P2 (config/policy/instructions/validator lidos através de junção para fora do workspace)."
+    windows_command: "mklink /J .panda C:\\Users\\Public\\evil && python -c \"from panda_core.safe_read import ensure_plain_path;from pathlib import Path;ensure_plain_path(Path('.'),Path('.panda/config.json'))\" (deve levantar ConfigError)"
+    status: not-run
+  - item: "W-04 Resolução de shim .cmd/.bat (shutil.which, PATHEXT, cwd primeiro) para node/validador/doctor"
+    code_location: "src/panda_core/process.py:57-109@704f387; stdlib shutil.py:1515-1571"
+    predicted_behavior: "Emulado: shutil.which('node') -> ./node.cmd do corpus antes do node.exe do PATH; _expand_windows_shim devolve o payload.exe citado no .cmd. Ver R2-318 (e R2-214 para CreateProcess)."
+    risk: "P2: binário do corpus executado por `panda doctor`."
+    windows_command: "cd corpus-hostil (com node.cmd -> \"%dp0%\\payload.exe\") && panda doctor ; verificar se payload.exe rodou (Process Monitor ou arquivo marcador). Repetir com set NoDefaultCurrentDirectoryInExePath=1."
+    status: emulated
+  - item: 'W-05 BatBadBut (classe CVE-2024-24576): run_shell com argv[0] .bat/.cmd passa por cmd.exe com aspas MSVC de list2cmdline'
+    code_location: src/panda_core/process.py:231-239@704f387; src/panda_core/tools.py:821-845@704f387
+    predicted_behavior: 'Emulado: subprocess.list2cmdline([''corpus\\t.bat'', ''x&y'']) -> ''corpus\t.bat x&y'' (sem aspas); [''corpus\\t.bat'', ''"&echo PWNED>pwned.txt''] -> ''corpus\t.bat "\"&echo PWNED>pwned.txt"''. CreateProcess executa .bat/.cmd via cmd.exe, que não entende o escape MSVC: ''&'' fora de aspas encadeia outro comando. A prévia de aprovação mostra '' ''.join(argv) = ''t.bat x&y'' sem avisar. O classificador trata git.bat/git.cmd como git (force continua hard_deny); um .bat qualquer é ask. Python não mudou subprocess para BatBadBut, só documentou [memory: unverified].'
+    risk: 'P3: operador aprova um script do corpus com ''argumento'' que na verdade é um segundo comando; com --auto, sem humano.'
+    windows_command: 'pytest: aprovar run_shell argv [''corpus\\t.bat'', ''x&echo PWNED>pwned.txt''] e afirmar que pwned.txt NÃO existe (previsto: existe).'
+    status: emulated
+  - item: "W-06 Kill da árvore com neto (taskkill /T /F) e taskkill por nome nu"
+    code_location: "src/panda_core/process.py:181-199@704f387; :263-277@704f387"
+    predicted_behavior: "Timeout/cancelamento com o filho vivo: taskkill /T mata a árvore enquanto os pais existem. Saída normal do comando: taskkill roda após a saída e não acha a árvore; netos sobrevivem (R2-320). 'taskkill' por nome nu pode vir do cwd (R2-214). Sem Job Object."
+    risk: "P3 (C-8 não vale no Windows)."
+    windows_command: "pytest teste: run_command(['cmd','/c','start','/b','ping','-n','30','127.0.0.1'], timeout=60) e checar com tasklist que ping.exe não existe após o retorno; repetir com timeout=1."
+    status: not-run
+  - item: "W-07 Ausência de O_NOFOLLOW"
+    code_location: "src/panda_core/safe_read.py:30,74@704f387"
+    predicted_behavior: "_NO_FOLLOW=0: só o lstat-walk protege; troca de link entre o walk e o os.open é seguida (TOCTOU, R2-209). Symlink de arquivo no Windows exige Developer Mode/privilégio e o git com core.symlinks=false materializa links como texto, o que reduz a exposição."
+    risk: "P3/P4"
+    windows_command: "Com Developer Mode: mklink .panda\\instructions.md C:\\Users\\me\\secret.txt ; panda run --plain 'oi' deve recusar (ConfigError). Corrida: script que alterna arquivo/link em laço enquanto load_config roda 1000x."
+    status: not-run
+  - item: "W-08 Insensibilidade a caixa vs globs da política (.ENV, Corpus/Validation/validate.mjs, .PANDA/policy.json)"
+    code_location: "src/panda_core/policy.py:40-49@704f387"
+    predicted_behavior: "Emulado: PolicyRule.matches baixa caixa de ação, recurso e padrão: .ENV -> hard_deny; Corpus/Validation/validate.mjs e .PANDA/policy.json -> hard_deny (floor-control-plane). Barra invertida normalizada em _decide_rules."
+    risk: "Nenhum observado."
+    windows_command: "panda policy check read .ENV ; panda policy check write Corpus\\Validation\\validate.mjs (esperado hard_deny)"
+    status: emulated
+  - item: "W-09 Nomes curtos 8.3 (VALIDA~1.MJS, GIT~1.EXE)"
+    code_location: "src/panda_core/tools.py:176-191@704f387; src/panda_core/shell_policy.py:60-65@704f387"
+    predicted_behavior: "Emulado: write 'corpus/VALIDA~1/VALIDA~1.MJS' em nível string -> allow; resolve() de arquivo existente devolve o nome longo (GetFinalPathNameByHandleW), então write_file deve ser negado. argv[0] 'GIT~1.EXE' com push --force -> ask (R2-317), sem normalização."
+    risk: "P2 no shell (R2-317); baixo em arquivos."
+    windows_command: "dir /x corpus\\validation ; pytest teste: write_file {'path':'corpus/VALIDA~1/VALIDA~1.MJS'} bloqueado; run_shell ['GIT~1.EXE','push','--force'] -> hard_deny esperado"
+    status: emulated
+  - item: "W-10 Nomes reservados (CON, NUL, aux.txt, COM1.md)"
+    code_location: "src/panda_core/tools.py:176-191@704f387; src/panda_core/config.py:51-67@704f387"
+    predicted_behavior: "Emulado (PureWindowsPath): 'CON', 'NUL', 'corpus/aux.txt' ficam 'dentro' em resolve_inside; is_reserved=True. write_file: os.replace para dispositivo falha (OSError -> erro). read_file: is_file() False para dispositivo. config.instructions='CON' aceito por _relative_posix_path; _read_instructions vê is_file False. No Windows 11 'aux.txt' deixou de ser dispositivo [memory: unverified]."
+    risk: "P4 (erros confusos; nenhum travamento esperado)."
+    windows_command: "pytest teste: read_file {'path':'CON'} e {'path':'corpus/aux.txt'} retornam erro sem bloquear; write_file 'corpus/NUL' falha limpo"
+    status: emulated
+  - item: "W-11 CRLF no edit_file/write_file"
+    code_location: "src/panda_core/tools.py:154-173,751-819@704f387; src/panda_core/atomic.py:86-118@704f387"
+    predicted_behavior: "edit_file grava bytes (atomic_write_bytes, modo binário) e confere com open(newline=''); write_file usa newline='\\n' (sem tradução). Esperado: byte-exato no Windows. Lacuna conhecida: CR solto via new_string (R2-119)."
+    risk: "Baixo."
+    windows_command: ".\\.venv\\Scripts\\python.exe -m pytest -q tests/security/test_w2b.py -k crlf"
+    status: not-run
+  - item: "W-12 msvcrt.locking em file_lock"
+    code_location: "src/panda_core/atomic.py:20-77@704f387"
+    predicted_behavior: "Trava 1 byte no offset 0 com LK_NBLCK em laço até 10 s; arquivo aberto 'a+b' (link seguido, R2-308). Lock por handle: dois file_lock no mesmo processo esperam 10 s e levantam TimeoutError (igual ao flock com handles distintos)."
+    risk: "Baixo."
+    windows_command: ".\\.venv\\Scripts\\python.exe -m pytest -q tests/security/test_w5.py -k lock"
+    status: not-run
+  - item: "W-13 Permissões do cofre de credenciais no Windows"
+    code_location: "src/panda_core/credentials.py:32-45@704f387; src/panda_core/atomic.py:95@704f387"
+    predicted_behavior: "os.chmod(0o600) só alterna o bit read-only; a proteção vem da ACL herdada de %LOCALAPPDATA% (perfil do usuário). PANDA_CREDENTIALS_FILE fora do perfil herda a ACL da pasta (ex.: C:\\shared -> Users:RX). Sem checagem de ACL."
+    risk: "P3 com override em pasta compartilhada."
+    windows_command: "set PANDA_CREDENTIALS_FILE=C:\\Users\\Public\\c.json && panda auth set && icacls C:\\Users\\Public\\c.json"
+    status: not-run
+  - item: "W-14 shlex posix=False em PolicyEngine.decide('shell', str)"
+    code_location: "src/panda_core/policy.py:433-440@704f387; src/panda_core/process.py:40-54@704f387"
+    predicted_behavior: "Emulado com os.name='nt': tokens mantêm aspas. 'git \"push\" --force', '\"git\" push --force', 'git \"reset\" --hard', 'git push origin \"+main\"' -> ask (posix: hard_deny). 'git push \"--force\"' continua hard_deny (fallback por glob de texto). O run_shell usa argv JSON (sem aspas) e o '!cmd' usa split_command, que remove aspas: a divergência afeta policy_check/MCP/`panda policy check` (explicação mais branda que a execução). Coberto por R2-203/R2-503."
+    risk: "P3 (explicação de política errada no Windows)."
+    windows_command: "panda policy check shell 'git \"push\" --force' (esperado hard_deny; previsto ask)"
+    status: emulated
+  - item: "W-15 os.open sem O_BINARY (ledger, safe_read, crash log)"
+    code_location: "src/panda_core/session.py:366-372@704f387; src/panda_core/safe_read.py:74@704f387"
+    predicted_behavior: "Descritor em modo texto do CRT: ledger com CRLF e leitura parando em 0x1A (R2-319)."
+    risk: "P4"
+    windows_command: "python -c \"import os;fd=os.open('t.bin',os.O_WRONLY|os.O_CREAT);os.write(fd,b'a\\n');os.close(fd);print(open('t.bin','rb').read())\" (b'a\\r\\n' confirma)"
+    status: not-run
+  - item: "W-16 Descoberta de workspace em ancestral gravável (C:\\.panda)"
+    code_location: "src/panda_core/workspace.py:35-53,130-157@704f387"
+    predicted_behavior: "Usuários autenticados podem criar pastas em C:\\ por padrão; C:\\.panda\\config.json vale para qualquer cwd sob C:\\ sem .panda próprio (R2-300)."
+    risk: "P2"
+    windows_command: "(como outro usuário) mkdir C:\\.panda && copy config.json C:\\.panda\\ ; (como vítima) cd C:\\work\\novo && panda status (root deve ser C:\\work\\novo, não C:\\)"
+    status: not-run
+  - item: "W-17 Contenção de caminho com drive relativo, UNC e \\\\?\\"
+    code_location: "src/panda_core/tools.py:176-191@704f387; src/panda_core/config.py:51-67@704f387; src/panda_core/registry.py:86-104@704f387"
+    predicted_behavior: "Emulado (PureWindowsPath): 'e:foo' -> junta como 'e:foo' e relative_to falha (recusado); '/Windows/x' -> C:\\Windows\\x recusado; UNC e \\\\?\\ absolutos recusados; 'C:foo' -> dentro (C:\\ws\\foo). _relative_posix_path recusa 'C:x' e UNC."
+    risk: "Nenhum observado."
+    windows_command: "pytest teste: read_file {'path':'e:foo'}, {'path':'\\\\\\\\localhost\\\\c$\\\\Windows\\\\win.ini'} bloqueados"
+    status: emulated
+  - item: "W-18 Classificador com nomes Win32 normalizados (git.exe., 'git.exe ', GIT~1.EXE, git.exe::$DATA, git.com)"
+    code_location: "src/panda_core/shell_policy.py:60-65@704f387"
+    predicted_behavior: "Emulado: todos viram ask em push --force/reset --hard/clean -fdx (R2-317). Falta confirmar que CreateProcess executa o git com essas grafias."
+    risk: "P2"
+    windows_command: "python -c \"import subprocess;print(subprocess.run(['git.exe.','--version'],capture_output=True).stdout)\" ; idem 'git.exe ' e o nome 8.3 de dir /x"
+    status: emulated
+  - item: "W-19 Raízes protegidas (_is_protected_dir) e sonda de escrita"
+    code_location: "src/panda_core/workspace.py:77-120@704f387"
+    predicted_behavior: "Só SystemRoot/ProgramFiles/ProgramFiles(x86)/ProgramW6432 lidos do ambiente; relative_to de WindowsPath compara sem caixa. Pastas como C:\\ProgramData não entram (mkstemp lento possível). É otimização, não controle."
+    risk: "P4"
+    windows_command: "cd C:\\Windows\\System32 && Measure-Command { panda status }"
+    status: not-run
+  - item: "W-20 Restauração do console (SetConsoleMode) e mouse após crash"
+    code_location: "src/panda_cli/terminal.py:125-200@704f387"
+    predicted_behavior: "ctypes com suppress(Exception); ENABLE_MOUSE_INPUT removido quando não há snapshot. Sem entrada externa."
+    risk: "INFO"
+    windows_command: "panda (cockpit) em PowerShell, forçar crash (PANDA_MOUSE=1 + exceção) e verificar que o PowerShell não recebe '[<35;..M'"
+    status: not-run
+trifecta_map:

@@ -1,0 +1,77 @@
+schema: panda.audit.state.v1
+commit: 704f387
+baseline: 231e48f
+updated: '2026-11-04'
+language: pt-BR
+phases:
+  P0_orientation: done
+  P1_regression: done (trilha A)
+  P2_new_surface: done (trilha B)
+  P3_blind_spots: partial (trilha C interrompida por limite de uso apos 24 achados e 20 itens Windows; trifecta escrito pelo auditor principal; schemas/sdist parcial)
+  P4_test_quality: done (cobertura, 28 mutantes, instabilidade 3x carga + 5x repouso, drift)
+  P5_harness: done (trilha D, web verificada)
+  P6_windows: not-run (sem host Windows; checklist estatico/emulado)
+  P7_consolidate: done
+commands_run:
+- git fetch origin ccr-97408065-lnoi2u; git worktree add ../panda-audit-src 704f387; git worktree add ../panda-audit-base 231e48f
+- pip install -e '.[dev,mcp]' pytest-cov hypothesis pip-audit (venv dedicado por commit)
+- ruff check src tests --no-cache
+- python -m compileall -q src tests
+- python -m mypy --platform linux
+- python -m mypy --platform win32
+- python -m pytest -q -p no:cacheprovider
+- pip-audit --skip-editable
+- pytest --cov=src --cov-branch -q
+- 'mutacao: 28 mutantes em copias (gates/mutation.txt, gates/mutation-rerun.txt)'
+- pytest tests/security x3 sob carga, x5 em repouso
+- 'PoCs: poc/A (69 falham/10 passam), poc/B (100/9), poc/E (6/1), poc/C (14/2)'
+gates:
+  ruff: exit 0
+  compileall: exit 0
+  mypy_linux: exit 0
+  mypy_win32: exit 0
+  pytest:
+    passed: 771
+    failed: 0
+    skipped: 3
+    skips: so-Windows
+  pip_audit: no known vulnerabilities
+  coverage_branch: 77%
+  flaky:
+    under_load: 1 falha em 3 rodadas (test_a_long_preview_reports_the_hidden_lines) + 4 outros testes de tempo observados nas rodadas de mutacao
+    idle: 5/5 verdes
+counts:
+  regression:
+    bypassed: 5
+    partial: 21
+    fixed-verified: 25
+    not-addressed: 1
+    not-reproducible: 1
+  findings_by_severity:
+    P0: 1
+    P1: 8
+    P2: 12
+    P3: 42
+    P4: 35
+    INFO: 1
+  findings_by_status:
+    confirmed: 86
+    probable: 11
+    hypothesis: 2
+  refuted: 21
+  improvements: 30
+  mutants:
+    total: 28
+    killed: 21
+    survived_real: 5
+    survived_equivalent: 2
+open_blockers:
+- 'Sem host Windows: WIN-001 e 20 itens do checklist nao executados.'
+- Limite de uso da conta interrompeu a trilha C duas vezes.
+not_verified:
+- Qualquer comportamento em Windows (junctions, ADS, nomes 8.3, taskkill /T, PATHEXT/cwd, shlex posix=False na pratica, msvcrt lock, O_BINARY).
+- Corrida real entre processos nos TOCTOU de safe_read/grep_worker (demonstrados por troca entre chamadas).
+- Comportamento com provedor real (OpenCode Go); so httpx.MockTransport.
+- Conteudo completo de schemas/ contra o produtor e do sdist alem de R2-314/R2-315.
+- Achados ACI R2-400..R2-416 com uma perna so (probable).
+- R2-211, R2-317, R2-318, R2-319, R2-320 (Windows, probable/hypothesis).

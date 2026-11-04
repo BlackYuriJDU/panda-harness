@@ -1,0 +1,26 @@
+M01 KILLED _force ignores short -f :: 1 failed, 129 passed in 4.10s :: FAILED tests/security/test_w1.py::test_destructive_and_exfiltrating_variants_fail_closed[git --no-pager -C . push -f origin main-hard_deny]
+M02 KILLED push: drop short -d (delete) :: 1 failed, 245 passed in 11.32s :: FAILED tests/security/test_w2b.py::test_timeout_kills_the_whole_process_group
+M03 KILLED push: drop +refspec/:branch :: 1 failed, 125 passed in 4.68s :: FAILED tests/security/test_w1.py::test_f04_decisions_by_effect[git push origin +main-hard_deny]
+M04 KILLED push: drop --mirror :: 1 failed, 245 passed in 11.18s :: FAILED tests/security/test_w2b.py::test_timeout_kills_the_whole_process_group
+M05 KILLED decide_shell: classifier can no longer escalate :: 1 failed, 121 passed in 4.56s :: FAILED tests/security/test_w1.py::test_f04_decisions_by_effect[git -C . reset --hard HEAD-hard_deny]
+M06 KILLED policy_floor drops built-in hard denies :: 1 failed, 61 passed in 3.24s :: FAILED tests/security/test_w0.py::test_floor_survives_a_policy_that_allows_everything[read-.env]
+M07 KILLED policy_floor drops control-plane rule :: 1 failed, 55 passed in 3.21s :: FAILED tests/security/test_w0.py::test_floor_survives_a_policy_that_allows_everything[write-.panda/policy.json]
+M08 KILLED provider boundary accepts userinfo :: 1 failed, 6 passed in 2.74s :: FAILED tests/security/test_w0.py::test_load_config_rejects_foreign_base_url[https://user:pass@opencode.ai/inference/go]
+M09 KILLED provider boundary accepts any port :: 1 failed, 9 passed in 2.28s :: FAILED tests/security/test_w0.py::test_load_config_rejects_foreign_base_url[https://opencode.ai:8443/inference/go]
+M10 KILLED ensure_plain_path ignores symlinked components :: 1 failed, 27 passed in 2.62s :: FAILED tests/security/test_w0.py::test_symlinked_panda_directory_is_refused
+M11 KILLED _check_anchor accepts events beyond anchor :: 1 failed, 251 passed in 13.06s :: FAILED tests/security/test_w2b.py::test_wait_for_really_bounds_a_running_tool
+M12 SURVIVED _check_anchor ignores hash mismatch :: 771 passed, 3 skipped in 32.74s :: 
+M13 KILLED _redact_assignment no-op :: 1 failed, 344 passed in 12.83s :: FAILED tests/security/test_w4.py::test_a_long_preview_reports_the_hidden_lines
+M14 KILLED ApprovalScreen approves with hidden lines :: 1 failed, 345 passed in 14.97s :: FAILED tests/security/test_w4.py::test_approval_waits_until_the_end_of_a_long_preview_has_been_seen
+M15 SKIP site-count=2 ApprovalScreen not armed
+M16 KILLED ApprovalScreen no double confirmation :: 1 failed, 344 passed in 13.81s :: FAILED tests/security/test_w4.py::test_a_long_preview_reports_the_hidden_lines
+M17 KILLED Agent._log swallows ledger OSError :: 1 failed, 220 passed in 6.29s :: FAILED tests/security/test_w2a.py::test_a_full_disk_is_a_ledger_failure_not_a_silent_skip
+M18 KILLED _kill_tree kills only direct child :: 1 failed, 245 passed in 39.04s :: FAILED tests/security/test_w2b.py::test_timeout_kills_the_whole_process_group
+M19 KILLED NEVER_AUTO drops shell-git-push :: 1 failed, 338 passed in 13.45s :: FAILED tests/security/test_w4.py::test_auto_never_approves_a_push[shell-git-push]
+M20 KILLED NEVER_AUTO drops shell-push :: 1 failed, 337 passed in 13.47s :: FAILED tests/security/test_w4.py::test_auto_never_approves_a_push[shell-push]
+M21 KILLED NEVER_AUTO drops git-push :: 1 failed, 339 passed in 13.49s :: FAILED tests/security/test_w4.py::test_auto_never_approves_a_push[git-push]
+M22 SURVIVED string path uses non-posix shlex (Windows behaviour) :: 771 passed, 3 skipped in 31.13s :: 
+M23 KILLED wrappers not unwrapped :: 1 failed, 144 passed in 5.02s :: FAILED tests/security/test_w1.py::test_destructive_and_exfiltrating_variants_fail_closed[env git push --force-hard_deny]
+M24 KILLED rm -R not recursive :: 1 failed, 148 passed in 5.45s :: FAILED tests/security/test_w1.py::test_destructive_and_exfiltrating_variants_fail_closed[RM -R corpus-hard_deny]
+M25 KILLED find -delete not hard_deny :: 1 failed, 124 passed in 5.42s :: FAILED tests/security/test_w1.py::test_f04_decisions_by_effect[find corpus -delete-hard_deny]
+M26 SURVIVED git clean -f not hard_deny :: 771 passed, 3 skipped in 32.67s :: 

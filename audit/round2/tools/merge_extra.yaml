@@ -1,0 +1,101 @@
+merge:
+  R2-214: R2-318
+  R2-122: R2-306
+rc_of:
+  R2-400: RC-23
+  R2-401: RC-23
+  R2-402: RC-23
+  R2-403: RC-23
+  R2-404: RC-23
+  R2-405: RC-12
+  R2-406: RC-12
+  R2-407: RC-23
+  R2-408: RC-23
+  R2-409: RC-23
+  R2-410: RC-23
+  R2-411: RC-23
+  R2-412: RC-23
+  R2-413: RC-23
+  R2-414: RC-23
+  R2-415: RC-23
+  R2-416: RC-23
+  R2-417: RC-23
+  R2-300: RC-21
+  R2-303: RC-21
+  R2-304: RC-21
+  R2-301: RC-24
+  R2-309: RC-24
+  R2-312: RC-12
+  R2-302: RC-23
+  R2-311: RC-16
+  R2-305: RC-10
+  R2-307: RC-10
+  R2-308: RC-10
+  R2-306: RC-09
+  R2-310: RC-09
+  R2-313: RC-25
+  R2-314: RC-19
+  R2-315: RC-19
+  R2-316: RC-19
+  R2-317: RC-03
+  R2-318: RC-11
+  R2-319: RC-22
+  R2-320: RC-11
+severity: {}
+trifecta_map:
+- flow: "F1 texto de arquivo do corpus -> modelo -> run_shell git status/diff/log -p (allow) -> conteudo volta ao modelo -> provedor"
+  private_data: "sim: .env/chaves versionados no historico do git, arquivos do corpus restrito"
+  untrusted_content: "sim: qualquer arquivo do corpus lido pelo agente (B1/B3)"
+  external_comm: "sim: todo resultado de tool vai ao provedor (R2-218); git push/curl como ask, auto-aprovados com --auto (R2-500, R2-204)"
+  breaking_control: "nenhum efetivo: read-secrets nao cobre a rota git (R2-102); redacao so na persistencia; never_auto contornado"
+  rule_of_two: "violada (3 de 3 pernas sem controle que quebre uma delas)"
+  owasp: ["LLM01", "LLM02", "LLM06"]
+  findings: ["R2-102", "R2-218", "R2-500", "R2-204", "R2-112"]
+- flow: "F2 .panda/policy.json do corpus -> PolicyEngine (o dado do corpus configura o proprio controle)"
+  private_data: "sim (acesso ao workspace e ao ambiente do usuario via shell)"
+  untrusted_content: "sim: a politica vem do corpus"
+  external_comm: "sim: shell arbitrario 'allow' (curl, python -c) sem aprovacao"
+  breaking_control: "so o floor de hard_deny (segredos, destrutivo, control plane); nada impede allow fora dele"
+  rule_of_two: "violada"
+  owasp: ["LLM06"]
+  findings: ["R2-113", "R2-207", "R2-116"]
+- flow: "F3 corpus entregue com .git (zip/copia) -> abrir panda chat/run -> git_state -> filtro clean / hook do corpus"
+  private_data: "sim: o processo tem o ambiente do usuario (OPENCODE_API_KEY, ~/.ssh) "
+  untrusted_content: "sim: .git/config, .gitattributes, hooks do corpus"
+  external_comm: "sim: codigo nativo sem sandbox"
+  breaking_control: "nenhum: so core.fsmonitor e neutralizado; nao ha modelo nem aprovacao no caminho"
+  rule_of_two: "violada (e nao depende de LLM)"
+  owasp: []
+  findings: ["R2-106", "R2-101", "R2-201", "TRUST-004"]
+- flow: "F4 config.instructions / instructions.md do corpus -> papel system do prompt"
+  private_data: "sim: config.instructions pode apontar para qualquer arquivo do workspace sem passar pela politica de leitura"
+  untrusted_content: "sim, e com autoridade de system ('the corpus wins')"
+  external_comm: "sim: o prompt inteiro vai ao provedor"
+  breaking_control: "safe_read impede symlink; nada separa dado de instrucao nem consulta read-secrets"
+  rule_of_two: "violada"
+  owasp: ["LLM01", "LLM02"]
+  findings: ["R2-303", "R2-400", "R2-304"]
+- flow: "F5 validate (tool, MCP ou run_shell 'panda validate --root') -> node validate.mjs + corpus/node_modules"
+  private_data: "parcial: scrubbed_env remove chaves conhecidas, mas deixa PGPASSWORD, DATABASE_URL, SSH_AUTH_SOCK (R2-114)"
+  untrusted_content: "sim: dependencias do validador e --root escolhidos pelo agente"
+  external_comm: "sim: node sem sandbox"
+  breaking_control: "hard_deny de escrita em corpus/validation/ (nao cobre node_modules nem outro --root)"
+  rule_of_two: "violada"
+  owasp: ["LLM06"]
+  findings: ["R2-104", "R2-210", "R2-105", "R2-114"]
+- flow: "F6 cliente MCP (stdio ou HTTP loopback) -> tools do Panda"
+  private_data: "sim: leitura do workspace"
+  untrusted_content: "o proprio cliente e o que ele le"
+  external_comm: "o cliente MCP e externo ao Panda"
+  breaking_control: "mesma politica e ledger do CLI (REF-207); HTTP so loopback e recusa Host estranho (REF-206); policy_check(approved=true) grava 'allow approved' (R2-406)"
+  rule_of_two: "depende do cliente; Panda nao controla a perna externa"
+  owasp: ["LLM06"]
+  findings: ["R2-406", "R2-228", "R2-225"]
+- flow: "F7 resposta do provedor / lista de modelos / texto do corpus -> terminal (cockpit, CLI)"
+  private_data: "nao"
+  untrusted_content: "sim (B5, B1)"
+  external_comm: "nao, mas OSC 8/52 pode criar links ou escrever na area de transferencia do operador"
+  breaking_control: "sanitize_display so na REPL e no panda run; cockpit e tabelas do CLI sem sanitizacao"
+  rule_of_two: "n/a (risco de enganar o operador na aprovacao, C-4)"
+  owasp: ["LLM05"]
+  findings: ["R2-221", "R2-306", "R2-310", "R2-222", "R2-223"]

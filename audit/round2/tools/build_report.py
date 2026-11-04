@@ -1,0 +1,236 @@
+"""Gera AUDIT-REPORT.md a partir de findings.yaml + textos fixos + secoes da trilha D."""
+
+from __future__ import annotations
+
+import re
+from collections import Counter
+from pathlib import Path
+
+import yaml
+
+OUT = Path("/home/user/panda-audit-out")
+D = yaml.safe_load((OUT / "findings.yaml").read_text(encoding="utf-8"))
+F = D["findings"]
+REG = D["regression"]
+SEV = ["P0", "P1", "P2", "P3", "P4", "INFO"]
+DEFECT = {"new", "variant", "drift"}
+
+
+def one(text: object, n: int = 220) -> str:
+    s = re.sub(r"\s+", " ", str(text or "")).strip().replace("|", "\\|")
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def d_section(start: str, stop: str | None) -> str:
+    md = (OUT / "tracks" / "D-harness.md").read_text(encoding="utf-8")
+    i = md.index(start)
+    j = md.index(stop, i) if stop else len(md)
+    body = md[i:j].split("\n", 1)[1]
+    # desce um nivel de titulo para caber dentro da secao do relatorio
+    return re.sub(r"^(#{2,5}) ", lambda m: "#" + m.group(1) + " ", body, flags=re.M).strip()
+
+
+defects = [f for f in F if f.get("kind") in DEFECT]
+refuted = [f for f in F if f.get("kind") == "refuted"]
+imps = [f for f in F if f.get("kind") == "improvement"]
+sev_count = Counter(str(f.get("severity")) for f in defects)
+st_count = Counter(f.get("status") for f in defects)
+reg_count = Counter(r["verdict"] for r in REG)
+flaky_idle = (OUT / "gates" / "flaky-idle.txt").read_text(encoding="utf-8").strip()
+flaky_load = (OUT / "gates" / "flaky-load.txt").read_text(encoding="utf-8").strip()
+
+L: list[str] = []
+w = L.append
+
+w("# Auditoria independente, rodada 2 — Panda Harness 0.2.0a5 (commit 704f387)")
+w("")
+w("Baseline: 231e48f (0.2.0a4). Data: 2026-11-03/04. Ambiente: Linux (sem host Windows). Idioma: pt-BR; identificadores em inglês.")
+w("Arquivos irmãos: `findings.yaml` (fonte de verdade, schema `panda.audit.findings.v2`), `STATE.yaml`, `NEXT.md`, `tracks/` (notas por trilha), `poc/` (testes de regressão que falham hoje), `gates/` (saídas dos comandos).")
+w("")
+w("## 1. Resumo executivo")
+w("")
+w("1. **Veredito: não publicar 0.2.0a5 como está.** A rodada 1 foi corrigida rota a rota; a mesma causa raiz reaparece em rotas irmãs. Das 53 correções, " + f"{reg_count['fixed-verified']} se sustentam, {reg_count['partial']} são parciais e {reg_count['bypassed']} foram contornadas (SEC-001, SEC-002, TRUST-003, TRUST-004, APR-004).")
+w("2. **P0 (R2-106):** abrir `panda chat`/`panda run` num corpus entregue com `.git` (zip, cópia) executa o filtro clean e o hook `post-index-change` do corpus, sem tool call nem aprovação. O fix de TRUST-004 só neutralizou `core.fsmonitor`.")
+w("3. **A política de shell ainda decide pelo texto:** regras allow casam o argv unido, então `git status/../..<bin>` (R2-100) e `panda validate --root corpus/x` (R2-104) executam código sem aprovação; o classificador só escala e não conhece `timeout`, `stdbuf`, `sudo -u`, `env -u` (R2-103).")
+w("4. **`git` \"read-only\" é execução e é leitura de segredo:** `git status/diff/show` (allow) rodam `fsmonitor`/`diff.external`/`textconv` do corpus (R2-101, R2-201) e imprimem `.env` versionado (R2-102), contornando `read-secrets`.")
+w("5. **\"A workspace policy can only tighten\" é falso:** uma regra `allow` no `policy.json` do corpus libera shell arbitrário e escrita fora dos escopos (R2-113); o corpus também define `risk`/`reason` mostrados ao operador (R2-207).")
+w("6. **`--auto` aprova push:** a classe never_auto é decidida pelo nome da regra; `env git push`, `git -C . push`, `/usr/bin/git push` e qualquer push sob política do corpus passam (R2-500); `gh release`/`twine upload`/`npm publish` também (R2-204).")
+w("7. **Segredos e terminal:** resultados de tools vão ao provedor sem redação (R2-218) e a redação falha em JSON, URL com senha e Cookie (R2-112); o cockpit e as tabelas do CLI emitem ESC/OSC/C1 (R2-221, R2-306).")
+w("8. **Testes:** 771 passam, mas 5 de 28 mutantes de segurança sobrevivem (push -d, push --mirror, git clean -f, hash do anchor, shlex Windows) e 5 testes de tempo são instáveis sob carga.")
+w("9. **Windows:** nada foi executado em Windows; 20 itens de checklist com predição estática, 2 P2 prováveis (R2-317, R2-318).")
+w("10. **Primeiro passo:** fechar as causas raiz RC-02/03/04/05/01 com uma política por argv, workspace só-restringe, git isolado e never_auto por efeito (ver §12 e NEXT.md).")
+w("")
+w("| | P0 | P1 | P2 | P3 | P4 | INFO | total |")
+w("|---|---|---|---|---|---|---|---|")
+w("| achados (new/variant/drift) | " + " | ".join(str(sev_count.get(s, 0)) for s in SEV) + f" | {len(defects)} |")
+w("")
+w(f"Status dos achados: confirmed {st_count.get('confirmed', 0)}, probable {st_count.get('probable', 0)}, hypothesis {st_count.get('hypothesis', 0)}. Refutações registradas: {len(refuted)}. Melhorias: {len(imps)}.")
+w(f"Regressão (53): fixed-verified {reg_count['fixed-verified']}, partial {reg_count['partial']}, bypassed {reg_count['bypassed']}, not-addressed {reg_count['not-addressed']}, not-reproducible {reg_count['not-reproducible']} (WIN-001, não executado).")
+w("")
+w("## 2. Ambiente e gates")
+w("")
+w("| item | valor |")
+w("|---|---|")
+w("| SO | Linux 6.18 x86_64 (contêiner de nuvem, 4 CPUs) |")
+w("| Python / Node / git | 3.13.18 / 22.23.4 / 2.43.0 |")
+w("| instalação | venv dedicado, `pip install -e \".[dev,mcp]\"` em worktree de 704f387 (mcp 1.30.0, textual 6.12.0) |")
+w("| `ruff check src tests --no-cache` | exit 0 |")
+w("| `python -m compileall -q src tests` | exit 0 |")
+w("| `mypy --platform linux` / `--platform win32` | exit 0 / exit 0 (39 arquivos) |")
+w("| `pytest -q` | **771 passed, 0 failed, 3 skipped** (os 3 skips são só-Windows: test_process.py:24, test_startup.py:105, test_workspace.py:119) |")
+w("| `pip-audit --skip-editable` | no known vulnerabilities |")
+w("| cobertura de ramos | 77% (gates/coverage.txt) |")
+w("| Windows | **não executado** (sem host). Resultado Windows deste commit continua desconhecido. |")
+w("")
+w("O snapshot do prompt foi re-derivado: versão 0.2.0a5, 31 commits entre 231e48f e 704f387, 39 arquivos .py (13.910 linhas, o prompt diz 38/13.912: diferença de `__main__.py`/contagem, irrelevante).")
+w("")
+w("## 3. Regressão das 53 correções")
+w("")
+w("| id | veredito | falha no baseline | evidência |")
+w("|---|---|---|---|")
+for r in REG:
+    w(f"| {r['id']} | {r['verdict']} | {r.get('test_fails_on_baseline')} | {one(r.get('note'), 260)} |")
+w("")
+w("## 4. Achados novos (maior severidade primeiro)")
+w("")
+w("Cada item resume o registro de `findings.yaml` (que tem as duas pernas completas, comandos e esboço de correção). Duplicatas entre trilhas foram fundidas no id canônico (`merged_from`).")
+w("")
+for f in defects:
+    w(f"### {f['id']} [{f.get('severity')}] {one(f.get('title'), 200)}")
+    w(f"- status `{f.get('status')}`, evidência `{f.get('evidence_level')}`, confiança `{f.get('confidence')}`, causa raiz `{f.get('root_cause')}`, fronteira `{f.get('boundary')}`" + (f", fundido de {', '.join(f['merged_from'])}" if f.get("merged_from") else ""))
+    w(f"- precondições: {one(f.get('preconditions'), 260)}")
+    w(f"- afirmação: {one(f.get('claim'), 400)}")
+    locs = f.get("locations") or []
+    w(f"- locais: {', '.join('`' + one(x, 90) + '`' for x in locs[:4])}" + (" …" if len(locs) > 4 else ""))
+    for e in (f.get("evidence") or [])[:3]:
+        if e.get("command"):
+            w(f"- perna {e.get('leg')} ({e.get('method')}): `{one(e.get('command'), 160)}` → {one(e.get('output_excerpt'), 200)}")
+        else:
+            w(f"- perna {e.get('leg')} ({e.get('method')}): {one(e.get('detail'), 260)}")
+    w(f"- falsificação: {one(f.get('falsification'), 260)}")
+    fix = f.get("fix") or {}
+    w(f"- correção: {one(fix.get('approach'), 300)}")
+    if f.get("calibration"):
+        w(f"- calibração: {one(f.get('calibration'), 260)}")
+    w("")
+w("## 5. Hipóteses refutadas")
+w("")
+w("| id | hipótese | por que não se sustenta |")
+w("|---|---|---|")
+for f in refuted:
+    ev = "; ".join(one(e.get("detail") or e.get("output_excerpt"), 140) for e in (f.get("evidence") or [])[:2])
+    w(f"| {f['id']} | {one(f.get('title'), 160)} | {one(f.get('falsification') or ev, 220)} |")
+w("")
+w("## 6. Mapa trifecta (dados privados x conteúdo não confiável x comunicação externa)")
+w("")
+w("| fluxo | dados privados | conteúdo não confiável | comunicação externa | controle que quebra uma perna | Rule of Two | OWASP | achados |")
+w("|---|---|---|---|---|---|---|---|")
+for t in D["trifecta_map"]:
+    w(f"| {one(t['flow'], 140)} | {one(t['private_data'], 110)} | {one(t['untrusted_content'], 90)} | {one(t['external_comm'], 110)} | {one(t['breaking_control'], 140)} | {one(t['rule_of_two'], 50)} | {', '.join(t.get('owasp') or []) or '-'} | {', '.join(t.get('findings') or [])} |")
+w("")
+w("Leitura: em F1–F5 as três pernas coexistem e nenhum controle do Panda quebra uma delas de forma confiável; a única barreira é a aprovação humana de `ask`, que `--auto` remove (R2-500) e que a política do corpus pode converter em `allow` (R2-113). F3 nem passa pelo modelo.")
+w("")
+w("## 7. Qualidade dos testes")
+w("")
+w("### 7.1 Cobertura de ramos (módulos críticos)")
+w("")
+w("| módulo | cobertura | ramos não cobertos relevantes |")
+w("|---|---|---|")
+w("| shell_policy.py | 95% | 103 (opção git desconhecida), 178, 185, 195 |")
+w("| policy.py | 95% | 364-378 (erros de load_policy), 437-438 (fallback `resource.split()` quando shlex falha) |")
+w("| session.py | 81% | 487-547 e 568-619 (recover e verify: ramos de erro), 79-81, 104-107 |")
+w("| process.py | 62% | 45-114 (resolução de shims Windows), 189-199 (`taskkill`), 317-326 |")
+w("| safe_read.py | 88% | 47-48 (fora do workspace), 56-57 (OSError), 81 (não regular) |")
+w("| runtime.py | 66% | 148-185 (set_model, models) |")
+w("| repl.py / render.py / terminal.py | 26% / 20% / 46% | rota de aprovação e `!cmd` da REPL quase sem teste |")
+w("| grep_worker.py | 0% medido | roda em processo filho; habilitar coverage de subprocesso |")
+w("")
+w("### 7.2 Mutação mínima (28 mutantes, uma linha cada)")
+w("")
+w("Método: cópia de 704f387 sem `.git`, uma mutação por cópia, `PYTHONPATH` para a cópia, suíte inteira; a primeira rodada (com `-x`) foi descartada por ruído de testes instáveis e refeita sem `-x`, com os 3 testes instáveis excluídos e uma rodada de controle sem mutação (768 passed).")
+w("")
+w("| id | sítio | resultado |")
+w("|---|---|---|")
+for m in D["mutation"]["results"]:
+    w(f"| {m['id']} | {one(m['site'], 120)} | {m['result']} |")
+w("")
+w("Sobreviventes com lacuna real: M02, M04, M26 (R2-504: caminhos que só o classificador protege), M12 (R2-502: hash do anchor; ver também R2-224), M22 (R2-503: shlex Windows). M11 e M27 são equivalentes: a checagem de hash recusa do mesmo jeito, só muda a dica ao operador.")
+w("")
+w("### 7.3 Testes instáveis")
+w("")
+w("Sob carga (rodadas paralelas das trilhas), falharam sem relação com a mudança: `test_timeout_kills_the_whole_process_group`, `test_wait_for_really_bounds_a_running_tool`, `test_a_long_preview_reports_the_hidden_lines` (inclusive numa rodada de controle sem mutação), `test_a_background_child_does_not_outlive_a_finished_command`, `test_cancelling_the_tool_call_stops_the_command` (R2-505).")
+w("")
+w("```")
+w(flaky_load)
+w(flaky_idle)
+w("```")
+w("")
+w("Testes que afirmam implementação em vez de comportamento: APR-004 testa a pertença ao conjunto `NEVER_AUTO_RULES` (R2-501); os testes de isolamento de cwd usam `--version` e não provam nada (R2-316); `test_workflows.py` procura texto (R2-232). Não-vacuidade: os testes de P1/P2 falham no baseline 231e48f (detalhe por linha na §3); vários P3/P4 só falham por símbolo novo (SEC-006, DEAD-001, LED-001, UI-001, APR-001/002, SEC-008) e 5 testes passam também no baseline.")
+w("")
+w("## 8. Divergência documentação x código")
+w("")
+w("| id | sev | divergência |")
+w("|---|---|---|")
+for f in defects:
+    if f.get("kind") == "drift" or "docs-drift" in (f.get("class") or []):
+        w(f"| {f['id']} | {f.get('severity')} | {one(f.get('title'), 200)} |")
+w("")
+w("Também falsas hoje e cobertas por achados: CONTRACT §8 \"a workspace policy can only tighten\" (R2-113), CONTRACT §7 \"a child started by the command cannot outlive the call\" (R2-107: `setsid` escapa), C-7 \"redigido antes do texto enviado ao provedor\" (R2-218), CONTRACT §8 \"Text in the prompt is sanitized\" vale para o modal mas não para o cockpit (R2-221). `tests/test_contract.py` checa nomes (comandos, eventos, versões), não garantias.")
+w("")
+w("## 9. Panda como harness: revisão ACI e comparação")
+w("")
+w(d_section("## 1. Revisão ACI", "## 3. Melhorias ranqueadas"))
+w("")
+w("### Melhorias ranqueadas")
+w("")
+w(d_section("## 3. Melhorias ranqueadas", "## 4. Dicas práticas"))
+w("")
+w("## 10. Dicas práticas (esta semana)")
+w("")
+w(d_section("## 4. Dicas práticas", "## 5. Harness de avaliação"))
+w("")
+w("Acréscimos do auditor principal:")
+w("- Rode a mutação de bolso deste relatório (`gates/mutation*.txt`, script em `NEXT.md`) antes de cada release; 28 mutantes levam ~15 min.")
+w("- Toda regra de shell nova deve vir com um caso `env …`, `git -C . …`, `/usr/bin/…` e um caso sob política de corpus vazia: foi exatamente onde as correções vazaram.")
+w("- Teste garantias pela rota real (`ToolRegistry.call('run_shell', …)` com `auto=True`), não por funções auxiliares.")
+w("")
+w("## 11. Harness de avaliação")
+w("")
+w(d_section("## 5. Harness de avaliação", "## 6. Limites desta trilha"))
+w("")
+w("## 12. Roadmap (risco x custo)")
+w("")
+w("| ordem | o quê | fecha | custo | por quê primeiro |")
+w("|---|---|---|---|---|")
+w("| 1 | Sonda e todo git \"read-only\" com config isolada: `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `-c core.fsmonitor= -c core.hooksPath=/dev/null -c diff.external= -c core.pager=cat --no-ext-diff --no-textconv`, recusar `filter.*`/`include.*` do repo; `git_state` só com `--no-optional-locks` e sem atualizar índice | R2-106 (P0), R2-101, R2-201 | S/M | único P0; não depende de LLM |")
+w("| 2 | Política do workspace só-restringe: carregar só `deny`/`ask`/`hard_deny`; ignorar `risk`/`reason` do corpus para efeitos menos severos; allow só por arquivo de usuário (`~/.panda`) com confiança explícita | R2-113, R2-207, R2-116 | S | uma linha de código fecha um P1 inteiro |")
+w("| 3 | never_auto e `--auto` por efeito resolvido (flag no verdict do classificador, propagado na Decision), allowlist do que `--auto` pode aprovar | R2-500, R2-204, R2-501 | S | P1 com PoC pronta |")
+w("| 4 | Política de shell por argv: allow só por prefixo de tokens com `argv[0]` canonizado (basename sem `..`/`/`), wrappers desconhecidos = ask, `panda validate` fora do allow (só a tool `validate`) | R2-100, R2-104, R2-103, R2-203 | M | fecha a classe que gerou SEC-001/SEC-007 duas vezes |")
+w("| 5 | Conteúdo do git sob a política de leitura: `git diff/show/log -p` só com pathspec explícito checado, ou `ask` | R2-102 | S | P1; segredo ao provedor |")
+w("| 6 | Redação no limite de saída ao provedor + padrões JSON/URL/Cookie | R2-218, R2-112 | M | C-7 |")
+w("| 7 | Sanitização no ponto de renderização (um `render_untrusted` para cockpit/CLI) | R2-221, R2-306, R2-310, R2-222, R2-223 | M | C-4 |")
+w("| 8 | Testes: matar M02/M04/M12/M22/M26, rotas reais, estabilizar 5 testes de tempo, coverage de subprocesso | R2-501..R2-506 | S | protege 1–7 |")
+w("| 9 | Windows: rodar o checklist da §13 num host real; Job Objects no lugar de `taskkill` | WIN-001, R2-317, R2-318, R2-320 | M | resultado Windows desconhecido |")
+w("| 10 | Docs: SECURITY.md reescrito, CONTRACT §7/§8 corrigidos, help de `--auto` | DRIFT-500..503, DRIFT-200 | S | o documento é a promessa |")
+w("")
+w("Antes do roadmap do mantenedor: BioMCP (nova egress + conteúdo não confiável) só depois de 1–6, porque adiciona a terceira perna a fluxos que hoje já têm as outras duas; perfil pytest só com `tests/`, `conftest.py` e `pyproject.toml` protegidos contra escrita e `validate` como `ask` (trilha D, §3.1); PyPI só depois de 1–5 e de uma rodada Windows.")
+w("")
+w("## 13. Limites desta auditoria")
+w("")
+w("- **Windows não executado.** Fase 6 só estática/emulada (ntpath, `shlex.split(posix=False)`, monkeypatch de `os.name`). Checklist exato em `findings.yaml: windows_checklist` (20 itens) e abaixo.")
+w("- TOCTOU de `safe_read` e do `grep_worker` demonstrados com troca entre chamadas no mesmo processo (R2-209, R2-215), não com corrida real entre processos.")
+w("- Nenhum provedor real chamado (httpx.MockTransport); MCP HTTP só em 127.0.0.1.")
+w("- A trilha C (pontos cegos) foi interrompida duas vezes por limite de uso da conta; o mapa trifecta foi escrito pelo auditor principal a partir dos achados de todas as trilhas, e a inspeção de `schemas/` e do sdist ficou parcial (R2-314, R2-315).")
+w("- Achados de ACI (R2-400..R2-416) têm uma perna estática na maioria: ficaram `probable` quando faltou a segunda perna.")
+w("- O gate `compileall` grava `__pycache__` (ignorado pelo git) na worktree auditada; removido ao final. Nenhum arquivo rastreado foi alterado (`git status` limpo antes da remoção).")
+w("- Desvio do schema: WIN-001 recebeu `not-reproducible` porque o enum não tem `unverified`; a nota explica.")
+w("")
+w("### Checklist Windows (executar em host real)")
+w("")
+w("| item | onde | previsão | risco | comando | status |")
+w("|---|---|---|---|---|---|")
+for c in D["windows_checklist"]:
+    w(f"| {one(c.get('item'), 90)} | {one(c.get('code_location'), 60)} | {one(c.get('predicted_behavior'), 140)} | {one(c.get('risk'), 40)} | `{one(c.get('windows_command'), 140)}` | {c.get('status')} |")
+w("")
+(OUT / "AUDIT-REPORT.md").write_text("\n".join(L) + "\n", encoding="utf-8")
+print("linhas:", len(L))

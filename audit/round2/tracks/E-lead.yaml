@@ -1,0 +1,296 @@
+findings:
+  - id: "R2-500"
+    kind: variant
+    title: "--auto aprova git push: a classe never_auto depende do rule_id, nao do efeito resolvido"
+    severity: P1
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-01"
+    class: ["policy-bypass", "excessive-agency", "owasp:LLM06", "owasp:LLM01", "trifecta:external-communication"]
+    boundary: "B2"
+    preconditions: "operador usa --auto (panda run --auto ou cockpit/REPL com auto); o modelo emite run_shell com um push embrulhado (env, timeout, git -c, git -C, caminho absoluto) ou o corpus traz uma .panda/policy.json propria; nenhuma aprovacao humana"
+    locations:
+      - "src/panda_cli/runtime.py:46@704f387"
+      - "src/panda_cli/runtime.py:118-122@704f387"
+      - "src/panda_core/policy.py:449-463@704f387"
+      - "src/panda_core/tools.py:232-250@704f387"
+      - "src/panda_core/shell_policy.py:35@704f387"
+    claim: "ChatRuntime._approve recusa so os rule_id {shell-push, shell-git-push, git-push}; decide_shell devolve a Decision das regras de texto sempre que o classificador nao escala estritamente, entao um push com o mesmo efeito 'ask' chega com rule_id shell-default-ask, None ou o id de uma regra do corpus e e auto-aprovado."
+    evidence:
+      - {leg: A, method: static, detail: "runtime.py:122 `return request.rule_id not in NEVER_AUTO_RULES`; policy.py:462 `if SEVERITY[worst.effect] <= SEVERITY[base.effect]: return base` (base = _decide_rules sobre o texto); o glob de texto da regra shell-push so casa 'git push*', entao 'env git push', 'git -C . push', '/usr/bin/git push' caem em shell-default-ask; o classificador tambem devolve 'ask' (shell-git-push), mas igualdade de severidade devolve base. 'timeout' nao esta em _WRAPPERS (shell_policy.py:35). Com policy.json do corpus sem regra 'shell-push', base.rule_id e None ou o id do corpus."}
+      - {leg: B, method: executed, command: "cd /home/user/panda-audit-src && python -m pytest -p no:cacheprovider -q --rootdir=../panda-audit-out/poc/E ../panda-audit-out/poc/E/test_r2_500_auto_never_publishes.py", output_excerpt: "FAILED ...[env git push origin main]\nFAILED ...[timeout 5 git push origin main]\nFAILED ...[git -c user.name=x push origin main]\nFAILED ...[git -C . push origin main]\nFAILED ...[/usr/bin/git push origin main]\nFAILED ...under_a_corpus_supplied_policy[git push origin main]\n6 failed, 1 passed in 1.95s"}
+      - {leg: B, method: spy, detail: "script direto sobre PolicyEngine.decide: politica padrao -> 'env git push origin main' effect=ask rule=shell-default-ask; politica vazia -> 'git push origin main' rule=None; regra do corpus {id: corpus-shell, shell, *, ask} -> rule=corpus-shell; todos auto_approves=True"}
+    falsification: "Conferi se outro ponto barra o push no caminho real: tools._authorize (tools.py:232-250) monta o ApprovalRequest exatamente com decision.rule_id e chama ctx.approve = ChatRuntime._approve; nao ha outra checagem antes de run_command. O teste existente test_auto_never_approves_a_push passa o rule_id a mao e o teste end-to-end so usa 'git push origin main' com a politica padrao, por isso a suite fica verde."
+    impact: "Quebra a promessa C-5 e o fix de APR-004: um modelo guiado por texto do corpus publica commits (canal de exfiltracao para um remote controlado pelo atacante via `git -c remote.x.url=...` ou um remote ja configurado) sem nenhuma pessoa aprovar."
+    fix:
+      approach: "decidir a classe never_auto pelo efeito resolvido, nao pelo nome da regra: o classificador marca o verdict com um atributo `publishes=True` (ou classe 'never_auto') que sobrevive a fusao em decide_shell; Decision ganha campo `never_auto: bool`; _approve recusa se decision.never_auto. Em decide_shell, quando worst e base tem a mesma severidade, mesclar flags (OR) em vez de devolver base cru. Acrescentar 'timeout', 'stdbuf', 'setsid', 'ionice', 'chrt', 'taskset', 'xargs' aos wrappers ou tratar wrapper desconhecido + 'git' em qualquer posicao como 'ask never_auto'."
+      sketch: "ShellVerdict(..., never_auto=True) para push; Decision(never_auto=base.never_auto or worst.never_auto); runtime._approve: `if self.auto: return not request.never_auto`"
+      risk: "baixo; muda so a aprovacao automatica de pushes"
+      rollback: "reverter o commit; os testes novos voltam a falhar"
+    tests_to_add:
+      - "tests/security/test_w4.py::test_auto_never_approves_a_push_with_the_default_policy (parametrizado: env, timeout, git -c, git -C, /usr/bin/git, GIT.EXE)"
+      - "tests/security/test_w4.py::test_auto_never_approves_a_push_under_a_corpus_supplied_policy"
+    related: ["APR-004", "SEC-001", "SEC-007", "TRUST-003"]
+
+  - id: "R2-501"
+    kind: new
+    title: "Testes de APR-004 testam a pertenca ao conjunto, nao o pipeline decide_shell -> _approve"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-01"
+    class: ["test-quality", "vacuous-test"]
+    boundary: "B8"
+    preconditions: "nenhuma"
+    locations: ["tests/security/test_w4.py:192-205@704f387"]
+    claim: "test_auto_never_approves_a_push injeta rule_id diretamente; o unico teste end-to-end usa o comando literal 'git push origin main' com a politica padrao, a unica combinacao que funciona."
+    evidence:
+      - {leg: A, method: static, detail: "test_w4.py:195-197 approval(..., rule_id=rule_id) e test_w4.py:200-205 um so comando."}
+      - {leg: B, method: executed, command: "mutantes M19/M20/M21 (remover cada id de NEVER_AUTO_RULES) sao mortos so pelos casos parametrizados por id; a PoC R2-500 mostra 6 rotas sem teste", output_excerpt: "M19 KILLED ... test_auto_never_approves_a_push[shell-git-push]"}
+    falsification: "O teste mata mutacoes de pertenca, logo nao e vazio; e estreito: protege a tabela, nao a garantia."
+    impact: "A garantia C-5 fica sem teste de comportamento; regressao silenciosa."
+    fix: {approach: "testar pela rota real: ToolRegistry.call('run_shell') com runtime auto=True e run_command monkeypatchado, para uma matriz de argv e de politicas de workspace", sketch: "", risk: "baixo", rollback: "remover os testes"}
+    tests_to_add: ["tests/security/test_w4.py::test_run_shell_push_matrix_is_never_auto_approved"]
+    related: ["R2-500", "APR-004"]
+
+  - id: "R2-502"
+    kind: new
+    title: "Mutante sobrevivente: _check_anchor sem checagem de hash passa na suite inteira"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-05"
+    class: ["test-quality", "ledger-integrity"]
+    boundary: "B7"
+    preconditions: "nenhuma (lacuna de teste)"
+    locations: ["src/panda_core/session.py:338@704f387"]
+    claim: "Trocar `if anchor.get('hash') != self._tail[1]:` por `if False:` nao faz nenhum dos 771 testes falhar."
+    evidence:
+      - {leg: A, method: static, detail: "session.py:338-342 e a unica defesa contra um evento final reescrito com o mesmo seq (SES-003); nenhum teste em tests/ altera so o hash do ultimo evento e depois chama append."}
+      - {leg: B, method: executed, command: "/tmp/claude-0/mut/run.sh (M12)", output_excerpt: "M12 SURVIVED _check_anchor ignores hash mismatch :: 771 passed, 3 skipped"}
+    falsification: "verify() de ponta a ponta pode pegar a adulteracao por outro caminho; mas o contrato C-3 e sobre append estrito, e append e o que o mutante abre."
+    impact: "Uma regressao que remova a checagem de hash permitiria lavar um ultimo evento forjado (SES-003) sem que a CI perceba."
+    fix: {approach: "teste: reescrever o payload do ultimo evento mantendo seq, recalcular nada, chamar append -> SessionIntegrityError", sketch: "", risk: "nenhum", rollback: "n/a"}
+    tests_to_add: ["tests/security/test_w2a.py::test_append_refuses_a_tail_whose_hash_differs_from_the_anchor"]
+    related: ["SES-003"]
+
+  - id: "R2-503"
+    kind: new
+    title: "Mutante sobrevivente: caminho string do shell com shlex posix=False (comportamento Windows) nao e testado"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-02"
+    class: ["test-quality", "platform-difference", "windows"]
+    boundary: "B2"
+    preconditions: "Windows (os.name == 'nt'); rota policy_check/MCP que usa PolicyEngine.decide('shell', str)"
+    locations: ["src/panda_core/policy.py:436@704f387", "tests/test_process.py:24@704f387"]
+    claim: "Forcar posix=False em decide('shell', str) nao quebra nenhum teste; o unico teste de modo Windows e pulado no Linux."
+    evidence:
+      - {leg: A, method: static, detail: "policy.py:436 `shlex.split(resource, posix=os.name != 'nt')`; com posix=False as aspas ficam no token ('\"--force\"'), e _force/_short em shell_policy.py nao removem aspas."}
+      - {leg: B, method: executed, command: "/tmp/claude-0/mut/run.sh (M22)", output_excerpt: "M22 SURVIVED string path uses non-posix shlex (Windows behaviour) :: 771 passed, 3 skipped"}
+    falsification: "No Linux o ramo nao executa; o risco real depende do resultado no Windows (ver trilha C / Fase 6)."
+    impact: "Paridade string vs argv no Windows sem nenhuma protecao de teste."
+    fix: {approach: "testar decide com monkeypatch de os.name='nt' (ou extrair a funcao de tokenizacao e testa-la nos dois modos) para a matriz de push/force com aspas", sketch: "", risk: "baixo", rollback: "n/a"}
+    tests_to_add: ["tests/security/test_w1.py::test_string_and_argv_paths_agree_in_windows_shlex_mode"]
+    related: ["SEC-001", "WIN-001"]
+
+  - id: "R2-504"
+    kind: new
+    title: "Mutantes sobreviventes: caminhos que so o classificador protege (push -d, push --mirror, git clean -f fora do glob) nao tem teste"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-02"
+    class: ["test-quality"]
+    boundary: "B2"
+    preconditions: "nenhuma (lacuna de teste)"
+    locations: ["src/panda_core/shell_policy.py:126@704f387", "src/panda_core/policy.py:248@704f387", "tests/security/test_w1.py:329-330@704f387"]
+    claim: "Os testes de push --mirror, push --delete e git clean usam so formas que as regras de texto do floor ja negam; para 'git push -d' (nenhum teste), 'git -C . push --mirror', 'env git push --mirror', 'git -C . push origin :x', 'git -C . clean -f', 'git clean -xdf' e 'env git clean -f' o classificador e a unica defesa. Remover cada ramo (M02, M04, M26) deixa 768/768 testes verdes."
+    evidence:
+      - {leg: A, method: static, detail: "policy.py:248 glob 'git clean *-f*'; shell_policy.py:126 `if sub == 'clean' and _force(rest)`."}
+      - {leg: B, method: executed, command: "decide_shell vs _decide_rules em 704f387", output_excerpt: "git push -d origin x -> hard_deny | text only: ask shell-push\ngit -C . push --mirror -> hard_deny | text only: ask shell-default-ask\ngit -C . clean -f -> hard_deny shell-git-clean | text only: ask\ngit clean -xdf -> hard_deny shell-git-clean | text only: ask\nM02 SURVIVED push: drop short -d :: 768 passed\nM04 SURVIVED push: drop --mirror :: 768 passed\nM26 SURVIVED git clean -f not hard_deny :: 768 passed"}
+    falsification: "O codigo atual esta correto; o achado e so de cobertura."
+    impact: "Uma regressao no classificador reabre exclusao de arquivos nao rastreados sem aprovacao (via --auto) e a CI fica verde."
+    fix: {approach: "acrescentar os tres argv ao parametrize de test_destructive_and_exfiltrating_variants_fail_closed", sketch: "", risk: "nenhum", rollback: "n/a"}
+    tests_to_add: ["tests/security/test_w1.py::test_destructive_and_exfiltrating_variants_fail_closed[git push -d origin x, git -C . push --mirror, env git push --mirror, git -C . push origin :x, git -C . clean -f, git clean -xdf, env git clean -f]"]
+    related: ["SEC-001", "SEC-007"]
+
+  - id: "R2-505"
+    kind: new
+    title: "Testes de seguranca dependentes de tempo falham sob carga de CPU"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-06"
+    class: ["test-quality", "flaky"]
+    boundary: "B8"
+    preconditions: "CI ou maquina com CPU ocupada (4 processos pytest paralelos)"
+    locations:
+      - "tests/security/test_w2b.py::test_timeout_kills_the_whole_process_group@704f387"
+      - "tests/security/test_w2b.py::test_wait_for_really_bounds_a_running_tool@704f387"
+      - "tests/security/test_w4.py::test_a_long_preview_reports_the_hidden_lines@704f387"
+      - "tests/security/test_w2b.py::test_a_background_child_does_not_outlive_a_finished_command@704f387"
+      - "tests/security/test_w2b.py::test_cancelling_the_tool_call_stops_the_command@704f387"
+    claim: "Cinco testes falharam em rodadas sem relacao com o codigo que verificam (inclusive numa rodada de controle sem nenhuma mutacao)."
+    evidence:
+      - {leg: A, method: static, detail: "ver secao de flakiness no AUDIT-REPORT (orcamentos de tempo fixos / pilot do Textual)."}
+      - {leg: B, method: executed, command: "rodada de controle sem mutacao em copia limpa de 704f387, com 2-4 subagentes rodando pytest ao mesmo tempo", output_excerpt: "CONTROL (no mutation) :: 1 failed, 770 passed, 3 skipped :: ['tests/security/test_w4.py::test_a_long_preview_reports_the_hidden_lines']\nM02 ... :: ['tests/security/test_w2b.py::test_timeout_kills_the_whole_process_group'] (mutacao em push -d, sem relacao)\nM11 ... FAILED tests/security/test_w2b.py::test_wait_for_really_bounds_a_running_tool (mutacao no anchor, sem relacao)"}
+    falsification: "Pode ser so a carga extrema do ambiente de auditoria; ainda assim runners de CI compartilhados tem carga parecida, e um teste de seguranca instavel acaba sendo ignorado ou re-executado ate passar."
+    impact: "Falso vermelho na CI e mascara de regressao real; a mutacao rapida (-x) fica sem sentido."
+    fix: {approach: "trocar sleeps/orcamentos fixos por espera ativa com prazo generoso (poll ate condicao, timeout 10x maior) e, no teste do pilot, esperar o layout (await pilot.pause() em loop ate o scroll existir)", sketch: "", risk: "baixo", rollback: "n/a"}
+    tests_to_add: []
+    related: ["SEC-008", "APR-002"]
+
+  - id: "R2-506"
+    kind: new
+    title: "Lacunas de cobertura em rotas de seguranca: REPL, render, terminal, grep_worker e ramos Windows"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-06"
+    class: ["test-quality", "coverage"]
+    boundary: "B8"
+    preconditions: "nenhuma"
+    locations: ["src/panda_cli/repl.py@704f387", "src/panda_cli/render.py@704f387", "src/panda_core/grep_worker.py@704f387", "src/panda_core/process.py:45-114,189-199@704f387", "src/panda_core/session.py:487-547@704f387"]
+    claim: "Cobertura de ramos 77% no total; repl.py 26%, render.py 20%, terminal.py 46%, grep_worker.py 0% (roda em processo filho, nao medido), process.py 62% (ramo Windows e resolucao de shims), runtime.py 66%."
+    evidence:
+      - {leg: A, method: static, detail: "repl.py e o caminho de aprovacao e de `!cmd` (APR-003, UI-002) e quase nao e exercitado."}
+      - {leg: B, method: executed, command: "pytest --cov=src --cov-branch -q (gates/coverage.txt)", output_excerpt: "src/panda_cli/repl.py 158 112 54 3 26%\nsrc/panda_cli/render.py 252 192 84 2 20%\nsrc/panda_core/grep_worker.py 32 32 14 0 0%\nsrc/panda_core/process.py 183 61 66 6 62%\nTOTAL 7122 1461 2378 395 77%"}
+    falsification: "Parte da logica da REPL e testada por funcoes auxiliares; mesmo assim, o laco de aprovacao e `!cmd` da REPL nao tem teste de ponta a ponta."
+    impact: "Rotas irmas (REPL) podem divergir do cockpit sem sinal na CI."
+    fix: {approach: "habilitar coverage em subprocessos (COVERAGE_PROCESS_START) para grep_worker; testes de REPL com stdin simulado para aprovacao e `!cmd`", sketch: "", risk: "nenhum", rollback: "n/a"}
+    tests_to_add: ["tests/test_repl.py::test_bang_command_goes_through_decide_shell", "tests/test_repl.py::test_repl_approval_renders_markup_literally"]
+    related: ["APR-003", "UI-002"]
+
+  - id: "DRIFT-500"
+    kind: drift
+    title: "SECURITY.md descreve o produto v0.1 (OpenCode/OpenRouter) e um modelo de ameaca que nao trata o corpus como hostil"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-07"
+    class: ["docs-drift"]
+    boundary: "B1"
+    preconditions: "nenhuma"
+    locations: ["SECURITY.md:34@704f387", "SECURITY.md:43@704f387", "SECURITY.md:47-51@704f387", "SECURITY.md:81@704f387", "SECURITY.md:97-101@704f387", "README.md:55@704f387", "src/panda_cli/main.py:442-523@704f387"]
+    claim: "SECURITY.md tem a secao 'Controls in v0.1', diz que o usuario controla o workspace, diz que `panda run` exige o servidor MCP na config do OpenCode e repassa o exit code do OpenCode, cita OpenRouter, diz 'last match wins' e nao menciona floor, never_auto, safe_read, falta de sandbox nem que `--auto` aprova asks comuns."
+    evidence:
+      - {leg: A, method: static, detail: "SECURITY.md:47 'Controls in v0.1'; :34 'the user controls the machine and the workspace'; :81 e :97-101 OpenCode/OpenRouter; main.py:489-523 `panda run` usa ChatRuntime (nativo); README.md:55 'Not an OpenCode wrapper. The OpenCode CLI is not required.'"}
+      - {leg: B, method: independent, detail: "policy.py:477-487 da precedencia a qualquer hard_deny (floor), contrariando 'last match wins' como regra unica; CONTRACT §8 ja descreve o floor."}
+    falsification: "SECURITY.md pode ter sido deixado de proposito como historico; mas e o arquivo que o GitHub mostra como politica de seguranca e o test_contract so checa a linha de versao suportada."
+    impact: "Quem reporta ou avalia o risco le um modelo de ameaca errado (o corpus e hostil desde a rodada 1)."
+    fix: {approach: "reescrever SECURITY.md a partir de CONTRACT §1/§8 e dos known_limits; acrescentar em test_contract checagem de que SECURITY.md nao contem 'OpenRouter' nem 'v0.1' e contem 'corpus' como entrada nao confiavel", sketch: "", risk: "nenhum", rollback: "n/a"}
+    tests_to_add: ["tests/test_contract.py::test_security_policy_describes_the_current_threat_model"]
+    related: ["DOC-001"]
+
+  - id: "DRIFT-501"
+    kind: drift
+    title: "CONTRACT/CHANGELOG/DESIGN afirmam que --auto nunca aprova push; o help de --auto diz que aprova todo ask"
+    severity: P3
+    confidence: high
+    status: confirmed
+    evidence_level: E3
+    root_cause: "RC-01"
+    class: ["docs-drift"]
+    boundary: "B6"
+    preconditions: "nenhuma"
+    locations: ["CHANGELOG.md:48@704f387", "CHANGELOG.md:76-78@704f387", "docs/DESIGN.md:143-144@704f387", "src/panda_cli/main.py:448@704f387"]
+    claim: "Os documentos prometem uma garantia que R2-500 mostra ser falsa; e o help da CLI ('Approve every `ask` action.') contradiz os documentos no sentido oposto."
+    evidence:
+      - {leg: A, method: static, detail: "CHANGELOG.md:48 'a person approves a push; `--auto` never does'; main.py:448 help='Approve every `ask` action.'"}
+      - {leg: B, method: executed, command: "PoC R2-500", output_excerpt: "6 failed, 1 passed"}
+    falsification: "Depois do fix de R2-500 o texto dos documentos fica correto; o help continua errado."
+    impact: "O operador escolhe --auto acreditando numa garantia que nao existe."
+    fix: {approach: "corrigir R2-500; mudar o help para 'Approve ordinary `ask` actions; never pushes or publishing (see CONTRACT §8)'", sketch: "", risk: "nenhum", rollback: "n/a"}
+    tests_to_add: ["tests/test_contract.py::test_auto_help_matches_the_never_auto_contract"]
+    related: ["R2-500", "APR-004"]
+
+  - id: "DRIFT-502"
+    kind: drift
+    title: "CONTRACT §8 'The last matching rule wins' sem a excecao de hard_deny"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-07"
+    class: ["docs-drift"]
+    boundary: "B1"
+    preconditions: "nenhuma"
+    locations: ["docs/CONTRACT.md:390-391@704f387", "src/panda_core/policy.py:477-488@704f387"]
+    claim: "O codigo escolhe o ultimo hard_deny entre todas as regras casadas antes de aplicar 'last match wins'; a frase do contrato e incompleta (o paragrafo do floor ajuda, mas so para regras do floor)."
+    evidence:
+      - {leg: A, method: static, detail: "policy.py:477 `hard = [rule for rule in matched if rule.effect == 'hard_deny']` vem antes de `matched[-1]`."}
+      - {leg: B, method: independent, detail: "uma regra hard_deny do workspace seguida de uma allow do workspace para o mesmo recurso resulta em hard_deny, nao em allow (comportamento desejavel, documentacao errada)."}
+    falsification: "comportamento e o mais seguro; so o texto precisa mudar."
+    impact: "Autores de politica podem achar que uma regra posterior desfaz um hard_deny."
+    fix: {approach: "texto: 'any matching hard_deny wins; otherwise the last matching rule wins'", sketch: "", risk: "nenhum", rollback: "n/a"}
+    tests_to_add: []
+    related: ["TRUST-003"]
+
+  - id: "DRIFT-503"
+    kind: drift
+    title: "README diz que main ja e a linha 0.2.0a5; main ainda e 231e48f (0.2.0a4)"
+    severity: P4
+    confidence: high
+    status: confirmed
+    evidence_level: E2
+    root_cause: "RC-07"
+    class: ["docs-drift"]
+    boundary: "B8"
+    preconditions: "nenhuma"
+    locations: ["README.md:7-9@704f387"]
+    claim: "'The line in `main` is the unreleased `0.2.0a5`' e falso enquanto a branch ccr-97408065-lnoi2u nao for mergeada."
+    evidence:
+      - {leg: A, method: static, detail: "README.md:7-9."}
+      - {leg: B, method: executed, command: "git ls-remote origin", output_excerpt: "231e48f... refs/heads/main\n704f387... refs/heads/ccr-97408065-lnoi2u"}
+    falsification: "fica verdadeiro no merge; registrar so para nao publicar um sdist com o texto antes disso."
+    impact: "baixo"
+    fix: {approach: "nenhuma acao se o merge vier antes da publicacao", sketch: "", risk: "nenhum", rollback: "n/a"}
+    tests_to_add: []
+    related: []
+
+mutation:
+  method: "copia de 704f387 sem .git; uma mutacao de uma linha por copia; PYTHONPATH aponta para a copia; suite inteira sem -x; os 3 testes instaveis conhecidos excluidos (--deselect) e comparacao com rodada de controle sem mutacao (768 passed)"
+  files: ["gates/mutation.txt (rodada 1, -x, ruidosa)", "gates/mutation-rerun.txt (rodada 2, controle)"]
+  total: 28
+  killed: 21
+  survived_real_gap: ["M02 push -d", "M04 push --mirror", "M12 hash do anchor", "M22 shlex posix=False", "M26 git clean -f"]
+  survived_equivalent: ["M11 seq alem do anchor (a checagem de hash recusa do mesmo jeito; so a dica muda de 'recover' para 'verify')", "M27 log truncado (idem)"]
+  results:
+    - {id: M01, site: "shell_policy._force sem -f curto", result: killed}
+    - {id: M02, site: "push sem -d curto", result: survived}
+    - {id: M03, site: "push sem +refspec/:branch", result: killed}
+    - {id: M04, site: "push sem --mirror", result: survived}
+    - {id: M05, site: "decide_shell: <= vira >= (classificador nao escala)", result: killed}
+    - {id: M06, site: "policy_floor sem hard denies built-in", result: killed}
+    - {id: M07, site: "policy_floor sem floor-control-plane", result: killed}
+    - {id: M08, site: "_enforce_provider_boundary aceita userinfo", result: killed}
+    - {id: M09, site: "_enforce_provider_boundary aceita qualquer porta", result: killed}
+    - {id: M10, site: "ensure_plain_path ignora symlink", result: killed}
+    - {id: M11, site: "_check_anchor aceita eventos alem do anchor", result: survived-equivalent}
+    - {id: M12, site: "_check_anchor ignora hash", result: survived}
+    - {id: M13, site: "_redact_assignment no-op", result: killed}
+    - {id: M14, site: "ApprovalScreen aprova com linhas escondidas", result: killed}
+    - {id: M15b, site: "ApprovalScreen sem atraso de armamento", result: killed}
+    - {id: M16, site: "ApprovalScreen sem dupla confirmacao", result: killed}
+    - {id: M17, site: "Agent._log engole OSError do ledger", result: killed}
+    - {id: M18, site: "_kill_tree sem killpg", result: killed}
+    - {id: M19, site: "NEVER_AUTO sem shell-git-push", result: killed}
+    - {id: M20, site: "NEVER_AUTO sem shell-push", result: killed}
+    - {id: M21, site: "NEVER_AUTO sem git-push", result: killed}
+    - {id: M22, site: "decide(shell, str) com posix=False", result: survived}
+    - {id: M23, site: "wrappers nao desembrulhados", result: killed}
+    - {id: M24, site: "rm -R nao recursivo", result: killed}
+    - {id: M25, site: "find -delete sem hard_deny", result: killed}
+    - {id: M26, site: "git clean -f sem hard_deny (classificador)", result: survived}
+    - {id: M27, site: "_check_anchor aceita log truncado", result: survived-equivalent}
+    - {id: M28, site: "git reset --hard sem hard_deny (classificador)", result: killed}
