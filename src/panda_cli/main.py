@@ -515,9 +515,14 @@ def run_command(
             typer.echo(f"[tool] {name}: {state}", err=True)
 
     async def _execute() -> Any:
+        from panda_cli.runtime import policy_notice
+
         runtime = _runtime(
             workspace, log, selected_model, max_steps, private, auto, on_event=on_event
         )
+        notice = policy_notice(runtime.policy_state)
+        if notice and not quiet:
+            typer.echo(notice, err=True)
         try:
             return await runtime.ask(task_text)
         finally:
@@ -1094,6 +1099,80 @@ def policy_show(
         return
     typer.echo(f"policy: {'file' if from_file else 'built-in default'} ({workspace.policy_path})")
     render.rules_table(policy.rules)
+
+
+@policy_app.command("trust")
+@handle
+def policy_trust(
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    show: bool = typer.Option(
+        False, "--show", help="List what trusting would allow; change nothing."
+    ),
+    revoke: bool = typer.Option(
+        False, "--revoke", help="Withdraw trust in this workspace's policy."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Trust without the typed confirmation."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Trust this workspace's policy file, so its allow rules apply.
+
+    Untrusted, a workspace policy can only tighten the built-in policy. Trust is
+    stored outside the workspace and bound to the file's SHA-256: editing the file
+    withdraws it. The floor and the shell classifier always apply.
+    """
+
+    from panda_core.policy import load_policy
+    from panda_core.trust import grant, is_trusted, is_wildcard, loosening_rules
+    from panda_core.trust import revoke as drop
+
+    workspace = _load_workspace(root)
+    if revoke:
+        removed = drop(workspace.root)
+        if json_output:
+            render.print_json({"ok": True, "revoked": removed})
+        else:
+            typer.echo("trust withdrawn" if removed else "this workspace was not trusted")
+        return
+    if not workspace.policy_path.is_file():
+        raise ConfigError(
+            "this workspace has no policy file; the built-in policy applies",
+            hint="nothing to trust",
+        )
+    policy = load_policy(workspace.policy_path)
+    rules = loosening_rules(policy)
+    trusted = is_trusted(workspace.root, workspace.policy_path)
+    listing = [
+        {**rule.to_dict(), "wildcard": is_wildcard(rule)} for rule in rules
+    ]
+    if json_output and (show or not yes):
+        render.print_json({"ok": True, "trusted": trusted, "loosening_rules": listing})
+        return
+    if not json_output:
+        render.trust_listing(workspace.policy_path, listing, trusted=trusted)
+    if show:
+        return
+    if not rules:
+        if not json_output:
+            typer.echo("nothing to trust: the file only tightens the built-in policy")
+        else:
+            render.print_json({"ok": True, "trusted": trusted, "loosening_rules": []})
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            raise ConfigError(
+                "trusting a policy needs a person at the terminal",
+                hint="rerun interactively, or pass --yes after reading `panda policy trust --show`",
+            )
+        word = "trust " + workspace.root.name if any(r["wildcard"] for r in listing) else "trust"
+        answer = typer.prompt(f"type `{word}` to trust these rules", default="", show_default=False)
+        if answer.strip() != word:
+            typer.echo("not trusted")
+            raise typer.Exit(code=5)
+    digest = grant(workspace.root, workspace.policy_path)
+    if json_output:
+        render.print_json({"ok": True, "trusted": True, "policy_sha256": digest})
+    else:
+        typer.echo(f"trusted policy sha256 {digest[:16]}; editing the file withdraws trust")
 
 
 # ---- study -------------------------------------------------------------------

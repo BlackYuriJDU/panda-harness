@@ -60,6 +60,10 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   `ChatRuntime` -> `ToolRegistry` route with a fake approver and effect markers. Open
   holes are strict xfails, so fixing one without flipping its case fails the suite.
 
+### Added
+
+- `panda policy trust [--show] [--yes] [--revoke]`: read what a workspace policy would allow beyond the built-in one, then trust it explicitly (typed confirmation); the cockpit, REPL and `panda run` say how many allow rules are ignored until then.
+
 ### Changed
 
 - `panda validate` through `run_shell` now needs an approval; the `validate` tool is the

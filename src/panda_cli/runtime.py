@@ -69,6 +69,7 @@ class ChatRuntime:
         self._model_source = "config"
         policy, from_file = load_policy_or_default(workspace.policy_path)
         self.policy = engine_for(workspace, policy, from_file=from_file)
+        self.policy_state = _policy_state(policy, from_file, self.policy)
         if session is None:
             workspace.ensure_runtime_dirs()
             session = SessionLog.create(
@@ -82,6 +83,7 @@ class ChatRuntime:
                     "base_url": workspace.config.provider.base_url,
                     "env_names": _env_names(),
                     "transport": "cockpit",
+                    "workspace_policy": self.policy_state,
                 },
                 private=private,
                 redact_enabled=workspace.config.logging.redact,
@@ -207,6 +209,7 @@ class ChatRuntime:
         usage = self.agent.usage_total
         return {
             "root": str(self.workspace.root),
+            "workspace_policy": self.policy_state,
             "initialized": self.workspace.initialized,
             "branch": git.get("branch"),
             "dirty": git.get("dirty"),
@@ -268,3 +271,29 @@ class ChatRuntime:
 
 
 __all__ = ["ApprovalCallback", "ChatRuntime", "EventCallback"]
+
+
+def _policy_state(policy: Any, from_file: bool, engine: Any) -> dict[str, Any]:
+    """Whether the workspace policy file is trusted, and how many allows it ignores."""
+
+    from panda_core.trust import loosening_rules
+
+    if not from_file:
+        return {"source": "built-in", "trusted": None, "ignored_allow_rules": 0}
+    trusted = engine.baseline is None
+    ignored = 0 if trusted else len(loosening_rules(policy))
+    return {"source": "file", "trusted": trusted, "ignored_allow_rules": ignored}
+
+
+def policy_notice(state: dict[str, Any]) -> str | None:
+    """One line for the operator when the workspace policy asks for more than it gets."""
+
+    count = int(state.get("ignored_allow_rules") or 0)
+    if not count:
+        return None
+    rules = "rule" if count == 1 else "rules"
+    return (
+        f"workspace policy: {count} allow {rules} ignored until you trust the file"
+        " · see `panda policy trust --show`"
+    )
+

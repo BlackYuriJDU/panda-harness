@@ -209,6 +209,41 @@ def session_detail(summary: Any, verification: Any, events: Iterable[Any]) -> No
     output.print(table)
 
 
+def trust_listing(path: Any, rules: list[dict[str, Any]], *, trusted: bool) -> None:
+    """What trusting a workspace policy would allow, in words a person can check."""
+
+    from panda_core.display import sanitize_display
+
+    output = console()
+    state = Text.assemble(
+        ("policy ", WHITE_SHADOW),
+        (sanitize_display(str(path)), WHITE),
+        ("  ", ""),
+        ("trusted", GREEN) if trusted else ("not trusted: only tightens", AMBER),
+    )
+    output.print(state)
+    if not rules:
+        output.print(Text("no allow rule beyond the built-in policy", style=WHITE_SHADOW))
+        return
+    output.print(Text("trusting turns these into allow, without approval:", style=WHITE))
+    for rule in rules:
+        line = Text("  ")
+        line.append("! " if rule["wildcard"] else "- ", style=AMBER if rule["wildcard"] else WHITE)
+        line.append(sanitize_display(", ".join(rule["actions"])), style=WHITE)
+        line.append("  ")
+        line.append(sanitize_display(" | ".join(rule["resources"])), style=WHITE)
+        line.append(f"  ({sanitize_display(rule['id'])})", style=WHITE_SHADOW)
+        if rule["wildcard"]:
+            line.append("  everything for this action", style=AMBER)
+        output.print(line)
+    output.print(
+        Text(
+            "the floor (secrets, control plane, .git, destructive commands) still applies",
+            style=WHITE_SHADOW,
+        )
+    )
+
+
 def rules_table(rules: Iterable[Any], decision: Any | None = None) -> None:
     output = console()
     table = Table(show_header=True, header_style=f"bold {WHITE_SHADOW}", box=None, pad_edge=False)

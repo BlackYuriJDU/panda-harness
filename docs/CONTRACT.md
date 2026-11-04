@@ -177,6 +177,7 @@ the environment variable name is.
 | `panda policy check <action> <resource>` | Evaluate one action. |
 | `panda policy explain <action> <resource>` | Show the matching rules. |
 | `panda policy show` | Print the effective policy. |
+| `panda policy trust [--show] [--yes] [--revoke]` | List the allow rules a workspace policy adds over the built-in one; trust the file (typed confirmation, `--yes` for scripts) or withdraw trust. |
 | `panda auth set` | Store a provider key outside the workspace (prompted by default; an exported variable still wins). |
 | `panda auth status` | Show where the key would come from. Never prints it. |
 | `panda auth clear` | Remove the stored key. |
@@ -475,7 +476,7 @@ trusted, each decision is the stricter of the workspace policy and the built-in
 policy (higher risk on a tie), so an `allow` in the file is a no-op and a workspace
 `risk`/`reason` cannot lower what the built-in policy says. Trust is user state
 (`PANDA_TRUST_FILE`, default next to the user workspace) bound to the file's SHA-256;
-editing the file withdraws it. A trusted file's rules apply, but never above the
+editing the file withdraws it. `panda policy trust --show` lists the allow rules the file adds; trusting needs a typed confirmation (`trust`, or `trust <folder>` when a rule allows a whole action) or `--yes`, and `--auto` never grants it. The cockpit, the REPL and `panda run` say how many allow rules are ignored, and `session.start` records `workspace_policy` (`source`, `trusted`, `ignored_allow_rules`). Allow rules that `panda init` wrote up to 0.2.0a5 need no trust. A trusted file's rules apply, but never above the
 floor or the shell classifier. Rule files are validated strictly: `actions` and
 `resources` must be non-empty lists of strings, `risk` one of `low`, `medium`,
 `high`, `critical`, and unknown fields are refused (exit `2`).

@@ -11,7 +11,7 @@ import asyncio
 from rich.text import Text
 
 from panda_cli import render
-from panda_cli.runtime import ChatRuntime
+from panda_cli.runtime import ChatRuntime, policy_notice
 from panda_core.agent import DEFAULT_MAX_STEPS, AgentEvent
 from panda_core.display import sanitize_display
 from panda_core.errors import PandaError
@@ -69,6 +69,9 @@ def _banner(runtime: ChatRuntime) -> None:
         f"{len(runtime.tools.names())} tools"
     )
     _say(f"session {status['session_id']} · /help for commands", style="dim")
+    notice = policy_notice(status.get("workspace_policy") or {})
+    if notice:
+        _say(notice, style="yellow")
 
 
 def _on_event(event: AgentEvent) -> None:

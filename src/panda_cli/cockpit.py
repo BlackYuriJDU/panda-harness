@@ -31,7 +31,7 @@ from textual.worker import Worker
 
 from panda_cli import mascot
 from panda_cli.brand import PALETTE, spark_lines
-from panda_cli.runtime import ChatRuntime
+from panda_cli.runtime import ChatRuntime, policy_notice
 from panda_core.agent import DEFAULT_MAX_STEPS
 from panda_core.display import sanitize_display
 from panda_core.errors import PandaError
@@ -546,6 +546,9 @@ class PandaCockpit(App[None]):
                 " · /validate fails until it exists",
                 style=AMBER,
             )
+        notice = policy_notice(status.get("workspace_policy") or {})
+        if notice:
+            text.append(f"\n{notice}", style=AMBER)
         text.append('\n"Evidence or it did not happen."  /help for commands', style=SHADOW)
         await self.query_one("#transcript", VerticalScroll).mount(
             Static(text, classes="block")

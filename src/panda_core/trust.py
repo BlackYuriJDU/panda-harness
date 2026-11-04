@@ -81,3 +81,44 @@ def revoke(root: Path) -> bool:
         return False
     atomic_write_json(trust_path(), data)
     return True
+
+
+# Allow rules that earlier built-in policies wrote into `.panda/policy.json`
+# (`panda init` up to 0.2.0a5). They loosen nothing a user decided, so they never
+# ask for trust; under the stricter-of rule they are simply no-ops.
+_LEGACY_ALLOW = frozenset(
+    {
+        ("shell-readonly", ("shell",), (
+            "git status*", "git diff*", "git log*", "git show*", "git branch*",
+            "panda validate*",
+        )),
+    }
+)
+
+
+def loosening_rules(policy: Any) -> list[Any]:
+    """`allow` rules of a workspace policy that the built-in policy does not have.
+
+    Only these change anything when the file is trusted, so they are what the
+    user is asked to read before trusting it.
+    """
+
+    from panda_core.policy import default_policy
+
+    built_in = set(default_policy().rules)
+    found = []
+    for rule in policy.rules:
+        if rule.effect != "allow" or rule in built_in:
+            continue
+        if (rule.id, tuple(rule.actions), tuple(rule.resources)) in _LEGACY_ALLOW:
+            continue
+        found.append(rule)
+    return found
+
+
+def is_wildcard(rule: Any) -> bool:
+    """A rule that allows a whole action (`shell *`, `write *`)."""
+
+    return any(resource.strip() in {"*", "**", "*/*"} for resource in rule.resources) or any(
+        action.strip() == "*" for action in rule.actions
+    )
