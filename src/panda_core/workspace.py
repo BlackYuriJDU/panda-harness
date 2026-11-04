@@ -6,7 +6,8 @@ import contextlib
 import json
 import os
 import platform
-import subprocess
+import re
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from panda_core.config import (
 )
 from panda_core.errors import ConfigError
 from panda_core.process import command_version, parse_version
+from panda_core.safe_read import read_workspace_file
 
 CONFIG_DIR = ".panda"
 CONFIG_FILE = "config.json"
@@ -30,6 +32,10 @@ POLICY_FILE = "policy.json"
 SESSIONS_DIR = "sessions"
 BACKUPS_DIR = "backups"
 INSTRUCTIONS_FILE = "instructions.md"
+
+_GIT_FILE_MAX = 1_000_000
+_GIT_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_GIT_BRANCH_REF = re.compile(r"refs/heads/[A-Za-z0-9._/+-]{1,200}")
 
 
 def _candidates(start: Path) -> list[Path]:
@@ -235,44 +241,62 @@ class Workspace:
         return relative.as_posix()
 
     def git_state(self) -> dict:
+        """Branch and commit of the workspace repository, read without running git.
+
+        A corpus can arrive with its own `.git` (zip, copy). Its config names
+        programs (clean/smudge filters, hooks, fsmonitor) that any `git status`
+        would run, and the probe used to pass them the whole environment
+        (R2-106). So nothing is executed here: HEAD and the ref are read as
+        plain files, and `dirty` is `None` (unknown) because only git can tell.
+        A `.git` file (worktree, submodule) points elsewhere and is not followed.
+        """
+
         git_dir = self.root / ".git"
-        if not git_dir.exists():
-            return {"repo": False}
+        unknown = {"repo": True, "commit": None, "branch": None, "dirty": None}
         try:
-            # One subprocess instead of three: `--branch` carries oid and head.
-            result = subprocess.run(
-                ["git", "status", "--porcelain=v2", "--branch"],
-                cwd=self.root,
-                # `.git/config` travels with the corpus: do not let it name a program
-                # (core.fsmonitor) that this read-only boot probe would execute.
-                env={
-                    **os.environ,
-                    "GIT_CONFIG_COUNT": "1",
-                    "GIT_CONFIG_KEY_0": "core.fsmonitor",
-                    "GIT_CONFIG_VALUE_0": "false",
-                },
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=1.5,
-                check=False,
+            mode = os.lstat(git_dir).st_mode
+        except FileNotFoundError:
+            return {"repo": False}
+        except OSError:
+            return unknown
+        if not stat.S_ISDIR(mode):
+            return unknown
+        head = self._git_file("HEAD")
+        if head is None:
+            return unknown
+        head = head.strip()
+        if _GIT_OID.fullmatch(head):
+            return {**unknown, "commit": head}
+        if not head.startswith("ref: "):
+            return unknown
+        ref = head[len("ref: ") :].strip()
+        if not _GIT_BRANCH_REF.fullmatch(ref) or ".." in ref or "//" in ref:
+            return unknown
+        branch = ref[len("refs/heads/") :]
+        commit = self._resolve_ref(ref)
+        return {**unknown, "branch": branch, "commit": commit}
+
+    def _git_file(self, relative: str) -> str | None:
+        try:
+            return read_workspace_file(
+                self.root, self.root / ".git" / relative, max_bytes=_GIT_FILE_MAX
             )
-        except (OSError, subprocess.SubprocessError):
-            return {"repo": True, "commit": None, "branch": None, "dirty": None}
-        commit: str | None = None
-        branch: str | None = None
-        dirty = False
-        for line in result.stdout.splitlines():
-            if line.startswith("# branch.oid "):
-                value = line[len("# branch.oid ") :].strip()
-                commit = None if value in {"(initial)", "(unknown)"} else value
-            elif line.startswith("# branch.head "):
-                value = line[len("# branch.head ") :].strip()
-                branch = None if value == "(detached)" else value
-            elif line and not line.startswith("#"):
-                dirty = True
-        return {"repo": True, "commit": commit, "branch": branch, "dirty": dirty}
+        except (ConfigError, OSError, ValueError):
+            return None
+
+    def _resolve_ref(self, ref: str) -> str | None:
+        loose = self._git_file(ref)
+        if loose is not None:
+            value = loose.strip()
+            return value if _GIT_OID.fullmatch(value) else None
+        packed = self._git_file("packed-refs")
+        if packed is None:
+            return None
+        for line in packed.splitlines():
+            oid, _, name = line.partition(" ")
+            if name.strip() == ref and _GIT_OID.fullmatch(oid):
+                return oid
+        return None
 
     def tool_versions(self, *, probe: bool = True) -> dict:
         """Tool versions for diagnostics.

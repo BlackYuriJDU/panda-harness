@@ -342,6 +342,14 @@ def init_panel(result: Any) -> None:
     )
 
 
+def _dirty_label(dirty: object) -> tuple[str, str]:
+    """`None` means Panda did not run git to find out (R2-106): never say "clean"."""
+
+    if dirty is None:
+        return ("worktree state unknown", WHITE_SHADOW)
+    return ("dirty", AMBER) if dirty else ("clean", GREEN)
+
+
 def status_panel(info: dict[str, Any], last_session: Any = None) -> None:
     output = console()
     root = info.get("root", "")
@@ -379,10 +387,7 @@ def status_panel(info: dict[str, Any], last_session: Any = None) -> None:
             ("git    ", WHITE_SHADOW),
             (str(branch), WHITE),
             ("  ", ""),
-            (
-                "dirty" if git.get("dirty") else "clean",
-                AMBER if git.get("dirty") else GREEN,
-            ),
+            _dirty_label(git.get("dirty")),
         ),
     ]
     tools = info.get("tools", {})
