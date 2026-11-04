@@ -998,10 +998,11 @@ def session_close(
 
 # ---- policy ------------------------------------------------------------------
 def _policy_engine(workspace: Workspace) -> tuple[PolicyEngine, str]:
-    from panda_core.policy import PolicyEngine, load_policy_or_default
+    from panda_core.policy import engine_for, load_policy_or_default
 
     policy, from_file = load_policy_or_default(workspace.policy_path)
-    return PolicyEngine(policy, root=workspace.root), "file" if from_file else "built-in default"
+    engine = engine_for(workspace, policy, from_file=from_file)
+    return engine, "file" if from_file else "built-in default"
 
 
 @policy_app.command("check")
@@ -1027,6 +1028,7 @@ def policy_check(
         decision = engine.authorize(action, normalized, approved=True)
     payload = decision.to_dict()
     payload["policy_source"] = source
+    payload["workspace_policy_trusted"] = source == "file" and engine.baseline is None
     payload["approved"] = approve
     if json_output:
         render.print_json(payload)
@@ -1061,6 +1063,7 @@ def policy_explain(
             {
                 "ok": True,
                 "policy_source": source,
+                "workspace_policy_trusted": source == "file" and engine.baseline is None,
                 "decision": decision.to_dict(),
                 "matching_rules": [rule.to_dict() for rule in matched],
             }

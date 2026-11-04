@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -32,12 +33,46 @@ class ShellVerdict:
     read_paths: tuple[str, ...] = ()
 
 
-_WRAPPERS = frozenset({"env", "command", "nohup", "nice", "time", "sudo", "doas", "exec"})
+# Wrappers that run the rest of argv as a command, with the options that take a
+# value (so the value is not mistaken for the program). R2-103: `sudo -u root git
+# push --force` and `timeout 60 git push --force` used to fall back to `ask`.
+_WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "sudo": frozenset({"-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host",
+                       "-p", "--prompt", "-r", "--role", "-t", "--type", "-U", "--other-user",
+                       "-D", "--chdir", "-R", "--chroot", "-T", "--command-timeout"}),
+    "doas": frozenset({"-u", "-C"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({"-c", "--class", "-n", "--classdata"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "time": frozenset({"-f", "--format", "-o", "--output"}),
+    "exec": frozenset({"-a"}),
+    "command": frozenset(),
+    "nohup": frozenset(),
+    "setsid": frozenset(),
+    "chrt": frozenset({"-T", "--sched-runtime", "-P", "--sched-period", "-D", "--sched-deadline"}),
+    "taskset": frozenset({"--cpu-list"}),
+    "xargs": frozenset({"-I", "-i", "-n", "--max-args", "-P", "--max-procs", "-d", "--delimiter",
+                        "-E", "-e", "-L", "-l", "-s", "--max-chars", "-a", "--arg-file"}),
+    "flock": frozenset({"-w", "--timeout", "-E", "--conflict-exit-code"}),
+    "busybox": frozenset(),
+}
+# Wrappers with one positional before the command (duration, priority, CPU mask, lock file).
+_WRAPPER_POSITIONAL = {"timeout": 1, "chrt": 1, "taskset": 1, "flock": 1}
+# Options whose value is itself a command line.
+_COMMAND_STRING_OPTIONS = {"env": {"-S", "--split-string"}, "flock": {"-c", "--command"},
+                           "script": {"-c", "--command"}}
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "ash", "fish"})
+_WRAPPERS = frozenset(_WRAPPER_VALUE_OPTIONS)
+_SUFFIX_PROGRAMS = frozenset({"git", "rm", "find"})
 _GIT_VALUE_GLOBALS = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
 )
 _GIT_FLAG_GLOBALS = frozenset(
-    {"--no-pager", "-P", "-p", "--paginate", "--bare", "--no-optional-locks", "--no-advice"}
+    {"--no-pager", "-P", "-p", "--paginate", "--bare", "--no-optional-locks", "--no-advice",
+     "--glob-pathspecs", "--noglob-pathspecs", "--literal-pathspecs", "--icase-pathspecs",
+     "--no-replace-objects", "--no-lazy-fetch"}
 )
 _READ_ONLY = frozenset({"status", "diff", "log", "show"})
 _FORBIDDEN_READ_FLAGS = (("--output", 5), ("--no-index", 7), ("--ext-diff", 5))
@@ -57,12 +92,26 @@ _SAFE_BRANCH = re.compile(
 )
 
 
+_SHORT_NAME = re.compile(r"([a-z0-9_]{1,6})~[0-9]+")
+
+
 def _program(token: str) -> str:
+    """The program a token names, across Windows spellings (R2-317).
+
+    `git.exe.`, `git.exe `, `git.exe::$DATA`, `git.com` and the 8.3 name `GIT~1.EXE`
+    all start git.
+    """
+
     name = os.path.basename(token.replace("\\", "/")).lower()
-    for suffix in (".exe", ".cmd", ".bat"):
+    if "::" in name:
+        name = name.split("::", 1)[0]
+    name = name.rstrip(". ")
+    for suffix in (".exe", ".cmd", ".bat", ".com"):
         if name.endswith(suffix):
-            return name[: -len(suffix)]
-    return name
+            name = name[: -len(suffix)].rstrip(". ")
+            break
+    short = _SHORT_NAME.fullmatch(name)
+    return short.group(1) if short else name
 
 
 def _long(arg: str, full: str, minimum: int) -> bool:
@@ -78,7 +127,7 @@ def _short(args: Sequence[str], letter: str) -> bool:
 
 def _force(args: Sequence[str]) -> bool:
     return _short(args, "f") or any(
-        a.split("=", 1)[0].startswith("--force") or _long(a, "--force", 5) for a in args
+        a.split("=", 1)[0].startswith("--force") or _long(a, "--force", 3) for a in args
     )
 
 
@@ -91,28 +140,47 @@ def _unsafe_path(token: str) -> bool:
 def _git(args: Sequence[str]) -> ShellVerdict | None:
     index = 0
     config = False
+    unknown_option = False
+    settings: list[str] = []
     while index < len(args) and args[index].startswith("-"):
         token = args[index]
         name = token.split("=", 1)[0]
         if name in _GIT_VALUE_GLOBALS:
-            config = config or name in {"-c", "--config-env"}
-            index += 1 if "=" in token else 2
+            if name in {"-c", "--config-env"}:
+                config = True
+                if "=" in token and token.startswith("--"):
+                    settings.append(token.split("=", 1)[1].lower())
+                elif index + 1 < len(args):
+                    settings.append(args[index + 1].lower())
+            index += 1 if ("=" in token and token.startswith("--")) else 2
         elif token in _GIT_FLAG_GLOBALS:
             index += 1
         else:
-            return ShellVerdict("ask", "medium", "unrecognised git option", "shell-git-option")
+            # Keep reading: an unknown global must not hide `clean -fdx` (R2-202).
+            unknown_option = True
+            index += 1
     if index >= len(args):
         return None
-    sub, rest = args[index], list(args[index + 1 :])
+    verdict = _git_subcommand(args[index], list(args[index + 1 :]), config, settings)
+    if unknown_option and (verdict is None or SEVERITY[verdict.effect] < SEVERITY["ask"]):
+        return ShellVerdict("ask", "medium", "unrecognised git option", "shell-git-option")
+    return verdict
+
+
+def _git_subcommand(
+    sub: str, rest: Sequence[str], config: bool, settings: Sequence[str]
+) -> ShellVerdict:
     positional = [a for a in rest if not a.startswith("-")]
 
     if sub == "push":
         if (
             _force(rest)
-            or _long_any(rest, "--mirror", 5)
-            or _long_any(rest, "--delete", 5)
+            or _long_any(rest, "--mirror", 3)
+            or _long_any(rest, "--delete", 3)
+            or _long_any(rest, "--prune", 3)
             or _short(rest, "d")
             or any(p[:1] in {"+", ":"} for p in positional)
+            or any(item.startswith("remote.") and ".mirror" in item for item in settings)
         ):
             return ShellVerdict(
                 "hard_deny",
@@ -121,7 +189,7 @@ def _git(args: Sequence[str]) -> ShellVerdict | None:
                 "shell-git-push-force",
             )
         return ShellVerdict("ask", "high", "publishes commits", "shell-git-push")
-    if sub == "reset" and _long_any(rest, "--hard", 4):
+    if sub == "reset" and _long_any(rest, "--hard", 3):
         return ShellVerdict("hard_deny", "critical", "discards local work", "shell-git-reset-hard")
     if sub == "clean" and _force(rest):
         return ShellVerdict("hard_deny", "critical", "deletes untracked files", "shell-git-clean")
@@ -137,7 +205,7 @@ def _long_any(args: Sequence[str], full: str, minimum: int) -> bool:
 
 
 def _branch(rest: Sequence[str], positional: Sequence[str]) -> ShellVerdict:
-    if _short(rest, "D") or _short(rest, "d") or _force(rest) or _long_any(rest, "--delete", 5):
+    if _short(rest, "D") or _short(rest, "d") or _force(rest) or _long_any(rest, "--delete", 3):
         return ShellVerdict("hard_deny", "critical", "deletes a branch", "shell-git-branch-delete")
     flags = [a for a in rest if a.startswith("-")]
     listing = any(a in {"-l", "--list"} or a.startswith("--list") for a in flags)
@@ -171,22 +239,122 @@ def _read_only(rest: Sequence[str], config: bool) -> ShellVerdict:
     return ShellVerdict(effect, risk, reason, rule, tuple(paths))
 
 
+def _split_command_string(text: str) -> list[list[str]]:
+    """Commands in a shell string, split at `;`, `&&`, `||`, `|` and `&`."""
+
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = text.split()
+    commands: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= set(";&|()"):
+            commands.append([])
+        else:
+            commands[-1].append(token)
+    return [command for command in commands if command]
+
+
+def _worst(verdicts: Sequence[ShellVerdict | None]) -> ShellVerdict | None:
+    found = [v for v in verdicts if v is not None]
+    if not found:
+        return None
+    return max(found, key=lambda item: SEVERITY[item.effect])
+
+
+def _unwrap(program: str, args: list[str], depth: int) -> ShellVerdict | None:
+    """Classify the command a wrapper runs, consuming its options and positionals."""
+
+    value_options = _WRAPPER_VALUE_OPTIONS.get(program, frozenset())
+    string_options = _COMMAND_STRING_OPTIONS.get(program, set())
+    nested: list[ShellVerdict | None] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        name = arg.split("=", 1)[0]
+        if arg == "--":
+            index += 1
+            break
+        if program == "env" and "=" in arg and not arg.startswith("-"):
+            index += 1  # NAME=VALUE
+            continue
+        if not arg.startswith("-") or arg == "-":
+            break
+        value = None
+        if name in value_options or name in string_options:
+            if "=" in arg:
+                value = arg.split("=", 1)[1]
+                index += 1
+            else:
+                value = args[index + 1] if index + 1 < len(args) else ""
+                index += 2
+        elif len(name) > 2 and not name.startswith("--") and name[:2] in value_options:
+            value = name[2:]  # attached value: `-oL`, `-uroot`
+            index += 1
+        else:
+            index += 1
+        if value is not None and (name in string_options or name[:2] in string_options):
+            nested += [classify_shell(cmd, depth + 1) for cmd in _split_command_string(value)]
+    for _ in range(_WRAPPER_POSITIONAL.get(program, 0)):
+        if index < len(args) and not (program == "flock" and args[index].startswith("-")):
+            index += 1
+    if program == "flock" and index < len(args) and args[index] in {"-c", "--command"}:
+        if index + 1 < len(args):
+            commands = _split_command_string(args[index + 1])
+            nested += [classify_shell(cmd, depth + 1) for cmd in commands]
+        return _worst(nested)
+    nested.append(classify_shell(args[index:], depth + 1))
+    return _worst(nested)
+
+
+def _shell_string(args: list[str], depth: int) -> ShellVerdict | None:
+    """`sh -c "git push --force"`: classify each command of the string."""
+
+    for index, arg in enumerate(args):
+        if arg == "-c" or (arg.startswith("-") and not arg.startswith("--") and "c" in arg):
+            if index + 1 < len(args):
+                commands = _split_command_string(args[index + 1])
+                return _worst([classify_shell(cmd, depth + 1) for cmd in commands])
+            return None
+        if not arg.startswith("-"):
+            return None
+    return None
+
+
 def classify_shell(argv: Sequence[str], _depth: int = 0) -> ShellVerdict | None:
     """Return a verdict for commands this module understands, else None."""
 
-    if not argv:
+    if not argv or _depth > 4:
         return None
     program, args = _program(argv[0]), list(argv[1:])
-    if program in _WRAPPERS and _depth < 3:
-        index = 0
-        while index < len(args) and (
-            args[index].startswith("-") or "=" in args[index] or args[index].isdigit()
-        ):
-            index += 1
-        return classify_shell(args[index:], _depth + 1)
+    if program in _WRAPPERS:
+        return _unwrap(program, args, _depth)
+    if program in _SHELLS:
+        return _shell_string(args, _depth)
     if program == "git":
         return _git(args)
-    recursive = _short(args, "r") or _short(args, "R") or _long_any(args, "--recursive", 5)
+    head = _classify_program(program, args)
+    if head is not None:
+        return head
+    # An unknown program followed by a known dangerous one (`mywrap git push --force`)
+    # may be a wrapper Panda does not know: never let it look harmless.
+    for offset in range(1, len(argv)):
+        if _program(argv[offset]) in _SUFFIX_PROGRAMS:
+            suffix = classify_shell(argv[offset:], _depth + 1)
+            if suffix is not None and SEVERITY[suffix.effect] >= SEVERITY["ask"]:
+                return ShellVerdict(
+                    "ask",
+                    "high",
+                    f"an unrecognised program runs `{_program(argv[offset])}`: {suffix.reason}",
+                    "shell-wrapped-command",
+                )
+    return None
+
+
+def _classify_program(program: str, args: list[str]) -> ShellVerdict | None:
+    recursive = _short(args, "r") or _short(args, "R") or _long_any(args, "--recursive", 3)
     if program == "rm" and recursive:
         return ShellVerdict("hard_deny", "critical", "recursive deletion", "shell-rm-recursive")
     if program == "find":

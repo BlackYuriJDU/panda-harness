@@ -8,37 +8,34 @@ cases:
     make_dirs: ["git status"]
     args: {argv: ["git status/../../../../../../../../usr/bin/touch", "{marker}"]}
     expected: {executed: false}
-    open_until: W7
   - id: shell-argv0-dir-prefix-decision-R2-100
     refs: [R2-100]
     route: decide_shell
     argv: ["git status/../../usr/bin/python3", "-c", "print(1)"]
     expected: {max_effect: ask}
-    open_until: W7
   # ---- R2-104: panda validate --root runs an agent-written validator
   - id: shell-panda-validate-root-R2-104
     refs: [R2-104, R2-205]
     route: decide_shell
     argv: ["panda", "validate", "--root", "corpus/x"]
     expected: {max_effect: ask}
-    open_until: W7
   # ---- R2-103 / R2-202: wrappers and spellings lowered hard_deny to ask
   - {id: rm-abbrev-recursive-R2-103, refs: [R2-103], route: decide_shell,
-     argv: ["rm", "--r", "x"], expected: {effect: hard_deny}, open_until: W7}
+     argv: ["rm", "--r", "x"], expected: {effect: hard_deny}}
   - {id: timeout-push-force-R2-103, refs: [R2-103], route: decide_shell,
-     argv: ["timeout", "60", "git", "push", "--force"], expected: {effect: hard_deny}, open_until: W7}
+     argv: ["timeout", "60", "git", "push", "--force"], expected: {effect: hard_deny}}
   - {id: stdbuf-reset-hard-R2-103, refs: [R2-103], route: decide_shell,
-     argv: ["stdbuf", "-o0", "git", "reset", "--hard"], expected: {effect: hard_deny}, open_until: W7}
+     argv: ["stdbuf", "-o0", "git", "reset", "--hard"], expected: {effect: hard_deny}}
   - {id: sudo-u-push-force-R2-103, refs: [R2-103], route: decide_shell,
-     argv: ["sudo", "-u", "root", "git", "push", "--force"], expected: {effect: hard_deny}, open_until: W7}
+     argv: ["sudo", "-u", "root", "git", "push", "--force"], expected: {effect: hard_deny}}
   - {id: env-u-push-force-R2-103, refs: [R2-103], route: decide_shell,
-     argv: ["env", "-u", "HOME", "git", "push", "--force"], expected: {effect: hard_deny}, open_until: W7}
+     argv: ["env", "-u", "HOME", "git", "push", "--force"], expected: {effect: hard_deny}}
   - {id: env-C-reset-hard-R2-103, refs: [R2-103], route: decide_shell,
-     argv: ["env", "-C", ".", "git", "reset", "--hard"], expected: {effect: hard_deny}, open_until: W7}
+     argv: ["env", "-C", ".", "git", "reset", "--hard"], expected: {effect: hard_deny}}
   - {id: push-prune-R2-103, refs: [R2-103], route: decide_shell,
-     argv: ["git", "push", "--prune", "origin"], expected: {effect: hard_deny}, open_until: W7}
+     argv: ["git", "push", "--prune", "origin"], expected: {effect: hard_deny}}
   - {id: glob-pathspecs-clean-R2-202, refs: [R2-202], route: decide_shell,
-     argv: ["git", "--glob-pathspecs", "clean", "-fdx"], expected: {effect: hard_deny}, open_until: W7}
+     argv: ["git", "--glob-pathspecs", "clean", "-fdx"], expected: {effect: hard_deny}}
   # ---- R2-504: forms only the classifier protects (mutants M02, M04, M26)
   - {id: push-delete-short-R2-504, refs: [R2-504], route: decide_shell,
      argv: ["git", "push", "-d", "origin", "x"], expected: {effect: hard_deny}}

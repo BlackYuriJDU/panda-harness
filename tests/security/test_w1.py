@@ -390,11 +390,19 @@ def test_reading_a_secret_through_git_is_refused(command: str) -> None:
         "git branch --list",
         "git branch -a",
         "git branch --show-current",
-        "panda validate",
     ],
 )
 def test_neg_ordinary_read_only_commands_stay_allowed(command: str) -> None:
     assert decide_shell(command) == "allow"
+
+
+@pytest.mark.parametrize(
+    "command", ["panda validate", "panda validate --root corpus/x", "panda validate --json"]
+)
+def test_panda_validate_through_the_shell_needs_an_approval(command: str) -> None:
+    # Owner-approved change (R2-104): `--root` loads a nested workspace whose
+    # validator the agent wrote. The `validate` tool is the unattended route.
+    assert decide_shell(command) == "ask"
 
 
 def test_neg_force_push_is_still_hard_denied_with_approval() -> None:

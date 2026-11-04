@@ -32,6 +32,27 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   for read-denied files); what Panda cannot isolate needs an approval. `--attr-source`
   alone does not cover `.git/info/attributes`: verified on git 2.43 and pinned by a case.
 - Writing into any `.git` directory is now a floor `hard_deny` (R2-201).
+- Workspace policy (R2-113, R2-207, R2-116): an `allow` rule in `.panda/policy.json`
+  opened arbitrary shell and writes, and a workspace rule could relabel a push as risk
+  `low`, "pre-approved". Unless the user trusts the file, decisions are now the stricter
+  of the workspace and built-in policies; trust is bound to the file's SHA-256 and kept
+  outside the workspace. Rule files are validated strictly (lists of strings, risk enum,
+  no unknown fields).
+- Shell policy (R2-100, R2-104, R2-103, R2-202, R2-203, R2-317): `allow` globs matched
+  joined text, so `git status/../../usr/bin/touch` and `panda validate --root
+  corpus/x` ran without approval, and wrappers or spellings lowered `hard_deny` to
+  `ask` (`timeout`, `stdbuf`, `sudo -u`, `env -u/-C`, `rm --r`, `push --prune`,
+  `git --glob-pathspecs clean -fdx`, `git.exe.`, `GIT~1.EXE`). Shell `allow` now comes
+  only from the argv classifier (plain `git` read-only forms) or a trusted rule
+  matched by tokens; the classifier unwraps wrappers by option arity, splits `sh -c`
+  and `env -S` strings, and escalates an unknown wrapper around git/rm/find. The
+  decision keeps the classifier's rule and risk on a tie, which is the root cause of
+  the `env git push` auto-approval (R2-500).
+- Validator closure (R2-105, R2-210): the configured validator, its directory,
+  `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
+  `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.
+- Windows (first CI run of the branch): non-UTF-8 child output in the ANSI code page
+  was decoded as U+FFFD; it is now decoded with the system code page.
 
 ### Added
 
@@ -41,6 +62,9 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
 
 ### Changed
 
+- `panda validate` through `run_shell` now needs an approval; the `validate` tool is the
+  unattended route (owner approved the test change).
+- CI runs the Ubuntu and Windows matrix on every branch push.
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

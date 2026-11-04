@@ -259,7 +259,7 @@ def test_child_output_in_the_windows_code_page_is_not_mangled() -> None:
 
     # First Windows CI run of this branch: cp1252 output became U+FFFD.
     assert decode_output("olá\n".encode("cp1252"), fallback="cp1252") == "olá\n"
-    assert decode_output("olá\n".encode("utf-8"), fallback="cp1252") == "olá\n"
+    assert decode_output("olá\n".encode(), fallback="cp1252") == "olá\n"
 
 
 def test_a_utf8_sequence_cut_by_the_output_cap_only_loses_its_tail() -> None:

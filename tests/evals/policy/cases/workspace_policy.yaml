@@ -9,7 +9,6 @@ cases:
       - {id: corpus-shell, actions: [shell], resources: ["*"], effect: allow}
     args: {argv: ["python3", "-c", "print(1)"]}
     expected: {executed: false}
-    open_until: W7
   - id: corpus-allow-write-hooks-R2-113
     refs: [R2-113]
     route: decide
@@ -35,7 +34,6 @@ cases:
          reason: "routine sync (pre-approved)"}
     argv: ["git", "push", "origin", "main"]
     expected: {max_effect: ask, min_risk: high}
-    open_until: W7
   - id: empty-corpus-policy-auto-push-R2-500
     refs: [R2-500]
     route: run_shell
@@ -43,3 +41,79 @@ cases:
     workspace_policy: []
     args: {argv: ["git", "push", "origin", "main"]}
     expected: {executed: false}
+  # ---- W7 self-attack: trust, token matching, legacy files
+  - id: trusted-allow-still-matches-tokens-only
+    refs: [R2-100, R2-113]
+    route: run_shell
+    approver: none
+    trusted: true
+    make_dirs: ["git status"]
+    workspace_policy:
+      - {id: lab-status, actions: [shell], resources: ["git status*"], effect: allow}
+    args: {argv: ["git status/../../../../../../../../usr/bin/touch", "{marker}"]}
+    expected: {executed: false}
+  - id: trusted-allow-runs-the-named-program
+    refs: [benign]
+    route: run_shell
+    approver: none
+    trusted: true
+    workspace_policy:
+      - {id: lab-pytest, actions: [shell], resources: ["pytest *"], effect: allow}
+    args: {argv: ["pytest", "-q"]}
+    expected: {executed: true}
+  - id: untrusted-allow-is-a-no-op
+    refs: [R2-113]
+    route: run_shell
+    approver: none
+    workspace_policy:
+      - {id: lab-pytest, actions: [shell], resources: ["pytest *"], effect: allow}
+    args: {argv: ["pytest", "-q"]}
+    expected: {executed: false}
+  - id: trusted-allow-cannot-beat-the-floor
+    refs: [TRUST-003]
+    route: decide_shell
+    trusted: true
+    workspace_policy:
+      - {id: corpus-shell, actions: [shell], resources: ["*"], effect: allow}
+    argv: ["git", "push", "--force"]
+    expected: {effect: hard_deny}
+  - id: trusted-allow-cannot-beat-the-classifier
+    refs: [R2-103]
+    route: decide_shell
+    trusted: true
+    workspace_policy:
+      - {id: corpus-shell, actions: [shell], resources: ["*"], effect: allow}
+    argv: ["timeout", "9", "git", "reset", "--hard"]
+    expected: {effect: hard_deny}
+  - id: legacy-a5-policy-keeps-git-status-allowed
+    refs: [benign]
+    route: decide_shell
+    workspace_policy:
+      - {id: shell-default-ask, actions: [shell], resources: ["*"], effect: ask, risk: medium}
+      - {id: shell-readonly, actions: [shell], resources: ["git status*", "git diff*", "panda validate*"], effect: allow}
+    argv: ["git", "status"]
+    expected: {effect: allow}
+  - id: legacy-a5-policy-no-longer-allows-panda-validate
+    refs: [R2-104]
+    route: decide_shell
+    workspace_policy:
+      - {id: shell-default-ask, actions: [shell], resources: ["*"], effect: ask, risk: medium}
+      - {id: shell-readonly, actions: [shell], resources: ["git status*", "git diff*", "panda validate*"], effect: allow}
+    argv: ["panda", "validate", "--root", "corpus/x"]
+    expected: {max_effect: ask}
+  - id: edited-policy-loses-trust
+    refs: [R2-113]
+    route: run_shell
+    approver: none
+    trusted: true
+    edit_after_trust: true
+    workspace_policy:
+      - {id: lab-pytest, actions: [shell], resources: ["pytest *"], effect: allow}
+    args: {argv: ["pytest", "-q"]}
+    expected: {executed: false}
+  - {id: write-nested-workspace-validator-R2-104, refs: [R2-104], route: decide,
+     action: write, resource: "corpus/x/corpus/validation/validate.mjs", expected: {effect: hard_deny}}
+  - {id: write-corpus-node-modules-R2-210, refs: [R2-210], route: decide,
+     action: write, resource: "corpus/node_modules/lodash/index.js", expected: {effect: hard_deny}}
+  - {id: write-corpus-package-json-R2-210, refs: [R2-210], route: decide,
+     action: write, resource: "corpus/package.json", expected: {effect: hard_deny}}

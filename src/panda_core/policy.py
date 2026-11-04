@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import os
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -26,6 +25,8 @@ Effect = Literal["allow", "deny", "ask", "hard_deny"]
 Risk = Literal["low", "medium", "high", "critical"]
 
 _SCHEMA_VERSION = 1
+RISKS: tuple[str, ...] = ("low", "medium", "high", "critical")
+_CATCH_ALL = frozenset({"shell-default-ask", None})
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,30 @@ class PolicyRule:
             fnmatch.fnmatchcase(resource_l, pattern.lower()) for pattern in self.resources
         )
         return action_ok and resource_ok
+
+    def matches_argv(self, action: str, argv: Sequence[str]) -> bool:
+        """Token-prefix match: `git status*` matches argv `git status --short`.
+
+        The program token must be a plain name, so a directory called `git status`
+        cannot make `git status/../../usr/bin/touch` look like `git status`.
+        """
+
+        if not any(fnmatch.fnmatchcase(action.lower(), a.lower()) for a in self.actions):
+            return False
+        if not argv or not _plain_program(argv[0]):
+            return False
+        for pattern in self.resources:
+            tokens = _split(pattern)
+            if not tokens:
+                continue
+            open_end = tokens[-1].endswith("*")
+            if tokens[-1] == "*":
+                tokens = tokens[:-1]
+            if len(argv) < len(tokens) or (not open_end and len(argv) != len(tokens)):
+                continue
+            if all(fnmatch.fnmatchcase(arg, tok) for arg, tok in zip(argv, tokens, strict=False)):
+                return True
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -211,21 +236,10 @@ def default_policy() -> Policy:
             "high",
             "deletion is irreversible",
         ),
-        # Broad shell ask first; specific read-only allows later.
+        # Every shell command asks. Only the argv classifier grants `allow`, for the
+        # closed set of read-only git forms it understands (R2-100, R2-104): a text
+        # glob such as `git status*` also matched `git status/../../usr/bin/touch`.
         _rule("shell-default-ask", ["shell"], ["*"], "ask", "medium"),
-        _rule(
-            "shell-readonly",
-            ["shell"],
-            [
-                "git status*",
-                "git diff*",
-                "git log*",
-                "git show*",
-                "git branch*",
-                "panda validate*",
-            ],
-            "allow",
-        ),
         _rule("shell-push", ["shell"], ["git push*"], "ask", "high"),
         # Non-overridable destructive operations.
         _rule(
@@ -339,7 +353,14 @@ _EFFECTS = frozenset({"allow", "ask", "deny", "hard_deny"})
 _CONTROL_PLANE_RULE = _rule(
     "floor-control-plane",
     ["write", "edit"],
-    [".panda/*", "corpus/validation/*"],
+    [
+        ".panda/*", "corpus/validation/*",
+        # A nested workspace is loaded by `--root` (R2-104).
+        "*/.panda/*", "*/corpus/validation/*",
+        # Node resolves the validator's imports from these (R2-210).
+        "node_modules/*", "corpus/node_modules/*", "package.json", "corpus/package.json",
+        ".npmrc", "corpus/.npmrc",
+    ],
     "hard_deny",
     "critical",
     "control plane: policy, config, ledger and validator are not agent-writable",
@@ -391,28 +412,51 @@ def load_policy(path: Path) -> Policy:
                 f"policy default 'allow' is not accepted from a workspace file: {path}",
                 hint="use 'ask' or 'deny'; a workspace may only tighten the policy",
             )
-        rules: list[PolicyRule] = []
-        for index, item in enumerate(raw.get("rules", [])):
-            if item.get("effect") not in _EFFECTS:
-                raise ConfigError(
-                    f"policy rule {index} has an invalid effect: {item.get('effect')!r}",
-                    hint=f"use one of {', '.join(sorted(_EFFECTS))}",
-                )
-            rules.append(
-                PolicyRule(
-                    id=str(item["id"]),
-                    actions=tuple(str(value) for value in item["actions"]),
-                    resources=tuple(str(value) for value in item["resources"]),
-                    effect=item["effect"],
-                    risk=item.get("risk", "low"),
-                    reason=item.get("reason", ""),
-                )
-            )
-            if not rules[-1].actions or not rules[-1].resources:
-                raise ConfigError(f"policy rule {index} has an empty actions/resources list")
+        rules = [_parse_rule(index, item) for index, item in enumerate(raw.get("rules", []))]
     except (KeyError, TypeError, ValueError) as exc:
         raise ConfigError(f"invalid policy in {path}: {exc}") from exc
     return Policy(rules=tuple(rules), default=default, schema_version=version)
+
+
+_RULE_KEYS = frozenset({"id", "actions", "resources", "effect", "risk", "reason"})
+
+
+def _string_list(index: int, item: dict, key: str) -> tuple[str, ...]:
+    value = item.get(key)
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) for v in value):
+        # A bare string used to become a tuple of letters (R2-116).
+        raise ConfigError(f"policy rule {index}: {key!r} must be a non-empty list of strings")
+    return tuple(value)
+
+
+def _parse_rule(index: int, item: Any) -> PolicyRule:
+    if not isinstance(item, dict):
+        raise ConfigError(f"policy rule {index} must be an object")
+    unknown = set(item) - _RULE_KEYS
+    if unknown:
+        raise ConfigError(f"policy rule {index} has unknown fields: {', '.join(sorted(unknown))}")
+    if item.get("effect") not in _EFFECTS:
+        raise ConfigError(
+            f"policy rule {index} has an invalid effect: {item.get('effect')!r}",
+            hint=f"use one of {', '.join(sorted(_EFFECTS))}",
+        )
+    risk = item.get("risk", "low")
+    if risk not in RISKS:
+        raise ConfigError(
+            f"policy rule {index} has an invalid risk: {risk!r}",
+            hint=f"use one of {', '.join(RISKS)}",
+        )
+    rule_id, reason = item.get("id"), item.get("reason", "")
+    if not isinstance(rule_id, str) or not rule_id or not isinstance(reason, str):
+        raise ConfigError(f"policy rule {index}: 'id' and 'reason' must be strings")
+    return PolicyRule(
+        id=rule_id,
+        actions=_string_list(index, item, "actions"),
+        resources=_string_list(index, item, "resources"),
+        effect=item["effect"],
+        risk=risk,
+        reason=reason,
+    )
 
 
 def load_policy_or_default(path: Path) -> tuple[Policy, bool]:
@@ -426,37 +470,84 @@ def write_default_policy(path: Path) -> None:
 
 
 class PolicyEngine:
-    def __init__(self, policy: Policy, *, root: Path | None = None):
+    """Decides actions from rules, the built-in floor and the shell classifier.
+
+    `policy` is the authority. With `baseline`, every decision is the stricter of
+    `policy` and `baseline`: that is how a workspace file that is not trusted can
+    only tighten the built-in policy (R2-113). `protected` adds write hard denies
+    for paths that belong to this workspace's control plane (its validator).
+    """
+
+    def __init__(
+        self,
+        policy: Policy,
+        *,
+        root: Path | None = None,
+        baseline: Policy | None = None,
+        protected: Sequence[str] = (),
+    ):
         self.policy = policy
         self.root = root
-        self._floor = policy_floor()
+        self.baseline = baseline
+        floor = list(policy_floor())
+        if protected:
+            floor.append(
+                _rule(
+                    "floor-validator",
+                    ["write", "edit"],
+                    list(protected),
+                    "hard_deny",
+                    "critical",
+                    "the configured validator and its directory are not agent-writable",
+                )
+            )
+        self._floor = tuple(floor)
 
-    def matching_rules(self, action: str, resource: str) -> list[PolicyRule]:
+    def matching_rules(
+        self,
+        action: str,
+        resource: str,
+        *,
+        argv: Sequence[str] | None = None,
+        rules: Sequence[PolicyRule] | None = None,
+    ) -> list[PolicyRule]:
         matched: list[PolicyRule] = []
-        for rule in (*_BASELINE_RULES, *self.policy.rules, *self._floor):
+        source = self.policy.rules if rules is None else rules
+        for rule in (*_BASELINE_RULES, *source, *self._floor):
             # Identical rules (the built-in policy already contains the floor)
             # are listed once; a weaker rule with the same id is kept and loses.
-            if rule.matches(action, resource) and rule not in matched:
+            if rule in matched:
+                continue
+            if action.lower() == "shell" and rule.effect == "allow":
+                # A shell allow never matches joined text, only argv tokens (R2-100).
+                tokens = argv if argv is not None else _split(resource)
+                if rule.matches_argv(action, tokens):
+                    matched.append(rule)
+            elif rule.matches(action, resource):
                 matched.append(rule)
         return matched
 
     def decide(self, action: str, resource: str) -> Decision:
         if action == "shell":
-            try:
-                argv = shlex.split(resource, posix=os.name != "nt")
-            except ValueError:
-                argv = resource.split()
-            return self.decide_shell(argv, text=resource)
+            # One tokenizer on every platform: `posix=False` kept the quotes in
+            # `git "push" --force` and the classifier missed it (R2-203, R2-503).
+            return self.decide_shell(_split(resource), text=resource)
         return self._decide_rules(action, resource)
 
     def decide_shell(self, argv: Sequence[str], *, text: str | None = None) -> Decision:
         """Decide a command from its argv: rules first, then the token classifier.
 
-        The classifier can only escalate (SEC-001, SEC-007), so a workspace policy
-        can tighten the result but never loosen it.
+        Rules may only ask or deny a shell command, except a trusted workspace allow,
+        which matches tokens. The classifier grants `allow` for the read-only forms
+        it understands when only the catch-all asked, and otherwise only escalates.
+        The result keeps the stricter effect and the higher risk and, on a tie, the
+        classifier's rule and reason, which describe what the command does (R2-500:
+        `env git push` used to report `shell-default-ask`).
         """
 
-        base = self._decide_rules("shell", text if text is not None else " ".join(argv))
+        base = self._decide_rules(
+            "shell", text if text is not None else " ".join(argv), argv=argv
+        )
         verdict = classify_shell(argv)
         if verdict is None:
             return base
@@ -464,21 +555,44 @@ class PolicyEngine:
         for path in verdict.read_paths:
             read = self._decide_rules("read", path)
             if read.effect != "allow":
-                worst = max(
-                    (worst, ShellVerdict(read.effect, read.risk, f"reads {path}: {read.reason}",
-                                         read.rule_id or "shell-git-read")),
-                    key=lambda item: SEVERITY[item.effect],
+                worst = _stricter_verdict(
+                    worst,
+                    ShellVerdict(
+                        read.effect,
+                        read.risk,
+                        f"reads {path}: {read.reason}",
+                        read.rule_id or "shell-git-read",
+                    ),
                 )
-        if SEVERITY[worst.effect] <= SEVERITY[base.effect]:
+        grantable = bool(argv) and argv[0] in {"git", "git.exe"}
+        if (
+            grantable
+            and worst.effect == "allow"
+            and base.effect == "ask"
+            and base.rule_id in _CATCH_ALL
+        ):
+            # Only the catch-all asked and the program is a plain `git`, which the
+            # tool runs isolated (gitsafe): the classifier knows it is read-only.
+            # A wrapper (`env git status`) or a path (`/usr/bin/git`) still asks.
+            return Decision(
+                action="shell",
+                resource=base.resource,
+                effect="allow",
+                risk=worst.risk,  # type: ignore[arg-type]
+                rule_id=worst.rule_id,
+                reason=worst.reason,
+                matched_rules=base.matched_rules,
+            )
+        if SEVERITY[worst.effect] < SEVERITY[base.effect]:
             return base
         return Decision(
             action="shell",
             resource=base.resource,
             effect=worst.effect,  # type: ignore[arg-type]
-            risk=worst.risk,  # type: ignore[arg-type]
+            risk=max(base.risk, worst.risk, key=RISKS.index),  # type: ignore[arg-type]
             rule_id=worst.rule_id,
             reason=worst.reason,
-            matched_rules=(*base.matched_rules, worst.rule_id),
+            matched_rules=base.matched_rules,
         )
 
     def denied_read_patterns(self) -> tuple[str, ...]:
@@ -490,9 +604,19 @@ class PolicyEngine:
                 patterns.extend(rule.resources)
         return tuple(dict.fromkeys(patterns))
 
-    def _decide_rules(self, action: str, resource: str) -> Decision:
+    def _decide_rules(
+        self, action: str, resource: str, *, argv: Sequence[str] | None = None
+    ) -> Decision:
+        decision = self._evaluate(self.policy, action, resource, argv)
+        if self.baseline is not None:
+            decision = _stricter(decision, self._evaluate(self.baseline, action, resource, argv))
+        return decision
+
+    def _evaluate(
+        self, policy: Policy, action: str, resource: str, argv: Sequence[str] | None
+    ) -> Decision:
         normalized = resource.replace("\\", "/")
-        matched = self.matching_rules(action, normalized)
+        matched = self.matching_rules(action, normalized, argv=argv, rules=policy.rules)
         hard = [rule for rule in matched if rule.effect == "hard_deny"]
         if hard:
             rule = hard[-1]
@@ -519,7 +643,7 @@ class PolicyEngine:
         return Decision(
             action=action,
             resource=normalized,
-            effect=self.policy.default,  # type: ignore[arg-type]
+            effect=policy.default,  # type: ignore[arg-type]
             risk="medium",
             rule_id=None,
             reason="no rule matched; policy default applies",
@@ -561,3 +685,53 @@ class PolicyEngine:
             hint="non-interactive execution treats ask as deny; rerun with approval",
             details=decision.to_dict(),
         )
+
+
+def _split(text: str) -> list[str]:
+    try:
+        return shlex.split(text, posix=True)
+    except ValueError:
+        return text.split()
+
+
+def _stricter(first: Decision, second: Decision) -> Decision:
+    """The more restrictive decision; on the same effect, the higher risk."""
+
+    key_first = (SEVERITY[first.effect], RISKS.index(first.risk))
+    key_second = (SEVERITY[second.effect], RISKS.index(second.risk))
+    return second if key_second > key_first else first
+
+
+def _stricter_verdict(first: ShellVerdict, second: ShellVerdict) -> ShellVerdict:
+    return second if SEVERITY[second.effect] > SEVERITY[first.effect] else first
+
+
+def _plain_program(token: str) -> bool:
+    return bool(token) and not any(mark in token for mark in ("/", "\\", " ", "\t")) and (
+        token not in {".", ".."}
+    )
+
+
+def engine_for(workspace: Any, policy: Policy, *, from_file: bool) -> PolicyEngine:
+    """The engine every surface uses for a workspace (one construction point).
+
+    A policy file in the workspace is corpus data: unless the user trusts it, it
+    can only tighten the built-in policy. The configured validator is protected.
+    """
+
+    from panda_core.trust import is_trusted  # local: trust reads user state
+
+    baseline = None
+    if from_file and not is_trusted(workspace.root, workspace.policy_path):
+        baseline = default_policy()
+    protected: list[str] = []
+    try:
+        validator = Path(workspace.config.validator)
+        rel = validator.as_posix().lstrip("./")
+        if rel and not validator.is_absolute() and ".." not in validator.parts:
+            protected.append(rel)
+            if validator.parent.as_posix() not in {"", "."}:
+                protected.append(f"{validator.parent.as_posix()}/*")
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return PolicyEngine(policy, root=workspace.root, baseline=baseline, protected=protected)

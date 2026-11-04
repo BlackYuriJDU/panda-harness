@@ -205,6 +205,13 @@ def test_policy_case(case: dict[str, Any], workspace, tmp_path: Path, monkeypatc
     if case.get("workspace_policy") is not None:
         policy = {"schema_version": 1, "default": "ask", "rules": case["workspace_policy"]}
         workspace.policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    if case.get("trusted"):
+        from panda_core.trust import grant
+
+        grant(workspace.root, workspace.policy_path)
+        if case.get("edit_after_trust"):
+            with workspace.policy_path.open("a", encoding="utf-8") as handle:
+                handle.write("\n")
     if marker.exists():
         marker.unlink()  # setup itself may run git programs; only the case counts
 
@@ -241,10 +248,10 @@ def test_policy_case(case: dict[str, Any], workspace, tmp_path: Path, monkeypatc
 
 
 def _check_decision(case: dict[str, Any], workspace, expected: dict[str, Any]) -> None:
-    from panda_core.policy import PolicyEngine, load_policy_or_default
+    from panda_core.policy import engine_for, load_policy_or_default
 
-    policy, _ = load_policy_or_default(workspace.policy_path)
-    engine = PolicyEngine(policy, root=workspace.root)
+    policy, from_file = load_policy_or_default(workspace.policy_path)
+    engine = engine_for(workspace, policy, from_file=from_file)
     if case["route"] == "decide_shell":
         decision = engine.decide_shell(case["argv"])
     else:

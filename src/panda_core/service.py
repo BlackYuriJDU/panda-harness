@@ -16,7 +16,7 @@ from typing import Any
 
 from panda_core import errors
 from panda_core.errors import PandaError, PolicyDenied, SessionIntegrityError
-from panda_core.policy import PolicyEngine, load_policy_or_default
+from panda_core.policy import engine_for, load_policy_or_default
 from panda_core.provider import status_snapshot
 from panda_core.registry import load_registry
 from panda_core.session import SessionLog, list_sessions
@@ -120,11 +120,11 @@ class PandaService:
         with its original class.
         """
 
-        policy, _ = load_policy_or_default(self.workspace.policy_path)
+        policy, from_file = load_policy_or_default(self.workspace.policy_path)
         registry = ToolRegistry(
             ToolContext(
                 workspace=self.workspace,
-                policy=PolicyEngine(policy, root=self.workspace.root),
+                policy=engine_for(self.workspace, policy, from_file=from_file),
                 session=self.session,
                 approve=None,
             )
@@ -198,7 +198,7 @@ class PandaService:
         self, action: str, resource: str, *, approved: bool = False
     ) -> dict[str, Any]:
         policy, from_file = load_policy_or_default(self.workspace.policy_path)
-        engine = PolicyEngine(policy, root=self.workspace.root)
+        engine = engine_for(self.workspace, policy, from_file=from_file)
         normalized = resource
         if action in {"read", "write", "edit", "delete"} and resource:
             normalized = self.workspace.relative_resource(resource)

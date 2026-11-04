@@ -16,7 +16,7 @@ from panda_core.agent import Agent, AgentEvent, TurnResult
 from panda_core.config import split_model
 from panda_core.errors import ConfigError
 from panda_core.model_catalog import CAPTURED_AT, snapshot_models
-from panda_core.policy import PolicyEngine, load_policy_or_default
+from panda_core.policy import engine_for, load_policy_or_default
 from panda_core.provider import (
     SUPPORTED_PROTOCOLS,
     ModelInfo,
@@ -67,8 +67,8 @@ class ChatRuntime:
         self._approver = approver
         self._on_event = on_event
         self._model_source = "config"
-        policy, _ = load_policy_or_default(workspace.policy_path)
-        self.policy = PolicyEngine(policy, root=workspace.root)
+        policy, from_file = load_policy_or_default(workspace.policy_path)
+        self.policy = engine_for(workspace, policy, from_file=from_file)
         if session is None:
             workspace.ensure_runtime_dirs()
             session = SessionLog.create(

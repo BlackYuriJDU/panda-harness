@@ -464,8 +464,38 @@ fails if a declared action is in neither or if a planned action starts being con
 the engine always adds a floor of `hard_deny` rules after loading it: every
 `hard_deny` of the built-in policy (secret and credential reads, force-push and
 history rewrites, destructive shell, release publishing) plus writes and edits
-under `.panda/` and `corpus/validation/`. A workspace policy can only tighten
-the result. `default: "allow"` is refused with exit `2`; use `ask` or `deny`.
+under `.panda/` and `corpus/validation/` (also nested, `*/.panda/*` and
+`*/corpus/validation/*`), the validator's module closure (`node_modules/`,
+`corpus/node_modules/`, `package.json`, `.npmrc`), the configured validator file and
+its directory, and any `.git` directory. `default: "allow"` is refused with exit `2`.
+
+**A workspace policy only tightens, unless the user trusts it.** Every surface builds
+its engine through `panda_core.policy.engine_for`. When `.panda/policy.json` is not
+trusted, each decision is the stricter of the workspace policy and the built-in
+policy (higher risk on a tie), so an `allow` in the file is a no-op and a workspace
+`risk`/`reason` cannot lower what the built-in policy says. Trust is user state
+(`PANDA_TRUST_FILE`, default next to the user workspace) bound to the file's SHA-256;
+editing the file withdraws it. A trusted file's rules apply, but never above the
+floor or the shell classifier. Rule files are validated strictly: `actions` and
+`resources` must be non-empty lists of strings, `risk` one of `low`, `medium`,
+`high`, `critical`, and unknown fields are refused (exit `2`).
+
+**Shell rules match tokens, and only the classifier grants `allow`.** The built-in
+policy no longer has `allow` globs for shell. A shell `allow` rule (from a trusted
+workspace) matches argv tokens with a plain program name, never joined text, so a
+directory called `git status` cannot turn `git status/../../usr/bin/touch` into
+`git status`. The classifier grants `allow` to plain `git` read-only forms when only
+the catch-all asked; `panda validate` through the shell asks (use the `validate`
+tool). When the rules and the classifier agree on the effect, the classifier's rule,
+risk and reason are kept (`env git push` reports `shell-git-push`, risk `high`).
+Wrappers are unwrapped with their option arity (`env -u/-C/-S`, `sudo -u/-g`,
+`timeout DUR`, `nice -n`, `stdbuf -oL`, `ionice`, `chrt`, `taskset`, `flock`,
+`xargs`, `setsid`, `busybox`), `sh -c`/`env -S` strings are split into commands,
+an unknown program followed by `git`/`rm`/`find` asks with risk `high`, long options
+match from three characters (`rm --r`), `git push --prune` and `-c remote.*.mirror`
+are `hard_deny`, an unknown git global option no longer hides the subcommand, and
+Windows spellings (`git.exe.`, `git.exe::$DATA`, `git.com`, `GIT~1.EXE`) name the
+same program. A string resource is always tokenized with POSIX rules.
 
 `panda policy check` exits `0` only for `allow`; every other effect exits `5`.
 Path resources are resolved before matching, so `corpus/../README.md` normalizes
