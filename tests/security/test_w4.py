@@ -267,9 +267,22 @@ def status_text(screen) -> str:
     return getattr(renderable, "plain", str(renderable))
 
 
+async def _until(pilot, condition, timeout: float = 3.0) -> bool:
+    """Poll instead of a fixed sleep: under CPU load the status tick is late (R2-505)."""
+
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        await pilot.pause(0.05)
+    return condition()
+
+
 def test_a_long_preview_reports_the_hidden_lines(workspace) -> None:
     async def script(pilot, screen, decisions):
-        await pilot.pause(0.3)
+        await _until(pilot, lambda: "hidden" in status_text(screen))
         assert "hidden" in status_text(screen)
         assert screen.query_one("#approval-preview-scroll").max_scroll_y > 0
 
