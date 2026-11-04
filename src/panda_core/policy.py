@@ -346,6 +346,16 @@ _CONTROL_PLANE_RULE = _rule(
 )
 
 
+_GIT_DIR_RULE = _rule(
+    "floor-git-dir",
+    ["write", "edit"],
+    [".git", ".git/*", ".git[. :]*", "*/.git", "*/.git/*", "*/.git[. :]*", "git~*", "*/git~*"],
+    "hard_deny",
+    "critical",
+    "a .git directory names programs (hooks, filters, fsmonitor) that git runs",
+)
+
+
 def policy_floor() -> tuple[PolicyRule, ...]:
     """Hard denies that no workspace policy can remove (TRUST-003).
 
@@ -356,7 +366,7 @@ def policy_floor() -> tuple[PolicyRule, ...]:
     """
 
     built_in = tuple(rule for rule in default_policy().rules if rule.effect == "hard_deny")
-    return (*built_in, _CONTROL_PLANE_RULE)
+    return (*built_in, _CONTROL_PLANE_RULE, _GIT_DIR_RULE)
 
 
 def load_policy(path: Path) -> Policy:
@@ -470,6 +480,15 @@ class PolicyEngine:
             reason=worst.reason,
             matched_rules=(*base.matched_rules, worst.rule_id),
         )
+
+    def denied_read_patterns(self) -> tuple[str, ...]:
+        """Globs of every read rule that does not allow: excluded from git output."""
+
+        patterns: list[str] = []
+        for rule in (*_BASELINE_RULES, *self.policy.rules, *self._floor):
+            if rule.effect != "allow" and any(a in {"read", "*"} for a in rule.actions):
+                patterns.extend(rule.resources)
+        return tuple(dict.fromkeys(patterns))
 
     def _decide_rules(self, action: str, resource: str) -> Decision:
         normalized = resource.replace("\\", "/")

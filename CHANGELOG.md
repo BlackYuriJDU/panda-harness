@@ -23,6 +23,22 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   classified, `--auto` approves no shell command; edits inside write scopes are
   still approved.
 
+- Read-only git (R2-101, R2-201, R2-102): `git status`/`diff`/`show`/`log`, which need
+  no approval, ran the corpus's `core.fsmonitor`, `diff.external` and textconv drivers,
+  including from a nested `corpus/sub/.git/config` the agent could write, and printed a
+  committed `.env`. Allowed git now runs through `panda_core.gitsafe` (explicit git dir,
+  empty attribute source, program-naming keys overridden, filters from
+  `.git/info/attributes` neutralised by name, no inherited `GIT_*`, exclude pathspecs
+  for read-denied files); what Panda cannot isolate needs an approval. `--attr-source`
+  alone does not cover `.git/info/attributes`: verified on git 2.43 and pinned by a case.
+- Writing into any `.git` directory is now a floor `hard_deny` (R2-201).
+
+### Added
+
+- `tests/evals/policy/`: adversarial policy cases as data, run through the real
+  `ChatRuntime` -> `ToolRegistry` route with a fake approver and effect markers. Open
+  holes are strict xfails, so fixing one without flipping its case fails the suite.
+
 ### Changed
 
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,

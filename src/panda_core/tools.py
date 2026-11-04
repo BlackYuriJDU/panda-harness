@@ -17,10 +17,11 @@ import stat
 import sys
 import threading
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from panda_core import gitsafe
 from panda_core.atomic import atomic_write_bytes, atomic_write_text
 from panda_core.errors import ConfigError, PandaError
 from panda_core.policy import Decision, PolicyEngine
@@ -235,8 +236,24 @@ async def _authorize(
         return decision, None
     if decision.effect in {"deny", "hard_deny"}:
         return decision, _blocked(tool, decision, "policy denies this action")
+    return decision, await _ask(ctx, decision, tool=tool, action=action, resource=resource,
+                                preview=preview, preview_kind=preview_kind)
+
+
+async def _ask(
+    ctx: ToolContext,
+    decision: Decision,
+    *,
+    tool: str,
+    action: str,
+    resource: str,
+    preview: str,
+    preview_kind: str,
+) -> ToolResult | None:
+    """Ask the approver; `None` means approved, a result means blocked."""
+
     if ctx.approve is None:
-        return decision, _blocked(
+        return _blocked(
             tool, decision, "approval is required and no interactive approver is available"
         )
     request = ApprovalRequest(
@@ -254,8 +271,12 @@ async def _authorize(
     except Exception:  # noqa: BLE001 - approval failure must deny, never allow
         approved = False
     if not approved:
-        return decision, _blocked(tool, decision, "approval denied by the operator")
-    return decision, None
+        return _blocked(tool, decision, "approval denied by the operator")
+    return None
+
+
+def _is_git(argv: Sequence[str]) -> bool:
+    return bool(argv) and Path(argv[0].replace("\\", "/")).name.lower() in {"git", "git.exe"}
 
 
 def _fail(tool: str, message: str, *, data: dict[str, Any] | None = None) -> ToolResult:
@@ -832,7 +853,7 @@ class ToolRegistry:
         if not cwd.is_dir():
             raise ToolInputError(f"cwd is not a directory: {cwd_relative}")
         command_text = " ".join(argv)
-        _, blocked = await _authorize(
+        decision, blocked = await _authorize(
             self.ctx,
             tool="run_shell",
             action="shell",
@@ -843,16 +864,49 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
+        effective, env = list(argv), _scrubbed_env()
+        if decision is not None and decision.effect == "allow" and _is_git(argv):
+            # Allowed git runs with nobody watching: the repository must not choose
+            # a program, and content commands must not print denied files.
+            hardened = gitsafe.harden(
+                argv,
+                root=self.ctx.workspace.root,
+                cwd=cwd,
+                base_env=env,
+                denied_reads=self.ctx.policy.denied_read_patterns(),
+            )
+            if hardened.hazard is not None:
+                escalated = replace(
+                    decision,
+                    effect="ask",
+                    risk="high",
+                    rule_id="shell-git-hazard",
+                    reason=f"git cannot be isolated here: {hardened.hazard}",
+                )
+                blocked = await _ask(
+                    self.ctx,
+                    escalated,
+                    tool="run_shell",
+                    action="shell",
+                    resource=command_text,
+                    preview=command_text,
+                    preview_kind="command",
+                )
+                if blocked:
+                    return blocked
+            else:
+                effective, env = list(hardened.argv), dict(hardened.env)
         cancel = threading.Event()
         try:
             result = await asyncio.to_thread(
-                run_command, argv, cwd=cwd, timeout=timeout, env=_scrubbed_env(), cancel=cancel
+                run_command, effective, cwd=cwd, timeout=timeout, env=env, cancel=cancel
             )
         except asyncio.CancelledError:
             cancel.set()  # the thread kills the process group; do not wait for it
             raise
         payload = {
             "argv": argv,
+            **({"effective_argv": effective} if effective != list(argv) else {}),
             "cwd": cwd_relative,
             "returncode": result.returncode,
             "timed_out": result.timed_out,

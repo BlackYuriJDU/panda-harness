@@ -434,6 +434,24 @@ and `git branch --list` with a closed set of flags and no `rev:path`, absolute o
 `git push origin fix-foo` is `ask`, no longer `hard_deny`. `node
 corpus/validation/validate.mjs` is no longer pre-approved: use the `validate` tool.
 
+**Allowed git runs isolated (`panda_core.gitsafe`).** A git command that runs
+without an approval is rebuilt before it runs, because the repository's own config
+and attributes name programs that even `git status` executes (fsmonitor, clean
+filters, textconv, external diff, hooks, pager, gpg). Panda passes explicit
+`--git-dir`/`--work-tree` for the repository found between `cwd` and the workspace
+root (never above it), `--attr-source=<empty tree>`, `--no-optional-locks`,
+`--no-pager`, `-c` overrides for every program-naming key (and for each filter
+named in `.git/info/attributes`), `--no-ext-diff --no-textconv` for
+`diff`/`show`/`log`, system and global config off, and no inherited `GIT_*`
+variable. `git diff`, `git show` and `git log -p` get exclude pathspecs for every
+path the `read` rules deny, so a committed `.env` is not printed. The tool result
+keeps the requested `argv` and adds `effective_argv`. When Panda cannot isolate the
+command (a wrapper such as `env git`, `git -C`, a `.git` file or symlink, an
+unreadable `.git/info/attributes`, git older than 2.42) the command needs an
+approval. Writing to any `.git` directory (`.git/*`, `*/.git/*`, Windows spellings)
+is a floor `hard_deny`. Opening a workspace runs no git at all: branch and commit
+are read from `.git/HEAD`, and the worktree state is reported as unknown.
+
 **Enforced and planned actions.** Only `read`, `write`, `edit`, `shell` and `validate` are
 consulted by tools. The default policy still declares rules for `delete`, `git`, `network`,
 `webfetch`, `websearch`, `release`, `spend`, `tool`, `question`, `external_read` and

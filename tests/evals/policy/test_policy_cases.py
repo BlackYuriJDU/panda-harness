@@ -119,7 +119,43 @@ def _committed_env(root: Path, tmp: Path, marker: Path) -> None:
     (root / ".env").write_text("TOKEN=SYNTH_SECRET_GITDIFF_4d2a_changed\n", encoding="utf-8")
 
 
+def _info_attributes_filter(root: Path, tmp: Path, marker: Path) -> None:
+    """The attribute source that --attr-source does not replace, with a macro."""
+
+    script = _payload(tmp, marker)
+    _git(root, "init", "-q", "-b", "main")
+    (root / "notes.txt").write_text("one\n", encoding="utf-8")
+    _git(root, "add", "notes.txt")
+    _git(root, "commit", "-q", "-m", "seed")
+    info = root / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "attributes").write_text(
+        "[attr]innocent filter=evil.x\n*.txt innocent\n", encoding="utf-8"
+    )
+    _git(root, "config", "filter.evil.x.clean", str(script))
+    (root / "notes.txt").write_text("two\n", encoding="utf-8")
+    os.utime(root / "notes.txt", (1, 1))
+
+
+def _parent_repo(root: Path, tmp: Path, marker: Path) -> None:
+    """The workspace has no .git, but a hostile repository encloses it."""
+
+    script = _payload(tmp, marker)
+    _git(tmp, "init", "-q", "-b", "main")
+    _git(tmp, "config", "core.fsmonitor", str(script))
+
+
+def _git_symlink(root: Path, tmp: Path, marker: Path) -> None:
+    elsewhere = tmp / "elsewhere"
+    _git(tmp, "init", "-q", "-b", "main", str(elsewhere))
+    _git(elsewhere, "config", "core.fsmonitor", str(_payload(tmp, marker)))
+    (root / ".git").symlink_to(elsewhere / ".git", target_is_directory=True)
+
+
 SETUPS = {
+    "info_attributes_filter": _info_attributes_filter,
+    "parent_repo": _parent_repo,
+    "git_symlink": _git_symlink,
     "hostile_git": _hostile_git,
     "nested_hostile_git": _nested_hostile_git,
     "committed_env": _committed_env,

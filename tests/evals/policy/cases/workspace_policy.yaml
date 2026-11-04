@@ -18,7 +18,6 @@ cases:
     action: write
     resource: ".git/hooks/pre-commit"
     expected: {max_effect: ask}
-    open_until: W6
   - id: corpus-cannot-touch-control-plane-floor
     refs: [TRUST-003]
     route: decide

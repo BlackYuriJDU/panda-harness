@@ -165,3 +165,89 @@ def test_neg_auto_mode_still_approves_a_scoped_write(workspace) -> None:
         assert asyncio.run(runtime._approve(request)) is True
     finally:
         runtime.close()
+
+
+# --------------------------------------------------------------------------- R2-101/R2-102 (W6)
+def _registry(workspace):
+    from panda_cli.runtime import ChatRuntime
+
+    return ChatRuntime(workspace, label="w6")
+
+
+def _shell(runtime, argv, **extra):
+    import asyncio
+    import json
+
+    result = asyncio.run(runtime.tools.call("run_shell", {"argv": argv, **extra}))
+    return result, json.loads(result.content)
+
+
+@POSIX
+def test_hardened_git_still_reports_status_and_diffs(workspace, tmp_path: Path) -> None:
+    marker = tmp_path / "ran.txt"
+    _hostile_repo(workspace.root, marker)
+    (workspace.root / ".env").write_text("TOKEN=SYNTH_SECRET_W6_DIFF_91\n", encoding="utf-8")
+    _git(workspace.root, "add", "-f", ".env")
+    _git(workspace.root, "-c", "user.email=x@example.invalid", "-c", "user.name=x",
+         "commit", "-q", "-m", "env")
+    (workspace.root / ".env").write_text("TOKEN=SYNTH_SECRET_W6_DIFF_92\n", encoding="utf-8")
+    if marker.exists():
+        marker.unlink()
+    runtime = _registry(workspace)
+    try:
+        _, status = _shell(runtime, ["git", "status", "--short"])
+        _, diff = _shell(runtime, ["git", "diff"])
+        _, named = _shell(runtime, ["git", "diff", "notes.txt"])
+    finally:
+        runtime.close()
+    assert not marker.exists(), marker.read_text(encoding="utf-8")
+    assert status["returncode"] == 0 and "notes.txt" in status["stdout"]
+    assert diff["returncode"] == 0 and "+two" in diff["stdout"]
+    assert "SYNTH_SECRET_W6" not in diff["stdout"]
+    assert named["returncode"] == 0 and "+two" in named["stdout"]
+    assert diff["argv"] == ["git", "diff"]  # what the model asked for
+    assert "--no-textconv" in diff["effective_argv"]  # what ran, recorded in the ledger
+
+
+@POSIX
+def test_inherited_git_variables_do_not_redirect_hardened_git(
+    workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "ran.txt"
+    elsewhere = tmp_path / "elsewhere"
+    _git(tmp_path, "init", "-q", "-b", "main", str(elsewhere))
+    script = tmp_path / "fsmon.sh"
+    script.write_text(f"#!/bin/sh\necho ran >> '{marker}'\n", encoding="utf-8")
+    script.chmod(0o755)
+    _git(elsewhere, "config", "core.fsmonitor", str(script))
+    _git(workspace.root, "init", "-q", "-b", "main")
+    monkeypatch.setenv("GIT_DIR", str(elsewhere / ".git"))
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'core.fsmonitor={script}'")
+    runtime = _registry(workspace)
+    try:
+        _, status = _shell(runtime, ["git", "status"])
+    finally:
+        runtime.close()
+    assert not marker.exists()
+    assert status["returncode"] == 0
+
+
+def test_harden_refuses_what_it_cannot_reason_about(tmp_path: Path) -> None:
+    from panda_core.gitsafe import harden
+
+    root = tmp_path / "w"
+    root.mkdir()
+    for argv in (["env", "git", "status"], ["/usr/bin/git", "status"],
+                 ["git", "-C", "x", "status"], ["git", "-c", "a=b", "status"],
+                 ["git", "--git-dir=/tmp/x", "status"], ["git"]):
+        assert harden(argv, root=root, cwd=root, base_env={}).hazard, argv
+
+
+def test_exclude_pathspecs_follow_the_read_policy() -> None:
+    from panda_core.gitsafe import exclude_pathspecs
+    from panda_core.policy import PolicyEngine, default_policy
+
+    specs = exclude_pathspecs(PolicyEngine(default_policy()).denied_read_patterns())
+    assert ":(top,exclude,icase)*.env" in specs
+    assert ":(top,exclude,icase)*/.ssh/*" in specs
+    assert all(spec.startswith(":(top,exclude,icase)") for spec in specs)
