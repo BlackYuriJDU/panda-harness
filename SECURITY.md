@@ -9,6 +9,21 @@ Panda is an alpha project. Security reports are welcome and taken seriously.
 | `0.2.x` (alpha) | Best effort |
 | `0.1.x` | Not supported |
 
+## Advisory: treat third-party corpora as hostile (0.2.0a5)
+
+An independent audit of `0.2.0a5` (round 2) found that a corpus can still loosen
+Panda's controls. Until the fixes listed under `[Unreleased]` in `CHANGELOG.md` are
+complete:
+
+- open a corpus you did not create only after reading its `.panda/policy.json`,
+  `.panda/config.json`, `.git/config`, `.gitattributes` and `.git/hooks/`;
+- do not use `--auto` with a corpus you did not create;
+- `0.2.0a5` should not be published.
+
+Fixed so far on the development branch: opening a workspace no longer runs any git
+program (the boot probe reads `.git/HEAD` as a file), and `--auto` no longer approves
+shell commands.
+
 ## Reporting a vulnerability
 
 Please use GitHub's private vulnerability reporting:

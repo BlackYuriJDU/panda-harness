@@ -107,3 +107,61 @@ def test_git_state_does_not_follow_a_gitfile_outside_the_workspace(
     (workspace.root / ".git").write_text(f"gitdir: {outside / '.git'}\n", encoding="utf-8")
     state = workspace.git_state()
     assert state["repo"] is True and state["branch"] is None and state["commit"] is None
+
+
+# --------------------------------------------------------------------------- R2-500 hotfix
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["git", "push", "origin", "main"],
+        ["env", "git", "push", "origin", "main"],
+        ["timeout", "5", "git", "push", "origin", "main"],
+        ["git", "-C", ".", "push", "origin", "main"],
+        ["/usr/bin/git", "push", "origin", "main"],
+        ["twine", "upload", "dist/x.whl"],
+        ["python", "-c", "print(1)"],
+    ],
+)
+def test_auto_mode_never_approves_a_shell_command(workspace, command: list[str]) -> None:
+    import asyncio
+
+    from panda_cli.runtime import ChatRuntime
+    from panda_core.tools import ApprovalRequest
+
+    runtime = ChatRuntime(workspace, auto=True)
+    try:
+        decision = runtime.policy.decide_shell(command)
+        request = ApprovalRequest(
+            tool="run_shell",
+            action="shell",
+            resource=" ".join(command),
+            rule_id=decision.rule_id,
+            risk=decision.risk,
+            reason=decision.reason,
+            preview=" ".join(command),
+        )
+        assert asyncio.run(runtime._approve(request)) is False
+    finally:
+        runtime.close()
+
+
+def test_neg_auto_mode_still_approves_a_scoped_write(workspace) -> None:
+    import asyncio
+
+    from panda_cli.runtime import ChatRuntime
+    from panda_core.tools import ApprovalRequest
+
+    runtime = ChatRuntime(workspace, auto=True)
+    try:
+        request = ApprovalRequest(
+            tool="write_file",
+            action="write",
+            resource="preprint/draft.md",
+            rule_id="write-preprint",
+            risk="medium",
+            reason="edits the preprint",
+            preview="+ text",
+        )
+        assert asyncio.run(runtime._approve(request)) is True
+    finally:
+        runtime.close()

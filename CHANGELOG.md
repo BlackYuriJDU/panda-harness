@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.2.0a6 (hardening, round 2)
+
+Follows the round-2 audit of `0.2.0a5` (99 findings, 25 root causes). Fixes close root
+causes, not single routes, and each bypass becomes a permanent adversarial case.
+
+### Security
+
+- Boot probe (R2-106, P0): opening `panda chat`/`panda run` in a corpus delivered with
+  its `.git` directory ran the corpus's clean filter and `post-index-change` hook,
+  with the whole environment (including `OPENCODE_API_KEY`); the round-1 fix only
+  neutralised `core.fsmonitor`. `Workspace.git_state()` now starts no process: it
+  reads `.git/HEAD`, the branch ref and `packed-refs` as plain files (no symlinks,
+  bounded size, strict ref names). A `.git` file (worktree, submodule) is not followed.
+- `--auto` (R2-500 hotfix): the never-auto list matched rule ids, so `env git push`,
+  `git -C . push`, `/usr/bin/git push` and any push under a corpus policy were
+  auto-approved, as were `twine upload` and `gh release`. Until shell effects are
+  classified, `--auto` approves no shell command; edits inside write scopes are
+  still approved.
+
+### Changed
+
+- `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
+  and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
+  the cockpit header show the branch and commit without a dirty marker.
+
 ## [0.2.0a5] — 2026-11-03 (hardening)
 
 A security-hardening release that follows an independent audit of `0.2.0a4` (53 findings).

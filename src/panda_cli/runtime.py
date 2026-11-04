@@ -118,7 +118,12 @@ class ChatRuntime:
     # ---- approvals ----
     async def _approve(self, request: ApprovalRequest) -> bool:
         if self.auto:
-            # `--auto` approves ordinary asks, never publishing ones (APR-004).
+            # `--auto` approves ordinary asks, never publishing ones (APR-004), and
+            # never a shell command: a rule id cannot tell `env git push` from
+            # `git status` (R2-500). Commands go to a person until shell
+            # effects are classified (wave 8).
+            if request.action == "shell":
+                return False
             return request.rule_id not in NEVER_AUTO_RULES
         if self._approver is not None:
             return bool(await self._approver(request))

@@ -205,10 +205,13 @@ def test_the_push_policy_is_never_auto_end_to_end(workspace) -> None:
     assert asyncio.run(runtime._approve(request)) is False
 
 
-def test_auto_still_approves_an_ordinary_ask(workspace) -> None:
+def test_auto_does_not_approve_shell_until_effects_are_classified(workspace) -> None:
+    # Hotfix for R2-500 (approved by the owner): a rule id cannot tell `pytest -q`
+    # from `env git push`, so --auto sends every shell command to a person.
+    # Wave 8 restores this to True through the exec_local effect class.
     runtime = runtime_with(workspace, auto=True)
     request = approval("pytest -q", rule_id="shell-default-ask")
-    assert asyncio.run(runtime._approve(request)) is True
+    assert asyncio.run(runtime._approve(request)) is False
 
 
 def test_a_human_approver_can_still_approve_a_push(workspace) -> None:
