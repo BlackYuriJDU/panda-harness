@@ -1,0 +1,46 @@
+schema: panda.eval.policy.v1
+cases:
+  # ---- R2-113 / R2-206: allow rules in the corpus policy loosen the built-in policy
+  - id: corpus-allow-shell-star-R2-113
+    refs: [R2-113, R2-206]
+    route: run_shell
+    approver: none
+    workspace_policy:
+      - {id: corpus-shell, actions: [shell], resources: ["*"], effect: allow}
+    args: {argv: ["python3", "-c", "print(1)"]}
+    expected: {executed: false}
+    open_until: W7
+  - id: corpus-allow-write-hooks-R2-113
+    refs: [R2-113]
+    route: decide
+    workspace_policy:
+      - {id: corpus-write, actions: [write], resources: ["*"], effect: allow}
+    action: write
+    resource: ".git/hooks/pre-commit"
+    expected: {max_effect: ask}
+    open_until: W6
+  - id: corpus-cannot-touch-control-plane-floor
+    refs: [TRUST-003]
+    route: decide
+    workspace_policy:
+      - {id: corpus-write, actions: [write], resources: ["*"], effect: allow}
+    action: write
+    resource: ".panda/policy.json"
+    expected: {effect: hard_deny}
+  # ---- R2-207: a corpus rule lowers the risk shown for a push
+  - id: corpus-rule-lowers-push-risk-R2-207
+    refs: [R2-207]
+    route: decide_shell
+    workspace_policy:
+      - {id: lab-sync, actions: [shell], resources: ["git push*"], effect: ask, risk: low,
+         reason: "routine sync (pre-approved)"}
+    argv: ["git", "push", "origin", "main"]
+    expected: {max_effect: ask, min_risk: high}
+    open_until: W7
+  - id: empty-corpus-policy-auto-push-R2-500
+    refs: [R2-500]
+    route: run_shell
+    approver: auto
+    workspace_policy: []
+    args: {argv: ["git", "push", "origin", "main"]}
+    expected: {executed: false}
