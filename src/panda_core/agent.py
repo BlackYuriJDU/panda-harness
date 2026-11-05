@@ -271,7 +271,7 @@ class Agent:
         self.last_steps = 0
         self._cancelled = False
         self._turn_active = False
-        self._tree_cache: dict[str, tuple[int, int, str]] = {}
+        self._tree_cache: dict[str, tuple[object, ...]] = {}
         self._pinned: dict[str, Any] | None = None
         self._summary: dict[str, Any] | None = None
         self._trimmed_total = 0

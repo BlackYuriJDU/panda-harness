@@ -19,7 +19,10 @@ from pathlib import Path
 SCOPE = "corpus"
 MAX_FILES = 20_000
 MAX_FILE_BYTES = 64 * 1024 * 1024
-_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv"})
+# Only `.git` is skipped (the floor denies writes to it). node_modules, .venv and
+# __pycache__ under corpus/ are code the agent can write and the validator can load,
+# so they are part of the state (R2-226).
+_SKIP_DIRS = frozenset({".git"})
 
 
 @dataclass(frozen=True)
@@ -37,8 +40,13 @@ def file_sha256(path: Path) -> str:
     return sha.hexdigest()
 
 
-def tree_hash(root: Path, cache: dict[str, tuple[int, int, str]] | None = None) -> TreeHash:
-    """Hash `root/corpus`. `cache` maps path to (mtime_ns, size, sha) to skip rehashing."""
+def tree_hash(root: Path, cache: dict[str, tuple[object, ...]] | None = None) -> TreeHash:
+    """Hash `root/corpus`.
+
+    `cache` maps a path to (ctime_ns, mtime_ns, size, inode, sha) to skip rehashing.
+    ctime and the inode change on any write or replace and cannot be set back by
+    the writer, unlike mtime (R2-226).
+    """
 
     base = root / SCOPE
     entries: list[tuple[str, str]] = []
@@ -58,13 +66,14 @@ def tree_hash(root: Path, cache: dict[str, tuple[int, int, str]] | None = None) 
                     truncated = True
                     continue
                 key = str(path)
+                identity = (stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size, stat.st_ino)
                 hit = cache.get(key) if cache is not None else None
-                if hit and hit[0] == stat.st_mtime_ns and hit[1] == stat.st_size:
-                    digest = hit[2]
+                if hit and tuple(hit[:4]) == identity:
+                    digest = str(hit[4])
                 else:
                     digest = file_sha256(path)
                     if cache is not None:
-                        cache[key] = (stat.st_mtime_ns, stat.st_size, digest)
+                        cache[key] = (*identity, digest)
                 entries.append((path.relative_to(root).as_posix(), digest))
             if truncated and len(entries) >= MAX_FILES:
                 break

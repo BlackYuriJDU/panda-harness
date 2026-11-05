@@ -419,3 +419,40 @@ def test_evidence_readers_are_bounded(workspace, monkeypatch) -> None:
     monkeypatch.setattr(tools, "MAX_DATA_BYTES", 64)
     with pytest.raises(ToolInputError):
         _read_jsonl(big)
+
+
+# --------------------------------------------------------------------------- R2-226 / R2-313
+def test_tree_hash_covers_agent_writable_node_modules_under_corpus(workspace) -> None:
+    from panda_core.treehash import tree_hash
+
+    before = tree_hash(workspace.root).digest
+    module = workspace.root / "corpus" / "node_modules" / "lib" / "index.js"
+    module.parent.mkdir(parents=True)
+    module.write_text("module.exports = 1\n", encoding="utf-8")
+    assert tree_hash(workspace.root).digest != before
+
+
+def test_tree_hash_cache_is_not_fooled_by_a_restored_mtime(workspace) -> None:
+    from panda_core.treehash import tree_hash
+
+    path = workspace.root / "corpus" / "claims.md"
+    path.write_text("aaaa\n", encoding="utf-8")
+    cache: dict = {}
+    first = tree_hash(workspace.root, cache).digest
+    stat = path.stat()
+    path.write_text("bbbb\n", encoding="utf-8")  # same size
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))  # mtime put back
+    assert tree_hash(workspace.root, cache).digest != first
+
+
+def test_python_dash_m_ignores_panda_cli_portion_in_cwd(tmp_path: Path) -> None:
+    import subprocess
+
+    planted = tmp_path / "panda_cli"
+    planted.mkdir()
+    (planted / "entry.py").write_text("raise SystemExit('PLANTED')\n", encoding="utf-8")
+    (planted / "__main__.py").write_text("raise SystemExit('PLANTED')\n", encoding="utf-8")
+    result = subprocess.run([sys.executable, "-P", "-m", "panda_cli", "version"], cwd=tmp_path,
+                            capture_output=True, text=True)
+    assert "PLANTED" not in result.stdout + result.stderr
+    assert result.returncode == 0

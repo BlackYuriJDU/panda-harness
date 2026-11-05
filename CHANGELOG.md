@@ -122,6 +122,11 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   (`provider.name`) or raise budgets above 1 048 576 context tokens, 65 536 output tokens,
   3 retries and 600 s. Evidence and number registries above 16 MB and claim cards above
   1 MB are refused instead of read whole.
+- Tree hash and packaging (R2-226, R2-313): `tree_sha256` no longer skips
+  `corpus/node_modules`, `.venv` or `__pycache__` (code the validator can load), and its
+  cache keys on ctime and inode, which a writer cannot restore like mtime. `panda_cli` is
+  a regular package, and the MCP command Panda writes runs `python -P -m panda_cli`, so a
+  `panda_cli/` folder in a corpus cannot be imported.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.

@@ -89,7 +89,8 @@ def default_panda_command() -> list[str]:
         return split_command(override)
     if shutil.which("panda"):
         return ["panda"]
-    return [sys.executable, "-m", "panda_cli"]
+    # -P: do not put the current directory (a corpus) on sys.path (R2-313).
+    return [sys.executable, "-P", "-m", "panda_cli"]
 
 
 def build_permissions() -> list[dict[str, str]]:
