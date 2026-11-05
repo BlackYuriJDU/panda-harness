@@ -143,9 +143,6 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
 - `tests/evals/policy/`: adversarial policy cases as data, run through the real
   `ChatRuntime` -> `ToolRegistry` route with a fake approver and effect markers. Open
   holes are strict xfails, so fixing one without flipping its case fails the suite.
-
-### Added
-
 - `panda policy trust [--show] [--yes] [--revoke]`: read what a workspace policy would allow beyond the built-in one, then trust it explicitly (typed confirmation); the cockpit, REPL and `panda run` say how many allow rules are ignored until then.
 
 ### Changed
@@ -159,6 +156,12 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
 - `panda validate` through `run_shell` now needs an approval; the `validate` tool is the
   unattended route (owner approved the test change).
 - CI runs the Ubuntu and Windows matrix on every branch push.
+- Tool result budget (R2-408, R2-413): one result may carry at most 20% of the context
+  window (about 4 characters per token; between 8 000 and 200 000 characters). `read_file`
+  stops at that budget and ends with `call read_file with start_line=N+1`
+  (`next_start_line` in the data); a line over 2 000 characters is cut and counted in
+  `lines_cut`; a `start_line` past the end is an error instead of an empty `99-3` range.
+  Any other tool's result over the budget is cut with a note and `result_truncated: true`.
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

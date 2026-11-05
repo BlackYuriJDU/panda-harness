@@ -74,3 +74,56 @@ def test_every_tool_schema_is_a_valid_json_schema(workspace) -> None:
 
     for spec in _registry(workspace).specs():
         Draft202012Validator.check_schema(spec.parameters)
+
+
+# --------------------------------------------------------------------------- R2-408 / R2-413
+def _limited(workspace, limit: int):
+    registry = _registry(workspace)
+    registry.ctx.result_limit = limit
+    return registry
+
+
+def test_read_file_stops_at_the_result_budget_and_says_where_to_resume(workspace) -> None:
+    path = workspace.root / "corpus" / "big.md"
+    path.write_text("".join(f"line {n:04d} " + "x" * 90 + "\n" for n in range(1, 2001)),
+                    encoding="utf-8")
+    result = _call(_limited(workspace, 20_000), "read_file",
+                   {"path": "corpus/big.md", "max_lines": 2000})
+    assert result.ok and len(result.content) <= 20_000
+    end = result.data["end_line"]
+    assert 100 < end < 2000 and result.data["truncated"] is True
+    assert result.data["next_start_line"] == end + 1
+    assert f"call read_file with start_line={end + 1}" in result.content
+    resumed = _call(_limited(workspace, 20_000), "read_file",
+                    {"path": "corpus/big.md", "start_line": end + 1, "max_lines": 5})
+    assert f"line {end + 1:04d}" in resumed.content
+
+
+def test_read_file_cuts_a_single_huge_line(workspace) -> None:
+    (workspace.root / "corpus" / "one.md").write_text("y" * 500_000, encoding="utf-8")
+    result = _call(_registry(workspace), "read_file", {"path": "corpus/one.md"})
+    assert result.ok and len(result.content) < 3_000
+    assert result.data["lines_cut"] == 1 and "more chars]" in result.content
+
+
+def test_the_default_budget_follows_the_context_window(workspace) -> None:
+    registry = _registry(workspace)
+    window = workspace.config.provider.context_window
+    assert registry.ctx.max_result_chars() == max(8_000, min(200_000, int(window * 0.8)))
+
+
+def test_every_tool_result_is_bounded(workspace) -> None:
+    (workspace.root / "corpus" / "wide.md").write_text(
+        "\n".join("NEEDLE " + "z" * 1500 for _ in range(400)), encoding="utf-8")
+    result = _call(_limited(workspace, 10_000), "grep",
+                   {"pattern": "NEEDLE", "max_matches": 400})
+    assert len(result.content) <= 10_000 + 200
+    assert result.data["result_truncated"] is True
+    assert "narrow the request" in result.content
+
+
+def test_read_file_past_the_end_is_an_error(workspace) -> None:
+    (workspace.root / "corpus" / "short.md").write_text("a\nb\nc\n", encoding="utf-8")
+    result = _call(_registry(workspace), "read_file", {"path": "corpus/short.md",
+                                                       "start_line": 99})
+    assert not result.ok and "start_line 99 is past the end (3 lines)" in result.content

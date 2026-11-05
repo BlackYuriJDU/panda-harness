@@ -57,6 +57,13 @@ MAX_WRITE_BYTES = 2_097_152
 # A diff is shown whole up to this size; past it the action cannot be approved (R2-125).
 PREVIEW_LIMIT = 200_000
 DEFAULT_OUTPUT_LIMIT = 30_000
+# R2-408: one result may use at most this share of the context window (at ~4
+# characters per token, the estimate the agent trims against), and never more
+# than RESULT_LIMIT_MAX characters. Longer lines are cut so one line cannot.
+RESULT_WINDOW_SHARE = 0.2
+RESULT_LIMIT_MAX = 200_000
+RESULT_LIMIT_MIN = 8_000
+LINE_LIMIT = 2_000
 
 
 class ToolInputError(Exception):
@@ -152,6 +159,16 @@ class ToolContext:
     active_study: str | None = None
     approve: Approver | None = None
     output_limit: int = DEFAULT_OUTPUT_LIMIT
+    result_limit: int | None = None
+
+    def max_result_chars(self) -> int:
+        """Characters one tool result may carry to the model (R2-408)."""
+
+        if self.result_limit is not None:
+            return max(1, self.result_limit)
+        window = self.workspace.config.provider.context_window
+        share = int(window * 4 * RESULT_WINDOW_SHARE)
+        return max(RESULT_LIMIT_MIN, min(RESULT_LIMIT_MAX, share))
 
 
 def _json(payload: Any) -> str:
@@ -357,6 +374,26 @@ def _ok(tool: str, payload: dict[str, Any], *, text: str | None = None) -> ToolR
     body = {"ok": True, "tool": tool, **payload}
     return ToolResult(ok=True, content=text if text is not None else _json(body), data=body)
 
+def _bounded(result: ToolResult, limit: int) -> ToolResult:
+    """Cut any result above the per-result budget, saying so (R2-408).
+
+    Tools with a natural continuation (read_file) stop early with their own hint;
+    this net covers the rest, so no single result can fill the context window.
+    """
+
+    size = len(result.content)
+    if size <= limit:
+        return result
+    note = (
+        f"\n[result truncated: {size - limit} of {size} characters omitted; "
+        "narrow the request (a smaller range, a tighter pattern or a lower limit)]"
+    )
+    data = {**result.data, "result_truncated": True, "result_chars": size}
+    return ToolResult(
+        ok=result.ok, content=result.content[:limit] + note, data=data, blocked=result.blocked
+    )
+
+
 def _string_arg(args: dict[str, Any], key: str, *, default: str | None = None) -> str:
     value = args.get(key, default)
     if not isinstance(value, str):
@@ -552,7 +589,7 @@ class ToolRegistry:
             return _fail(name, f"invalid arguments: {problem}")
         handler = self._handlers[name]
         try:
-            return await handler(args)
+            return _bounded(await handler(args), self.ctx.max_result_chars())
         except ToolInputError as exc:
             return _fail(name, str(exc))
         except PandaError as exc:
@@ -598,24 +635,46 @@ class ToolRegistry:
         text = path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         total = len(lines)
-        end = min(total, start - 1 + limit)
-        numbered = "\n".join(
-            f"{number:>5}  {lines[number - 1]}" for number in range(start, end + 1)
-        )
+        if start > max(total, 1):
+            raise ToolInputError(f"start_line {start} is past the end ({total} lines)")
+        last = min(total, start - 1 + limit)
+        budget = self.ctx.max_result_chars() - 200  # header and hint
+        rendered: list[str] = []
+        used = 0
+        cut_lines = 0
+        end = start - 1
+        for number in range(start, last + 1):
+            line = lines[number - 1]
+            if len(line) > LINE_LIMIT:
+                line = f"{line[:LINE_LIMIT]} [line cut: {len(line) - LINE_LIMIT} more chars]"
+                cut_lines += 1
+            entry = f"{number:>5}  {line}"
+            if rendered and used + len(entry) + 1 > budget:
+                break
+            rendered.append(entry)
+            used += len(entry) + 1
+            end = number
         header = f"{relative}:{start}-{end} of {total} lines"
-        body = f"{header}\n{numbered}" if numbered else f"{header}\n(empty)"
-        return _ok(
-            "read_file",
-            {
-                "path": relative,
-                "total_lines": total,
-                "start_line": start,
-                "end_line": end,
-                "truncated": end < total,
-                "rule": decision.rule_id if decision else None,
-            },
-            text=body,
-        )
+        body = f"{header}\n" + ("\n".join(rendered) if rendered else "(empty)")
+        truncated = end < total
+        payload: dict[str, Any] = {
+            "path": relative,
+            "total_lines": total,
+            "start_line": start,
+            "end_line": end,
+            "truncated": truncated,
+            "rule": decision.rule_id if decision else None,
+        }
+        if truncated:
+            payload["next_start_line"] = end + 1
+            reason = "the result budget" if end < last else "max_lines"
+            body += (
+                f"\n[truncated at line {end} by {reason}; "
+                f"call read_file with start_line={end + 1} to continue]"
+            )
+        if cut_lines:
+            payload["lines_cut"] = cut_lines
+        return _ok("read_file", payload, text=body)
     async def _list_files(self, args: dict[str, Any]) -> ToolResult:
         pattern = _string_arg(args, "pattern", default="*") or "*"
         limit = _int_arg(args, "limit", default=200, minimum=1, maximum=2_000)

@@ -375,6 +375,11 @@ REPL, headless `run`, and the MCP export.
 | Process | `run_shell` (argv array, no shell, bounded timeout, `cwd` inside root) |
 | Provenance | `session_note` |
 
+No single tool result sent to the model exceeds the result budget: 20% of the
+context window at about 4 characters per token, between 8 000 and 200 000
+characters. `read_file` stops early at that budget and names the `start_line` to
+continue from; any other result above it is cut with `result_truncated: true`.
+
 Every path is resolved inside the workspace before use. Reads outside the
 workspace, secret paths, and traversal are refused by policy or by path
 resolution, not by prompt text. `write_file`, `edit_file`, and `run_shell` are
