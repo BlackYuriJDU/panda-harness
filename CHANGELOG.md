@@ -181,6 +181,10 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   when a rule describes a planned control. The unused `git` and `spend` rule families and
   `release-build` are gone from the built-in policy (their copies in old workspace files
   are legacy and need no trust); `release-publish` stays as a planned hard deny.
+- Tool descriptions (R2-411): every tool says when to use it, its limits and the common
+  mistake (no shell in `run_shell`; `*` is top-level only in `list_files`; the `read_file`
+  line-number prefix is not file text), and every parameter has a description.
+  `tests/golden/tools.json` pins what the model is told; `PANDA_UPDATE_GOLDEN=1` updates it.
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

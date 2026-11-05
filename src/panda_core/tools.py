@@ -1424,26 +1424,61 @@ class ToolRegistry:
         raise ToolInputError(f"number not found: {number_id}")
     # ---- specs ----
     def _build_specs(self) -> list[ToolSpec]:
+        """Tool descriptions, written for a capable colleague new to Panda (R2-411).
+
+        Each says when to use the tool, its limits and the common mistake; every
+        parameter has a description. tests/golden/tools.json pins the result.
+        """
+
         obj: dict[str, Any] = {"type": "object"}
+
+        def limit(default: int, maximum: int, what: str) -> dict[str, Any]:
+            return {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": maximum,
+                "default": default,
+                "description": f"Return at most this many {what} (1-{maximum}).",
+            }
+
+        def ident(what: str) -> dict[str, Any]:
+            return {"type": "string", "description": f"The {what}, exactly as listed."}
+
         return [
             ToolSpec(
                 "workspace_info",
-                "Workspace root, provider, model, validator, policy, studies, session state.",
+                "Describe the workspace: root, provider and model, validator, policy source, "
+                "registered studies, active study and session id. Call it first when you "
+                "need to know what this corpus is; it reads no file contents.",
                 {**obj, "properties": {}, "additionalProperties": False},
             ),
             ToolSpec(
                 "read_file",
-                "Read a UTF-8 text file inside the workspace, with line numbers for citation.",
+                "Read a UTF-8 text file inside the workspace. Each line comes back as "
+                "'<number>  <text>'; the number and the two spaces are not part of the "
+                "file, so never copy them into edit_file. Long results stop early and end "
+                "with the start_line to continue from; lines over 2000 characters are cut. "
+                "Files over 1 MiB are refused (use grep). Secret files are denied by policy.",
                 {
                     **obj,
                     "properties": {
-                        "path": {"type": "string", "description": "Workspace-relative path."},
-                        "start_line": {"type": "integer", "minimum": 1, "default": 1},
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative path, e.g. corpus/claims/c1.md.",
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 1,
+                            "description": "First line to return (1-based). Use the "
+                            "next_start_line of a truncated read to continue.",
+                        },
                         "max_lines": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 2000,
                             "default": 400,
+                            "description": "Maximum number of lines to return (1-2000).",
                         },
                     },
                     "required": ["path"],
@@ -1452,32 +1487,55 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "list_files",
-                "List workspace files matching a glob, skipping VCS and dependency directories.",
+                "List workspace paths matching a glob (directories end with '/'). '*' "
+                "matches the top level only; use '**/*' or 'corpus/**/*.md' to recurse. "
+                "VCS, virtualenv, cache and dependency directories are skipped, and paths "
+                "the read policy denies are counted in omitted_by_policy, not listed. "
+                "truncated: true means more paths match than limit.",
                 {
                     **obj,
                     "properties": {
-                        "pattern": {"type": "string", "default": "*"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 200},
+                        "pattern": {
+                            "type": "string",
+                            "default": "*",
+                            "description": "Glob relative to the workspace root.",
+                        },
+                        "limit": limit(200, 2000, "paths"),
                     },
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "grep",
-                "Search text files with a regular expression; returns path:line: text.",
+                "Search text files with a Python regular expression; each match is "
+                "'path:line: text' (text cut at 300 characters). Case-insensitive unless "
+                "case_sensitive is true. Searches at most 5000 files and skips files over "
+                "1 MiB: when search_complete is false, count 0 is not evidence of absence; "
+                "narrow the glob. Stops after 10 s; use fixed_strings for literal text.",
                 {
                     **obj,
                     "properties": {
-                        "pattern": {"type": "string"},
-                        "glob": {"type": "string", "default": "**/*"},
-                        "max_matches": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "default": 100,
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regular expression (or literal text with "
+                            "fixed_strings).",
                         },
-                        "case_sensitive": {"type": "boolean", "default": False},
-                        "fixed_strings": {"type": "boolean", "default": False},
+                        "glob": {
+                            "type": "string",
+                            "default": "**/*",
+                            "description": "Which files to search, relative to the root.",
+                        },
+                        "max_matches": limit(100, 1000, "matching lines"),
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Match case exactly.",
+                        },
+                        "fixed_strings": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Treat pattern as literal text, not a regex.",
+                        },
                     },
                     "required": ["pattern"],
                     "additionalProperties": False,
@@ -1485,38 +1543,59 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "study_list",
-                "List registered studies from corpus/studies/INDEX.md.",
+                "List the studies registered in corpus/studies/INDEX.md, optionally "
+                "filtered by track or status. Use study_show for one study's card.",
                 {
                     **obj,
                     "properties": {
-                        "track": {"type": "string", "enum": ["public", "simulated", "real"]},
-                        "status": {"type": "string", "enum": ["planned", "active", "done"]},
+                        "track": {
+                            "type": "string",
+                            "enum": ["public", "simulated", "real"],
+                            "description": "Only studies on this track.",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["planned", "active", "done"],
+                            "description": "Only studies with this status.",
+                        },
                     },
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "study_show",
-                "Show one registered study card, its frontmatter, and its body.",
+                "Show one registered study card: its frontmatter and body.",
                 {
                     **obj,
-                    "properties": {"study_id": {"type": "string"}},
+                    "properties": {"study_id": ident("study id from study_list")},
                     "required": ["study_id"],
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "validate",
-                "Run the canonical corpus validator and return its JSON report.",
+                "Run the corpus's own validator (Node) and return its JSON report. Run it "
+                "after edits and before claiming the corpus is consistent; a failing report "
+                "lists each error with its file.",
                 {
                     **obj,
-                    "properties": {"release": {"type": "boolean", "default": False}},
+                    "properties": {
+                        "release": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Pass --release to the validator, which runs "
+                            "the release checks the corpus defines.",
+                        }
+                    },
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "policy_check",
-                "Evaluate the fail-closed policy for one action/resource pair.",
+                "Ask what the policy would decide for an action before trying it: allow, "
+                "ask (needs the user's approval), deny or hard_deny, with the rule. It "
+                "changes nothing and grants nothing. Use it to explain a block, not to "
+                "look for another route around one.",
                 {
                     **obj,
                     "properties": {
@@ -1525,8 +1604,14 @@ class ToolRegistry:
                             # R2-410: only actions a tool enforces; an answer about
                             # anything else would describe a control that does not exist.
                             "enum": sorted(ENFORCED_ACTIONS),
+                            "description": "read, write or edit a path; shell a command; "
+                            "validate the corpus.",
                         },
-                        "resource": {"type": "string"},
+                        "resource": {
+                            "type": "string",
+                            "description": "Workspace-relative path, or the command line "
+                            "for shell.",
+                        },
                     },
                     "required": ["action", "resource"],
                     "additionalProperties": False,
@@ -1534,22 +1619,33 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "session_note",
-                "Append a durable observation to the hash-chained session ledger.",
+                "Append a short observation to the session ledger (hash-chained, kept "
+                "after the session). Use it for decisions and findings worth auditing "
+                "later, not for chat. At most 4000 characters are kept.",
                 {
                     **obj,
-                    "properties": {"message": {"type": "string"}},
+                    "properties": {
+                        "message": {"type": "string", "description": "The note to record."}
+                    },
                     "required": ["message"],
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "write_file",
-                "Write a workspace file (create or replace) after policy approval.",
+                "Create a file or replace it with the full new content (up to 2 MiB). "
+                "Prefer edit_file for changes to an existing file. Writes are checked "
+                "against the policy: some paths ask the user (they see a diff), some are "
+                "always denied (.git, .panda, the validator). Content must not contain the "
+                "[redacted] marker that stands for a hidden secret.",
                 {
                     **obj,
                     "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
+                        "path": {"type": "string", "description": "Workspace-relative path."},
+                        "content": {
+                            "type": "string",
+                            "description": "The complete file content (UTF-8).",
+                        },
                     },
                     "required": ["path", "content"],
                     "additionalProperties": False,
@@ -1558,14 +1654,24 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "edit_file",
-                "Replace one exact string (or every occurrence) in a workspace file.",
+                "Replace an exact string in an existing UTF-8 file. old_string must match "
+                "the file text exactly (without read_file's line-number prefix) and occur "
+                "once, unless replace_all is true; include surrounding lines to make it "
+                "unique. Line endings are kept. Checked against the policy like write_file.",
                 {
                     **obj,
                     "properties": {
-                        "path": {"type": "string"},
-                        "old_string": {"type": "string"},
-                        "new_string": {"type": "string"},
-                        "replace_all": {"type": "boolean", "default": False},
+                        "path": {"type": "string", "description": "Workspace-relative path."},
+                        "old_string": {
+                            "type": "string",
+                            "description": "Exact text to replace; must not be empty.",
+                        },
+                        "new_string": {"type": "string", "description": "Replacement text."},
+                        "replace_all": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Replace every occurrence instead of exactly one.",
+                        },
                     },
                     "required": ["path", "old_string", "new_string"],
                     "additionalProperties": False,
@@ -1574,17 +1680,32 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "run_shell",
-                "Run a bounded argv command without a shell, from a workspace directory.",
+                "Run one program with an argv array. There is no shell: pipes, globs, "
+                "redirection, '&&' and variables are not interpreted (pass each argument "
+                "as its own string). The environment is cleaned of credentials. Most "
+                "commands ask the user first; destructive ones (force-push, rm -rf, "
+                "git reset --hard) are always denied. stdout and stderr are each cut at "
+                "about 15000 characters.",
                 {
                     **obj,
                     "properties": {
-                        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                        "cwd": {"type": "string", "default": "."},
+                        "argv": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": 'Program and arguments, e.g. ["pytest", "-q"].',
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "default": ".",
+                            "description": "Working directory, relative to the root.",
+                        },
                         "timeout_seconds": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 600,
                             "default": 60,
+                            "description": "Stop the command after this many seconds.",
                         },
                     },
                     "required": ["argv"],
@@ -1594,85 +1715,74 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "evidence_list",
-                "List evidence records from corpus/evidence/evidence.jsonl.",
+                "List evidence records from corpus/evidence/evidence.jsonl (id, study, "
+                "track, source path and line, license). total counts the records that "
+                "match the filter.",
                 {
                     **obj,
                     "properties": {
-                        "study_id": {"type": "string"},
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "default": 100,
+                        "study_id": {
+                            "type": "string",
+                            "description": "Only evidence for this study.",
                         },
+                        "limit": limit(100, 1000, "records"),
                     },
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "evidence_show",
-                "Show one evidence record by evidence_id.",
+                "Show one full evidence record from corpus/evidence/evidence.jsonl.",
                 {
                     **obj,
-                    "properties": {"evidence_id": {"type": "string"}},
+                    "properties": {"evidence_id": ident("evidence id from evidence_list")},
                     "required": ["evidence_id"],
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "claim_list",
-                "List claims from corpus/claims/*.md frontmatter.",
+                "List claims from the frontmatter of corpus/claims/*.md, with their "
+                "evidence and number ids. Cards the policy hides, links and oversized cards "
+                "are counted (omitted_by_policy, omitted_links, omitted_too_large), not "
+                "listed.",
                 {
                     **obj,
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "default": 100,
-                        }
-                    },
+                    "properties": {"limit": limit(100, 1000, "claims")},
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "claim_show",
-                "Show one claim and its body by claim_id.",
+                "Show one claim card: frontmatter and body (body cut at 8000 characters).",
                 {
                     **obj,
-                    "properties": {"claim_id": {"type": "string"}},
+                    "properties": {"claim_id": ident("claim id from claim_list")},
                     "required": ["claim_id"],
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "number_list",
-                "List numbers from corpus/numbers.json with their evidence link.",
+                "List the numbers in corpus/numbers.json with their value and evidence "
+                "link. Cite a number by its number_id.",
                 {
                     **obj,
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "default": 100,
-                        }
-                    },
+                    "properties": {"limit": limit(100, 1000, "numbers")},
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "number_show",
-                "Show one number record by number_id.",
+                "Show one full number record from corpus/numbers.json.",
                 {
                     **obj,
-                    "properties": {"number_id": {"type": "string"}},
+                    "properties": {"number_id": ident("number id from number_list")},
                     "required": ["number_id"],
                     "additionalProperties": False,
                 },
             ),
         ]
-
 
 __all__ = [
     "ApprovalRequest",

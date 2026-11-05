@@ -302,3 +302,24 @@ def test_dead_rule_families_are_gone_and_old_files_need_no_trust(tmp_path) -> No
          "effect": "allow"},
     ]}), encoding="utf-8")
     assert loosening_rules(load_policy(legacy_file)) == []
+
+
+# --------------------------------------------------------------------------- R2-411
+GOLDEN = __import__("pathlib").Path(__file__).parents[1] / "golden" / "tools.json"
+
+
+def test_every_tool_and_parameter_has_a_description(workspace) -> None:
+    for spec in _registry(workspace).describe():
+        assert len(spec["description"]) >= 40, spec["name"]
+        for name, schema in spec["parameters"].get("properties", {}).items():
+            assert schema.get("description"), f"{spec['name']}.{name}"
+
+
+def test_tool_descriptions_match_the_golden_file(workspace) -> None:
+    """Changing what the model is told is a reviewed change: update the golden file."""
+
+    current = json.dumps(_registry(workspace).describe(), indent=2, sort_keys=True) + "\n"
+    if not GOLDEN.exists() or __import__("os").environ.get("PANDA_UPDATE_GOLDEN"):
+        GOLDEN.parent.mkdir(exist_ok=True)
+        GOLDEN.write_text(current, encoding="utf-8", newline="\n")
+    assert GOLDEN.read_text(encoding="utf-8") == current
