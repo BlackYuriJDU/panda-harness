@@ -127,6 +127,10 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   cache keys on ctime and inode, which a writer cannot restore like mtime. `panda_cli` is
   a regular package, and the MCP command Panda writes runs `python -P -m panda_cli`, so a
   `panda_cli/` folder in a corpus cannot be imported.
+- Tool arguments (R2-401): only `required` was checked, so `replace_all: "false"` replaced
+  every occurrence and unknown keys were ignored. Arguments are now validated against the
+  tool's JSON Schema (`jsonschema`, now a runtime dependency), unknown keys are refused, and
+  the error names the field and the expected type.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.

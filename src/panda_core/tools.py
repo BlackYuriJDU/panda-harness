@@ -320,6 +320,29 @@ _MARKER_MESSAGE = (
 )
 
 
+def _schema_problem(schema: dict[str, Any], args: dict[str, Any]) -> str | None:
+    """The first way `args` breaks the tool's JSON Schema, as one actionable sentence."""
+
+    from jsonschema import Draft202012Validator
+
+    strict = dict(schema)
+    strict.setdefault("type", "object")
+    if "properties" in strict:
+        strict.setdefault("additionalProperties", False)
+    errors = sorted(Draft202012Validator(strict).iter_errors(args), key=lambda e: list(e.path))
+    if not errors:
+        return None
+    error = errors[0]
+    where = ".".join(str(part) for part in error.path) or "arguments"
+    if error.validator == "additionalProperties":
+        unknown = sorted(set(args) - set(strict.get("properties", {})))
+        return f"unknown argument(s) {', '.join(unknown)}; allowed: {', '.join(strict['properties'])}"
+    if error.validator == "required":
+        return f"missing required argument: {error.message.split(chr(39))[1]}"
+    expected = error.schema.get("type") or error.schema.get("enum") or error.validator
+    return f"{where}: {error.message} (expected {expected})"
+
+
 def _is_git(argv: Sequence[str]) -> bool:
     return bool(argv) and Path(argv[0].replace("\\", "/")).name.lower() in {"git", "git.exe"}
 
@@ -521,10 +544,11 @@ class ToolRegistry:
         else:
             return _fail(name, "arguments must be an object or JSON object string")
 
-        required = spec.parameters.get("required", [])
-        missing = [key for key in required if key not in args]
-        if missing:
-            return _fail(name, f"missing required argument(s): {', '.join(missing)}")
+        problem = _schema_problem(spec.parameters, args)
+        if problem:
+            # R2-401: the schema the model sees is the one enforced; "false" is not a
+            # boolean, an unknown key is not ignored, and a bound is not clipped quietly.
+            return _fail(name, f"invalid arguments: {problem}")
         handler = self._handlers[name]
         try:
             return await handler(args)
