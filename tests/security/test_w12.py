@@ -323,3 +323,60 @@ def test_tool_descriptions_match_the_golden_file(workspace) -> None:
         GOLDEN.parent.mkdir(exist_ok=True)
         GOLDEN.write_text(current, encoding="utf-8", newline="\n")
     assert GOLDEN.read_text(encoding="utf-8") == current
+
+
+# --------------------------------------------------------------------------- R2-414
+def _agent(workspace, script, **kwargs):
+    from tests.test_agent import make_agent
+
+    return make_agent(workspace, script, **kwargs)
+
+
+def test_a_turn_out_of_steps_still_ends_with_a_summary(workspace) -> None:
+    import asyncio
+
+    from panda_core.provider import DoneEvent, TextDelta, ToolCall
+
+    call = ToolCall(id="c1", name="read_file", arguments='{"path":"README.md"}')
+    loop = [DoneEvent(finish_reason="tool_calls", tool_calls=(call,))]
+    summary = [TextDelta("did X; Y is left"),
+               DoneEvent(finish_reason="tool_calls", tool_calls=(call,))]
+    agent, session, provider = _agent(workspace, [loop, loop, summary], max_steps=2)
+    result = asyncio.run(agent.run_turn("go"))
+    assert result.status == "max_steps" and result.steps == 2
+    assert "did X; Y is left" in result.text
+    # the model was told before its last step and before the summary
+    assert "last step of the turn that can run tools" in provider.calls[1][-1]["content"]
+    assert "no tool calls will be run" in provider.calls[2][-1]["content"]
+    text = session.path.read_text(encoding="utf-8")
+    assert text.count('"type":"tool.result"') == 2  # the summary's call was not run
+    assert '"dropped_tool_calls":1' in text and '"type":"harness.note"' in text
+
+
+def test_max_tokens_stops_before_the_next_model_call(workspace) -> None:
+    import asyncio
+
+    from panda_core.provider import DoneEvent, ToolCall, Usage, UsageEvent
+
+    call = ToolCall(id="c1", name="read_file", arguments='{"path":"README.md"}')
+    step = [UsageEvent(Usage(prompt_tokens=900, completion_tokens=200, total_tokens=1100)),
+            DoneEvent(finish_reason="tool_calls", tool_calls=(call,))]
+    agent, _, provider = _agent(workspace, [step, step, step], max_steps=10)
+    agent.max_tokens = 2000
+    result = asyncio.run(agent.run_turn("go"))
+    assert result.status == "budget_exceeded" and len(provider.calls) == 2
+
+
+def test_budget_exceeded_is_a_limit_exit_code() -> None:
+    from panda_cli.main import run_exit_code
+
+    assert run_exit_code("budget_exceeded") == 7
+
+
+def test_run_accepts_budget_options() -> None:
+    from typer.testing import CliRunner
+
+    from panda_cli.main import app
+
+    out = CliRunner().invoke(app, ["run", "--help"], env={"COLUMNS": "200"}).output
+    assert "--max-tokens" in out and "--max-cost" in out

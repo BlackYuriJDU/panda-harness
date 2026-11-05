@@ -246,6 +246,13 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   `length`, `max_tokens`, `content_filter`, `refusal` or `incomplete`, the turn
   status is `incomplete` and `turn.end` carries `finish_reason`. Tool calls from a
   cut-off step are dropped, not executed, because their arguments may be truncated.
+- **A turn that runs out of steps still answers.** Before its last step the model
+  is told it is the last one that can run tools; when the steps are used up, the
+  harness asks once more for a summary (a `harness.note`) and runs none of the tool
+  calls in that reply. The status stays `max_steps`. `panda run --max-tokens N` and
+  `--max-cost USD` stop the turn before the next model call once it has used that many
+  tokens or that much provider-reported cost; the status is `budget_exceeded`, with the
+  budget in `finish_reason`, and the exit code is `7`.
 - **Nothing rewrites the conversation during a turn.** `/clear`, `Ctrl+L`, `/model`,
   `/study ...` and `!command` are refused with a notice while a turn is running in the
   cockpit, and the agent raises a usage error (exit `2`) if its model, active study or
@@ -577,6 +584,7 @@ keeps the task text and the assistant's prose out of the ledger (see §4.1).
 | `session.recovered` | `panda session recover` | One unanchored event was adopted. |
 | `turn.start` / `turn.end` | agent | A turn; `turn.end` carries `status`, usage and `tree_sha256`. |
 | `message.user` / `message.assistant` | agent | The user message and each model step. |
+| `harness.note` | agent | A fixed note the harness sent the model (`kind`: `last_step`, `summary`). |
 | `tool.call` / `tool.result` | agent | A tool call and its result, with file hashes for writes. |
 | `approval.request` / `approval.decision` | agent | An `ask` and its answer. |
 | `context.trim` | agent | Messages removed from the model context, with their hashes. |

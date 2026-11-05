@@ -70,6 +70,8 @@ class ChatRuntime:
         approver: ApprovalCallback | None = None,
         on_event: EventCallback | None = None,
         label: str = "chat",
+        max_tokens: int | None = None,
+        max_cost: float | None = None,
     ) -> None:
         self.workspace = workspace
         self.private = private
@@ -121,6 +123,8 @@ class ChatRuntime:
             session=session,
             model=model or workspace.config.model,
             max_steps=max_steps,
+            max_tokens=max_tokens,
+            max_cost=max_cost,
             active_study=active_study,
             approver=self._approve,
             decided_by=lambda: self.last_decided_by,

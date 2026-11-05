@@ -466,6 +466,19 @@ def run_command(
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps."
     ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        min=1,
+        help="Stop before the next model call once the turn has used this many tokens.",
+    ),
+    max_cost: float | None = typer.Option(
+        None,
+        "--max-cost",
+        min=0.0,
+        help="Stop before the next model call once the provider-reported cost reaches this"
+        " many USD (no effect when the provider reports no cost).",
+    ),
     timeout: int | None = typer.Option(None, "--timeout", help="Run timeout in seconds."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the plan; do not call the model."),
     quiet: bool = typer.Option(False, "--quiet", help="Do not print the session id."),
@@ -493,6 +506,8 @@ def run_command(
         "model": selected_model,
         "provider": workspace.config.provider.name,
         "max_steps": max_steps,
+        **({"max_tokens": max_tokens} if max_tokens else {}),
+        **({"max_cost": max_cost} if max_cost else {}),
         "cwd": str(workspace.root),
         "git": workspace.git_state(),
     }
@@ -531,7 +546,15 @@ def run_command(
         from panda_cli.runtime import policy_notice
 
         runtime = _runtime(
-            workspace, log, selected_model, max_steps, private, auto, on_event=on_event
+            workspace,
+            log,
+            selected_model,
+            max_steps,
+            private,
+            auto,
+            on_event=on_event,
+            max_tokens=max_tokens,
+            max_cost=max_cost,
         )
         notice = policy_notice(runtime.policy_state)
         if notice and not quiet:
@@ -626,6 +649,8 @@ def _runtime(
     *,
     on_event: Any = None,
     approver: Any = None,
+    max_tokens: int | None = None,
+    max_cost: float | None = None,
 ) -> ChatRuntime:
     from panda_cli.runtime import ChatRuntime
 
@@ -633,6 +658,8 @@ def _runtime(
         workspace,
         model=model,
         max_steps=max_steps,
+        max_tokens=max_tokens,
+        max_cost=max_cost,
         private=private,
         auto=auto,
         session=log,

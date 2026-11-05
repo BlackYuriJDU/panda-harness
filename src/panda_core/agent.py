@@ -81,6 +81,17 @@ Cite concrete locations as `path:line`.
 """
 
 
+LAST_STEP_NOTE = (
+    "[harness note] This is the last step of the turn that can run tools. Finish the "
+    "current action if you can; you will then be asked for a summary."
+)
+SUMMARY_NOTE = (
+    "[harness note] The step budget for this turn is used up and no tool calls will be "
+    "run. Reply with a short summary: what you did, what is left, and anything the user "
+    "must check or approve."
+)
+
+
 @dataclass(frozen=True)
 class AgentEvent:
     kind: str
@@ -246,6 +257,8 @@ class Agent:
         private: bool = False,
         context_window: int | None = None,
         decided_by: Callable[[], str] | None = None,
+        max_tokens: int | None = None,
+        max_cost: float | None = None,
     ) -> None:
         self.workspace = workspace
         self.provider = provider
@@ -253,6 +266,9 @@ class Agent:
         self.session = session if session is not None else tools.ctx.session
         self.model = model or workspace.config.model
         self.max_steps = max(1, int(max_steps))
+        # Per-turn budgets (R2-414): checked before each model call.
+        self.max_tokens = max_tokens if max_tokens and max_tokens > 0 else None
+        self.max_cost = max_cost if max_cost and max_cost > 0 else None
         self.active_study = active_study
         self.private = private
         self._approver = approver
@@ -484,6 +500,61 @@ class Agent:
                 hint="wait for the turn to finish or cancel it first",
             )
 
+    def _budget_exceeded(self, usage: Usage) -> str | None:
+        """Which per-turn budget the turn has used up, if any (R2-414)."""
+
+        if self.max_tokens is not None and usage.total_tokens >= self.max_tokens:
+            return f"max_tokens {self.max_tokens}"
+        if (
+            self.max_cost is not None
+            and usage.cost_usd is not None
+            and usage.cost_usd >= self.max_cost
+        ):
+            return f"max_cost {self.max_cost:g}"
+        return None
+
+    async def _summary_reply(self, turn: int) -> tuple[str, Usage]:
+        """One reply after the step budget, whose tool calls are never run (R2-414).
+
+        It is not a step: the budget counted the steps that could act. The model is
+        told no tool will run; any call it makes anyway is dropped, not answered.
+        """
+
+        self._harness_note(turn, "summary", SUMMARY_NOTE)
+        self._trim()
+        parts: list[str] = []
+        calls: list[Any] = []
+        usage_box: list[Usage] = [Usage()]
+        finish_box: list[str | None] = [None]
+        async for event in self.provider.stream(
+            self.messages, self.tools.to_openai(), model=self.model, session_id=self.session_id
+        ):
+            self._handle_provider_event(event, parts, usage_box, calls, finish_box)
+        text = "".join(parts)
+        self.messages.append({"role": "assistant", "content": text or None})
+        self.usage_total = _usage_sum(self.usage_total, usage_box[0])
+        self._log(
+            "message.assistant",
+            {
+                **(
+                    {"sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "private": True}
+                    if self.private
+                    else {"content": text}
+                ),
+                "chars": len(text),
+                "tool_calls": [],
+                "summary": True,
+                **({"dropped_tool_calls": len(calls)} if calls else {}),
+            },
+        )
+        return text, usage_box[0]
+
+    def _harness_note(self, turn: int, kind: str, content: str) -> None:
+        """A fixed English note from the harness, sent as a user message (R2-414)."""
+
+        self.messages.append({"role": "user", "content": content})
+        self._log("harness.note", {"turn": turn, "kind": kind})
+
     async def run_turn(self, user_message: str) -> TurnResult:
         self._turn_active = True
         try:
@@ -526,7 +597,15 @@ class Agent:
             self.messages.append(task_message)
             self._pinned = task_message
             while steps < self.max_steps:
+                exceeded = self._budget_exceeded(usage)
+                if exceeded:
+                    status, finish_reason = "budget_exceeded", exceeded
+                    break
                 steps += 1
+                # R2-414: the model is told before its last step, and a turn that runs
+                # out of steps gets one more reply with no tools (below) to summarize.
+                if self.max_steps >= 2 and steps == self.max_steps:
+                    self._harness_note(turn, "last_step", LAST_STEP_NOTE)
                 self._trim()
                 step_parts: list[str] = []
                 calls: list[Any] = []
@@ -642,6 +721,11 @@ class Agent:
                     )
                 if steps >= self.max_steps:
                     status = "max_steps"
+            if status == "max_steps":
+                summary, summary_usage = await self._summary_reply(turn)
+                usage = _usage_sum(usage, summary_usage)
+                if summary:
+                    texts.append(summary)
         except asyncio.CancelledError:
             self._close_dangling_tool_calls("cancelled")
             self._end_turn_quietly(turn, "cancelled", steps, tool_calls)

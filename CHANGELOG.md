@@ -185,6 +185,10 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   mistake (no shell in `run_shell`; `*` is top-level only in `list_files`; the `read_file`
   line-number prefix is not file text), and every parameter has a description.
   `tests/golden/tools.json` pins what the model is told; `PANDA_UPDATE_GOLDEN=1` updates it.
+- Step and spend limits (R2-414): the model is told before its last tool step, and a turn
+  that uses up `max_steps` gets one more reply with no tools, so it ends with a summary
+  instead of an empty answer. `panda run --max-tokens` and `--max-cost` stop the turn
+  before the next model call with status `budget_exceeded` (exit `7`).
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.
