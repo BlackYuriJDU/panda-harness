@@ -109,6 +109,12 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   appended after `session.end`. `panda session recover` refuses an unanchored approval or
   policy event and one dated before its predecessor or in the future. A new test kills
   the surviving mutant that skipped the anchor's hash comparison.
+- Reads that follow links (R2-209, R2-215, R2-307, R2-308, R2-109, R2-118): workspace
+  files are now opened one directory at a time with `O_NOFOLLOW` (a parent swapped for a
+  link after the check is refused); the grep worker opens only the inode the parent
+  checked; the cockpit crash log and lock files refuse links and other users' files;
+  `corpus/studies/INDEX.md` is read through `safe_read` and `study_list` (tool and MCP)
+  obeys the read policy.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.

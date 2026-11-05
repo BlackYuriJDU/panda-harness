@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import os
+import stat
 import tempfile
 import time
 import traceback
@@ -94,6 +95,24 @@ def _quote(token: str) -> str:
     import shlex
 
     return shlex.quote(token)
+
+
+def _open_private_log(path: Path) -> int:
+    """Open a crash log without following a link or using someone else's file (R2-307).
+
+    `.panda/logs/cockpit.log` comes with the corpus and can be a link; the /tmp
+    fallback can be pre-created by another user. O_NOFOLLOW, a regular-file check
+    and (POSIX) an owner check refuse both.
+    """
+
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    info = os.fstat(fd)
+    getuid = getattr(os, "getuid", None)
+    if not stat.S_ISREG(info.st_mode) or (getuid is not None and info.st_uid != getuid()):
+        os.close(fd)
+        raise OSError(f"refusing crash log {path}: not a private regular file")
+    return fd
 
 
 def _markdown(text: str) -> RichMarkdown:
@@ -850,11 +869,11 @@ class PandaCockpit(App[None]):
         for path in self._log_targets():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                with os.fdopen(fd, "a", encoding="utf-8") as handle:
-                    handle.write(entry)
+                fd = _open_private_log(path)
             except OSError:
                 continue
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                handle.write(entry)
             return path
         return None
 

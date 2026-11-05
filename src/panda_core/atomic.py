@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import secrets
+import stat
 import sys
 import time
 from collections.abc import Iterator
@@ -27,7 +28,13 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
     """
 
     ensure_dir(path.parent)
-    handle = open(path, "a+b")  # noqa: SIM115 - explicit lifecycle below
+    # R2-308: never follow a link planted as the lock file (it would get a NUL byte).
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"lock file is not a regular file: {path}")
+    handle = os.fdopen(fd, "a+b")  # noqa: SIM115 - explicit lifecycle below
     try:
         if handle.tell() == 0:
             handle.write(b"\0")

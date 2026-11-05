@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from panda_core.errors import ConfigError
-from panda_core.safe_read import ensure_plain_path
+from panda_core.safe_read import ensure_plain_path, read_workspace_file
 
 STUDY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 _ID_CELL_RE = re.compile(r"\[`?([^`\]]+)`?\]")
@@ -188,7 +188,8 @@ def load_registry(root: Path) -> list[Study]:
             hint="the corpus root must contain corpus/studies/INDEX.md",
         )
     try:
-        text = path.read_text(encoding="utf-8")
+        # R2-109: the registry is corpus data; a linked INDEX.md is refused.
+        text = read_workspace_file(root, path)
     except OSError as exc:
         raise ConfigError(f"cannot read study registry: {path}") from exc
     return parse_index(text, source=path)

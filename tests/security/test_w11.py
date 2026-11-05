@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -226,3 +227,106 @@ def test_a_rehashed_forged_tail_is_caught_by_the_anchor(tmp_path: Path) -> None:
     _rewrite_last_line(log.path, forge)
     with pytest.raises(SessionIntegrityError, match="anchor"):
         log.append("note", {"text": "next"})
+
+
+# --------------------------------------------------------------------------- TOCTOU (RC-10)
+@POSIX
+def test_parent_directory_swapped_after_lstat_walk_is_not_followed(tmp_path: Path) -> None:
+    from panda_core.safe_read import ensure_plain_path, open_no_follow
+
+    root = tmp_path / "w"
+    (root / ".panda").mkdir(parents=True)
+    target = root / ".panda" / "instructions.md"
+    target.write_text("plain", encoding="utf-8")
+    ensure_plain_path(root, target)  # the walk passes
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "instructions.md").write_text("SYNTH_SECRET_SWAP", encoding="utf-8")
+    (root / ".panda").rename(root / ".panda-real")
+    (root / ".panda").symlink_to(outside, target_is_directory=True)  # swapped after the walk
+    with pytest.raises(OSError):
+        open_no_follow(root, target)
+
+
+@POSIX
+def test_grep_worker_does_not_follow_a_file_swapped_to_a_secret(tmp_path: Path) -> None:
+    import subprocess
+
+    root = tmp_path / "w"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("hello\n", encoding="utf-8")
+    info = os.lstat(note)
+    secret = tmp_path / "secret.env"
+    secret.write_text("hello SYNTH_SECRET_GREP_SWAP\n", encoding="utf-8")
+    note.unlink()
+    note.symlink_to(secret)  # swapped after the policy check
+    worker = Path(__file__).parents[2] / "src" / "panda_core" / "grep_worker.py"
+    request = {"pattern": "hello", "flags": 0, "fixed": True, "limit": 10,
+               "max_bytes": 100_000, "files": [["note.md", info.st_dev, info.st_ino]]}
+    out = subprocess.run([sys.executable, "-I", str(worker)], cwd=root, input=json.dumps(request),
+                         capture_output=True, text=True, check=True).stdout
+    assert "SYNTH_SECRET_GREP_SWAP" not in out
+    assert json.loads(out)["scanned"] == 0
+
+
+@POSIX
+def test_file_lock_does_not_follow_symlink(tmp_path: Path) -> None:
+    from panda_core.atomic import file_lock
+
+    target = tmp_path / "victim.txt"
+    target.write_bytes(b"")
+    lock = tmp_path / "x.lock"
+    lock.symlink_to(target)
+    with pytest.raises(OSError), file_lock(lock):
+        pass
+    assert target.read_bytes() == b""
+
+
+@POSIX
+def test_cockpit_crash_log_does_not_follow_a_corpus_symlink(tmp_path: Path) -> None:
+    from panda_cli.cockpit import _open_private_log
+
+    target = tmp_path / "victim.txt"
+    target.write_text("keep", encoding="utf-8")
+    log = tmp_path / "cockpit.log"
+    log.symlink_to(target)
+    with pytest.raises(OSError):
+        _open_private_log(log)
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+@POSIX
+def test_study_list_does_not_follow_a_symlinked_index(workspace, tmp_path: Path) -> None:
+    import asyncio
+
+    from panda_cli.runtime import ChatRuntime
+
+    index = workspace.root / "corpus" / "studies" / "INDEX.md"
+    outside = tmp_path / "outside.md"
+    outside.write_text("| SYNTH_SECRET_INDEX | x |\n", encoding="utf-8")
+    index.unlink()
+    index.symlink_to(outside)
+    runtime = ChatRuntime(workspace, label="w11")
+    try:
+        result = asyncio.run(runtime.tools.call("study_list", {}))
+    finally:
+        runtime.close()
+    assert "SYNTH_SECRET_INDEX" not in result.content and not result.ok
+
+
+def test_study_list_obeys_a_read_deny_on_the_registry(workspace) -> None:
+    import asyncio
+
+    from panda_cli.runtime import ChatRuntime
+
+    rules = json.loads(workspace.policy_path.read_text(encoding="utf-8"))
+    rules["rules"].append({"id": "hide-index", "actions": ["read"],
+                           "resources": ["corpus/studies/*"], "effect": "deny", "risk": "high"})
+    workspace.policy_path.write_text(json.dumps(rules), encoding="utf-8")
+    runtime = ChatRuntime(workspace, label="w11")
+    try:
+        result = asyncio.run(runtime.tools.call("study_list", {}))
+    finally:
+        runtime.close()
+    assert not result.ok and "gse160208" not in result.content

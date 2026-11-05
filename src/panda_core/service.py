@@ -18,7 +18,6 @@ from panda_core import errors
 from panda_core.errors import PandaError, PolicyDenied, SessionIntegrityError
 from panda_core.policy import engine_for, load_policy_or_default
 from panda_core.provider import status_snapshot
-from panda_core.registry import load_registry
 from panda_core.session import SessionLog, list_sessions
 from panda_core.tools import ToolContext, ToolRegistry, ToolResult
 from panda_core.workspace import Workspace
@@ -227,16 +226,15 @@ class PandaService:
     def study_list(
         self, *, track: str | None = None, status: str | None = None
     ) -> list[dict[str, Any]]:
-        studies = [study.to_dict() for study in load_registry(self.workspace.root)]
+        # Through the registry, like the agent: the read policy on INDEX.md applies
+        # and the call is recorded by the same path (R2-118, MCP-002 parity).
+        arguments: dict[str, Any] = {}
         if track:
-            studies = [study for study in studies if study["track"] == track]
+            arguments["track"] = track
         if status:
-            studies = [study for study in studies if study["status"] == status]
-        self._record(
-            "tool.call",
-            {"tool": "study_list", "track": track, "status": status, "count": len(studies)},
-        )
-        return studies
+            arguments["status"] = status
+        data = self._call_tool("study_list", arguments)
+        return list(data.get("studies", []))
 
     def study_show(self, study_id: str) -> dict[str, Any]:
         data = self._call_tool("study_show", {"study_id": study_id})

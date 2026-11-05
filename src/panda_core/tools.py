@@ -12,6 +12,7 @@ import asyncio
 import difflib
 import hashlib
 import json
+import os
 import re
 import shlex
 import stat
@@ -621,14 +622,17 @@ class ToolRegistry:
             return blocked
         omitted = 0
         root = self.ctx.workspace.root.resolve()
-        candidates: list[str] = []
+        candidates: list[list[object]] = []
         for candidate in _iter_files(self.ctx.workspace.root, glob, 5_000):
             if not candidate.is_file() or candidate.stat().st_size > MAX_READ_BYTES:
                 continue
             if not _readable_by_policy(self.ctx, root, candidate):
                 omitted += 1
                 continue
-            candidates.append(candidate.relative_to(root).as_posix())
+            info = os.lstat(candidate)
+            candidates.append(
+                [candidate.relative_to(root).as_posix(), info.st_dev, info.st_ino]
+            )
         request = {
             "pattern": pattern,
             "flags": flags,
@@ -673,6 +677,12 @@ class ToolRegistry:
     async def _study_list(self, args: dict[str, Any]) -> ToolResult:
         track = args.get("track")
         status = args.get("status")
+        # R2-118: the registry is a file like any other; a read deny on it applies.
+        _, blocked = await _authorize(
+            self.ctx, tool="study_list", action="read", resource="corpus/studies/INDEX.md"
+        )
+        if blocked:
+            return blocked
         studies = [study.to_dict() for study in load_registry(self.ctx.workspace.root)]
         if isinstance(track, str) and track:
             studies = [study for study in studies if study["track"] == track]
