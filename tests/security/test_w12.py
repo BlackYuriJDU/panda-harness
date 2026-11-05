@@ -203,3 +203,57 @@ def test_evidence_list_total_counts_the_filtered_records(workspace) -> None:
         "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
     result = _call(_registry(workspace), "evidence_list", {"study_id": "s1"})
     assert result.data["total"] == 2 and result.data["records_in_file"] == 5
+
+
+# --------------------------------------------------------------------------- R2-412
+def test_a_policy_denial_says_not_to_retry_and_names_the_rule(workspace) -> None:
+    result = _call(_registry(workspace), "read_file", {"path": ".env"})
+    assert result.blocked
+    step = result.data["next_step"]
+    assert "Do not retry" in step and result.data["rule"] in step
+
+
+def test_a_workspace_denial_points_at_the_workspace_policy(workspace) -> None:
+    _claims(workspace)
+    result = _call(_workspace_registry(workspace), "read_file",
+                   {"path": "corpus/claims/c-secret.md"})
+    assert result.blocked and ".panda/policy.json" in result.data["next_step"]
+
+
+def test_no_approver_tells_the_user_to_approve_interactively(workspace) -> None:
+    from panda_core.policy import PolicyEngine, default_policy
+    from panda_core.tools import ToolContext, ToolRegistry
+
+    registry = ToolRegistry(ToolContext(workspace=workspace,
+                                        policy=PolicyEngine(default_policy(),
+                                                            root=workspace.root)))
+    result = _call(registry, "run_shell", {"argv": ["python", "-c", "print(1)"]})
+    assert result.blocked and "no interactive approver" in result.data["detail"]
+    assert "panda chat" in result.data["next_step"]
+
+
+@pytest.mark.parametrize(
+    ("auto", "approver", "detail", "hint"),
+    [
+        (True, None, "--auto does not approve", "--auto only approves"),
+        (False, "no", "approval denied by the operator", "ask the user why"),
+    ],
+)
+def test_a_denied_approval_says_who_denied_it(workspace, auto, approver, detail, hint) -> None:
+    import asyncio
+
+    from panda_cli.runtime import ChatRuntime
+
+    async def no(request) -> bool:
+        return False
+
+    runtime = ChatRuntime(workspace, auto=auto, approver=no if approver else None)
+    try:
+        # route through the agent's approver, which records who decided
+        runtime.tools.ctx.approve = runtime.agent._approve
+        result = asyncio.run(runtime.tools.call(
+            "run_shell", {"argv": ["python", "-c", "print(1)"]}))
+    finally:
+        runtime.close()
+    assert result.blocked and detail in result.data["detail"]
+    assert hint in result.data["next_step"]

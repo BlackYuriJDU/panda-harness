@@ -160,6 +160,8 @@ class ToolContext:
     approve: Approver | None = None
     output_limit: int = DEFAULT_OUTPUT_LIMIT
     result_limit: int | None = None
+    # Who answered the last approval request: human, auto or policy (set by the agent).
+    decided_by: str | None = None
 
     def max_result_chars(self) -> int:
         """Characters one tool result may carry to the model (R2-408)."""
@@ -238,7 +240,9 @@ def _diff_preview(relative: str, before: str, after: str) -> str:
     return _cap("\n".join(diff) or "(no textual change)", PREVIEW_LIMIT)
 
 
-def _blocked(tool: str, decision: Decision, detail: str) -> ToolResult:
+def _blocked(
+    tool: str, decision: Decision, detail: str, *, next_step: str | None = None
+) -> ToolResult:
     payload = {
         "ok": False,
         "blocked": True,
@@ -250,8 +254,43 @@ def _blocked(tool: str, decision: Decision, detail: str) -> ToolResult:
         "rule": decision.rule_id,
         "reason": decision.reason or detail,
         "detail": detail,
+        "next_step": next_step or _denied_next_step(decision, "built-in"),
     }
     return ToolResult(ok=False, blocked=True, content=_json(payload), data=payload)
+
+
+def _denied_next_step(decision: Decision, source: str) -> str:
+    """What the model should do after a policy denial (R2-412)."""
+
+    where = {
+        "workspace": "the workspace policy (.panda/policy.json)",
+        "classifier": "Panda's command classifier",
+    }.get(source, "Panda's built-in policy")
+    return (
+        f"Do not retry this by any other route (another tool, a wrapper, a different path). "
+        f"Tell the user that rule {decision.rule_id or 'default'} in {where} blocks it, and "
+        "ask how they want to proceed."
+    )
+
+
+# R2-412: a blocked approval tells the model what kind of stop it is.
+_APPROVAL_NEXT_STEP = {
+    "policy": (
+        "approval is required and no interactive approver is available",
+        "Do not try another route. Tell the user this action needs their approval: they can "
+        "run it in an interactive session (panda chat) or do it themselves.",
+    ),
+    "auto": (
+        "--auto does not approve this kind of action",
+        "Do not try another route. --auto only approves workspace edits and local checks; "
+        "tell the user this action needs a person's approval.",
+    ),
+    "human": (
+        "approval denied by the operator",
+        "The user said no. Do not retry the same action; ask the user why before trying "
+        "an alternative.",
+    ),
+}
 
 
 async def _authorize(
@@ -272,7 +311,13 @@ async def _authorize(
     if decision.effect == "allow":
         return decision, None
     if decision.effect in {"deny", "hard_deny"}:
-        return decision, _blocked(tool, decision, "policy denies this action")
+        source = ctx.policy.rule_source(decision.rule_id)
+        return decision, _blocked(
+            tool,
+            decision,
+            "policy denies this action",
+            next_step=_denied_next_step(decision, source),
+        )
     return decision, await _ask(
         ctx,
         decision,
@@ -303,9 +348,8 @@ async def _ask(
     """Ask the approver; `None` means approved, a result means blocked."""
 
     if ctx.approve is None:
-        return _blocked(
-            tool, decision, "approval is required and no interactive approver is available"
-        )
+        detail, step = _APPROVAL_NEXT_STEP["policy"]
+        return _blocked(tool, decision, detail, next_step=step)
     request = ApprovalRequest(
         tool=tool,
         action=action,
@@ -322,12 +366,15 @@ async def _ask(
         payload_sha256=payload_sha256,
         preview_complete="\n[truncated " not in preview[-120:],
     )
+    ctx.decided_by = None
     try:
         approved = bool(await ctx.approve(request))
     except Exception:  # noqa: BLE001 - approval failure must deny, never allow
         approved = False
     if not approved:
-        return _blocked(tool, decision, "approval denied by the operator")
+        detail, step = _APPROVAL_NEXT_STEP.get(ctx.decided_by or "human",
+                                               _APPROVAL_NEXT_STEP["human"])
+        return _blocked(tool, decision, detail, next_step=step)
     return None
 
 
@@ -1296,7 +1343,14 @@ class ToolRegistry:
         why = omitted.get(claim_id)
         if why == "policy":
             decision = self.ctx.policy.decide("read", f"corpus/claims/{claim_id}.md")
-            return _blocked("claim_show", decision, "policy denies reading this claim card")
+            return _blocked(
+                "claim_show",
+                decision,
+                "policy denies reading this claim card",
+                next_step=_denied_next_step(
+                    decision, self.ctx.policy.rule_source(decision.rule_id)
+                ),
+            )
         if why == "link":
             raise ToolInputError(f"claim card {claim_id}.md is a link and is not read")
         if why == "too_large":

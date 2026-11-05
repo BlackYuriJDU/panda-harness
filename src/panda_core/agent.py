@@ -377,6 +377,7 @@ class Agent:
             who = self._decided_by()
         else:
             who = "human"
+        self.tools.ctx.decided_by = who  # the blocked result explains a denial by who (R2-412)
         # Who consented is provenance: --auto and a person must not look the same (R2-405).
         self._log(
             "approval.decision",

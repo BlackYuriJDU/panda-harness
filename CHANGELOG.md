@@ -170,6 +170,11 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   policy denies is a blocked result naming the rule, not "claim not found";
   `evidence_list.total` counts the filtered records (the file total is
   `records_in_file`).
+- Blocked results say what to do next (R2-412): every blocked result carries `next_step`.
+  A policy denial says not to retry by another route and names the rule and where it
+  lives (built-in or `.panda/policy.json`); an approval with no approver, one `--auto`
+  does not cover, and one a person refused each get their own `detail` and `next_step`
+  (`--auto` denials no longer read "denied by the operator").
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.
