@@ -765,16 +765,23 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        found, more = _iter_files(self.ctx.workspace.root, pattern, limit)
-        entries: list[str] = []
-        omitted = 0
         root = self.ctx.workspace.root
-        for candidate in found:
-            if not _readable_by_policy(self.ctx, root, candidate):
-                omitted += 1
-                continue
-            relative = candidate.relative_to(root.resolve()).as_posix()
-            entries.append(relative + ("/" if candidate.is_dir() else ""))
+
+        def enumerate_entries() -> tuple[list[str], int, bool]:
+            found, more = _iter_files(root, pattern, limit)
+            entries: list[str] = []
+            omitted = 0
+            for candidate in found:
+                if not _readable_by_policy(self.ctx, root, candidate):
+                    omitted += 1
+                    continue
+                relative = candidate.relative_to(root.resolve()).as_posix()
+                entries.append(relative + ("/" if candidate.is_dir() else ""))
+            return entries, omitted, more
+
+        # R2-216: walking a large tree and checking each path must not stall the
+        # event loop (the cockpit, other MCP clients).
+        entries, omitted, more = await asyncio.to_thread(enumerate_entries)
         return _ok(
             "list_files",
             {
@@ -805,24 +812,29 @@ class ToolRegistry:
         _, blocked = await _authorize(self.ctx, tool="grep", action="read", resource=".")
         if blocked:
             return blocked
-        omitted = 0
         root = self.ctx.workspace.root.resolve()
-        candidates: list[list[object]] = []
-        files, capped = _iter_files(
-            self.ctx.workspace.root, glob, GREP_FILE_CAP, files_only=True
-        )
-        too_large = 0
-        for candidate in files:
-            if candidate.stat().st_size > MAX_READ_BYTES:
-                too_large += 1
-                continue
-            if not _readable_by_policy(self.ctx, root, candidate):
-                omitted += 1
-                continue
-            info = os.lstat(candidate)
-            candidates.append(
-                [candidate.relative_to(root).as_posix(), info.st_dev, info.st_ino]
+
+        def select_files() -> tuple[list[list[object]], int, int, bool]:
+            selected: list[list[object]] = []
+            files, capped = _iter_files(
+                self.ctx.workspace.root, glob, GREP_FILE_CAP, files_only=True
             )
+            omitted = too_large = 0
+            for candidate in files:
+                if candidate.stat().st_size > MAX_READ_BYTES:
+                    too_large += 1
+                    continue
+                if not _readable_by_policy(self.ctx, root, candidate):
+                    omitted += 1
+                    continue
+                info = os.lstat(candidate)
+                selected.append(
+                    [candidate.relative_to(root).as_posix(), info.st_dev, info.st_ino]
+                )
+            return selected, omitted, too_large, capped
+
+        # R2-216: enumeration and per-file policy checks run off the event loop.
+        candidates, omitted, too_large, capped = await asyncio.to_thread(select_files)
         request = {
             "pattern": pattern,
             "flags": flags,

@@ -527,3 +527,24 @@ def test_deeply_nested_arguments_are_a_tool_error_not_a_crash(workspace) -> None
     assert result.status == "completed"
     tool_message = next(m for m in agent.messages if m.get("role") == "tool")
     assert "invalid JSON arguments" in tool_message["content"]
+
+
+# --------------------------------------------------------------------------- R2-216
+@pytest.mark.parametrize(("tool", "args"), [("list_files", {"pattern": "**/*"}),
+                                            ("grep", {"pattern": "x"})])
+def test_search_enumeration_runs_off_the_event_loop(workspace, monkeypatch, tool, args) -> None:
+    import threading
+
+    import panda_core.tools as tools
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+    original = tools._iter_files
+
+    def spy(*a, **k):
+        seen.append(threading.get_ident())
+        return original(*a, **k)
+
+    monkeypatch.setattr(tools, "_iter_files", spy)
+    _call(_registry(workspace), tool, args)
+    assert seen and all(ident != loop_thread for ident in seen)

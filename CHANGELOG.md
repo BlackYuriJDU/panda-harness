@@ -204,6 +204,8 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   `old_string`/`new_string` instead of writing mixed line endings, and tool arguments
   nested deeply enough to exhaust the JSON parser are an invalid-arguments tool result
   instead of an exception that ended the turn.
+- `grep` and `list_files` enumerate files and check the read policy per file in a worker
+  thread, so a large tree no longer blocks the event loop (cockpit, MCP clients) (R2-216).
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.
