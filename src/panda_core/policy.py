@@ -285,18 +285,10 @@ def default_policy() -> Policy:
         ),
         # Network access is an explicit decision, never implicit.
         _rule("network-default-ask", ["network", "webfetch", "websearch"], ["*"], "ask", "medium"),
-        _rule("git-default-ask", ["git"], ["*"], "ask", "medium"),
-        _rule("git-readonly", ["git"], ["status*", "diff*", "log*", "show*", "branch*"], "allow"),
-        _rule("git-push", ["git"], ["push*"], "ask", "high"),
-        _rule(
-            "git-force-push",
-            ["git"],
-            ["push*--force*", "push*-f*", "push*--mirror*"],
-            "hard_deny",
-            "critical",
-            "history rewrite",
-        ),
-        _rule("release-build", ["release"], ["build*"], "allow"),
+        # DEAD-001: the `git` and `spend` families and `release-build` were removed in
+        # 0.2.0a6: no tool consulted them, and git is decided on the shell command
+        # (`shell-git-push` etc.). `release-publish` stays as a planned hard deny: the
+        # CONTRACT lists release publishing among the hard denies.
         _rule(
             "release-publish",
             ["release"],
@@ -305,7 +297,6 @@ def default_policy() -> Policy:
             "critical",
             "v0.1 never publishes; use the release workflow with human approval",
         ),
-        _rule("spend-default-ask", ["spend"], ["*"], "ask", "critical"),
         # MCP tool calls. `validate` and `study_show` also pass through the registry
         # policy (validate / read); the other exposed tools only describe state.
         # FastMCP registers the plain names, so both spellings are listed.
@@ -338,18 +329,17 @@ def default_policy() -> Policy:
 
 
 # Actions a tool or the agent really consults, and actions the default policy declares but
-# nothing consults yet. A rule for a planned action protects nothing today (DEAD-001): a
+# nothing consults yet. `policy_check` reports which one an answer is about (R2-410).
+# A rule for a planned action protects nothing today (DEAD-001): the
 # `release-publish` hard deny, for instance, guards a tool that does not exist.
 ENFORCED_ACTIONS = frozenset({"read", "write", "edit", "shell", "validate"})
 PLANNED_ACTIONS = frozenset(
     {
         "delete",
-        "git",
         "network",
         "webfetch",
         "websearch",
         "release",
-        "spend",
         "tool",
         "question",
         "external_read",

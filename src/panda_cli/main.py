@@ -1062,7 +1062,10 @@ def _policy_engine(workspace: Workspace) -> tuple[PolicyEngine, str]:
 @handle
 def policy_check(
     action: str = typer.Argument(
-        ..., help="read, write, edit, delete, shell, git, release, spend, tool."
+        ...,
+        help="Enforced: read, write, edit, shell, validate. Planned (no tool applies "
+        "them yet): delete, network, webfetch, websearch, tool, question, external_read, "
+        "external_write.",
     ),
     resource: str = typer.Argument(..., help="Path, shell command, or tool name."),
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
@@ -1083,10 +1086,17 @@ def policy_check(
     payload["policy_source"] = source
     payload["workspace_policy_trusted"] = source == "file" and engine.baseline is None
     payload["approved"] = approve
+    from panda_core.policy import ENFORCED_ACTIONS
+
+    payload["enforced"] = action in ENFORCED_ACTIONS  # R2-410
     if json_output:
         render.print_json(payload)
     else:
         render.decision_panel(decision)
+        if not payload["enforced"]:
+            typer.echo(
+                f"note: no tool applies `{action}` yet; this rule describes a planned control"
+            )
         if decision.effect == "ask":
             typer.echo("hint: rerun with --approve to allow this action once")
         elif decision.effect in {"deny", "hard_deny"}:

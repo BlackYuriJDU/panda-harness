@@ -175,6 +175,12 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   lives (built-in or `.panda/policy.json`); an approval with no approver, one `--auto`
   does not cover, and one a person refused each get their own `detail` and `next_step`
   (`--auto` denials no longer read "denied by the operator").
+- Policy actions (R2-410, DEAD-001): the `policy_check` tool accepts only the enforced
+  actions (`read`, `write`, `edit`, `shell`, `validate`) and returns `enforced` and
+  `enforced_by`; `panda policy check` and the MCP `policy_check` return `enforced` and say
+  when a rule describes a planned control. The unused `git` and `spend` rule families and
+  `release-build` are gone from the built-in policy (their copies in old workspace files
+  are legacy and need no trust); `release-publish` stays as a planned hard deny.
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

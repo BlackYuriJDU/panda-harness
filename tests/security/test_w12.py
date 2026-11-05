@@ -257,3 +257,48 @@ def test_a_denied_approval_says_who_denied_it(workspace, auto, approver, detail,
         runtime.close()
     assert result.blocked and detail in result.data["detail"]
     assert hint in result.data["next_step"]
+
+
+# --------------------------------------------------------------------------- R2-410 / DEAD-001
+def test_policy_check_offers_only_enforced_actions(workspace) -> None:
+    from panda_core.policy import ENFORCED_ACTIONS
+
+    registry = _registry(workspace)
+    spec = next(s for s in registry.describe() if s["name"] == "policy_check")
+    assert set(spec["parameters"]["properties"]["action"]["enum"]) == set(ENFORCED_ACTIONS)
+    refused = _call(registry, "policy_check", {"action": "release", "resource": "build x"})
+    assert not refused.ok and "invalid arguments" in refused.content
+    checked = _call(registry, "policy_check", {"action": "validate", "resource": "."})
+    assert checked.ok and checked.data["enforced"] is True
+    assert checked.data["enforced_by"] == ["validate"]
+
+
+def test_service_policy_check_says_when_an_action_is_not_enforced(workspace) -> None:
+    from panda_core.service import PandaService
+
+    service = PandaService(workspace)
+    try:
+        assert service.policy_check("release", "publish x")["enforced"] is False
+        assert service.policy_check("read", "corpus/a.md")["enforced"] is True
+    finally:
+        close = getattr(service, "close", None)
+        if close:
+            close()
+
+
+def test_dead_rule_families_are_gone_and_old_files_need_no_trust(tmp_path) -> None:
+    from panda_core.policy import default_policy, load_policy
+    from panda_core.trust import loosening_rules
+
+    ids = {rule.id for rule in default_policy().rules}
+    assert not ids & {"git-default-ask", "git-readonly", "git-push", "git-force-push",
+                      "release-build", "spend-default-ask"}
+    assert "release-publish" in ids  # the CONTRACT's planned hard deny stays
+    legacy_file = tmp_path / "policy.json"
+    legacy_file.write_text(json.dumps({"schema_version": 1, "default": "ask", "rules": [
+        {"id": "git-readonly", "actions": ["git"],
+         "resources": ["status*", "diff*", "log*", "show*", "branch*"], "effect": "allow"},
+        {"id": "release-build", "actions": ["release"], "resources": ["build*"],
+         "effect": "allow"},
+    ]}), encoding="utf-8")
+    assert loosening_rules(load_policy(legacy_file)) == []

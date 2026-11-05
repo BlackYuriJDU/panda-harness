@@ -26,7 +26,7 @@ from typing import Any
 from panda_core import gitsafe
 from panda_core.atomic import atomic_write_bytes, atomic_write_text
 from panda_core.errors import ConfigError, PandaError
-from panda_core.policy import Decision, PolicyEngine
+from panda_core.policy import ENFORCED_ACTIONS, Decision, PolicyEngine
 from panda_core.process import run_command, scrubbed_env
 from panda_core.provider import status_snapshot
 from panda_core.redact import REDACTED, redact_text
@@ -274,6 +274,15 @@ def _denied_next_step(decision: Decision, source: str) -> str:
 
 
 # R2-412: a blocked approval tells the model what kind of stop it is.
+# Which tools apply each enforced action (R2-410).
+ENFORCING_TOOLS: dict[str, list[str]] = {
+    "read": ["read_file", "list_files", "grep", "study_*", "evidence_*", "claim_*", "number_*"],
+    "write": ["write_file"],
+    "edit": ["edit_file"],
+    "shell": ["run_shell"],
+    "validate": ["validate"],
+}
+
 _APPROVAL_NEXT_STEP = {
     "policy": (
         "approval is required and no interactive approver is available",
@@ -926,13 +935,16 @@ class ToolRegistry:
         action = _string_arg(args, "action")
         resource = _string_arg(args, "resource")
         normalized = resource
-        if action in {"read", "write", "edit", "delete"} and resource:
+        if action in {"read", "write", "edit"} and resource:
             try:
                 _, normalized = resolve_inside(self.ctx.workspace.root, resource)
             except ToolInputError:
                 normalized = resource
         decision = self.ctx.policy.decide(action, normalized)
-        return _ok("policy_check", decision.to_dict())
+        return _ok(
+            "policy_check",
+            {**decision.to_dict(), "enforced": True, "enforced_by": ENFORCING_TOOLS[action]},
+        )
 
     async def _session_note(self, args: dict[str, Any]) -> ToolResult:
         message = _string_arg(args, "message").strip()
@@ -1510,18 +1522,9 @@ class ToolRegistry:
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": [
-                                "read",
-                                "write",
-                                "edit",
-                                "delete",
-                                "shell",
-                                "network",
-                                "git",
-                                "release",
-                                "spend",
-                                "tool",
-                            ],
+                            # R2-410: only actions a tool enforces; an answer about
+                            # anything else would describe a control that does not exist.
+                            "enum": sorted(ENFORCED_ACTIONS),
                         },
                         "resource": {"type": "string"},
                     },

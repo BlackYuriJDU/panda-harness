@@ -497,10 +497,14 @@ is a floor `hard_deny`. Opening a workspace runs no git at all: branch and commi
 are read from `.git/HEAD`, and the worktree state is reported as unknown.
 
 **Enforced and planned actions.** Only `read`, `write`, `edit`, `shell` and `validate` are
-consulted by tools. The default policy still declares rules for `delete`, `git`, `network`,
-`webfetch`, `websearch`, `release`, `spend`, `tool`, `question`, `external_read` and
-`external_write`; they are **planned**: `panda policy check` answers them, but nothing
-enforces them yet, so for example the `release-publish` hard deny protects no tool today.
+consulted by tools. The default policy still declares rules for `delete`, `network`,
+`webfetch`, `websearch`, `release`, `tool`, `question`, `external_read` and
+`external_write`; they are **planned**: `panda policy check` answers them with
+`enforced: false`, but nothing enforces them yet, so for example the `release-publish` hard
+deny protects no tool today (publishing commands are decided as shell commands). The
+`policy_check` tool offers only the enforced actions and names the tools that apply each
+one. The `git` and `spend` families were removed in 0.2.0a6; their old allow rules in a
+workspace file are recognised as legacy and never ask for trust.
 The sets are `ENFORCED_ACTIONS` and `PLANNED_ACTIONS` in `panda_core.policy`, and a test
 fails if a declared action is in neither or if a planned action starts being consulted.
 

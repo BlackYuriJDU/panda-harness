@@ -92,6 +92,9 @@ _LEGACY_ALLOW = frozenset(
             "git status*", "git diff*", "git log*", "git show*", "git branch*",
             "panda validate*",
         )),
+        # DEAD-001: families removed from the built-in policy in 0.2.0a6.
+        ("git-readonly", ("git",), ("status*", "diff*", "log*", "show*", "branch*")),
+        ("release-build", ("release",), ("build*",)),
     }
 )
 

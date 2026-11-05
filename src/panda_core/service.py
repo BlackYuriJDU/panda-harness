@@ -16,7 +16,7 @@ from typing import Any
 
 from panda_core import errors
 from panda_core.errors import PandaError, PolicyDenied, SessionIntegrityError
-from panda_core.policy import engine_for, load_policy_or_default
+from panda_core.policy import ENFORCED_ACTIONS, engine_for, load_policy_or_default
 from panda_core.provider import status_snapshot
 from panda_core.session import SessionLog, list_sessions
 from panda_core.tools import ToolContext, ToolRegistry, ToolResult
@@ -206,6 +206,9 @@ class PandaService:
         # it used to turn an `ask` (even `git push`) into a logged allow (R2-406).
         payload = decision.to_dict()
         payload["policy_source"] = "file" if from_file else "built-in default"
+        # R2-410: say whether any tool applies this action; a planned action's rule
+        # describes a control that does not exist yet.
+        payload["enforced"] = action in ENFORCED_ACTIONS
         payload["approved"] = False
         if approved:
             payload["deprecated"] = "approved is ignored; approval needs a person"
