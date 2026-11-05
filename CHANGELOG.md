@@ -115,6 +115,13 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   checked; the cockpit crash log and lock files refuse links and other users' files;
   `corpus/studies/INDEX.md` is read through `safe_read` and `study_list` (tool and MCP)
   obeys the read policy.
+- User state and config boundary (R2-301, R2-309, R2-110, R2-304, R2-302): atomic writes
+  create the temporary file with its final mode (a key was briefly world-readable), a
+  world-readable credential store is refused, and the OpenCode export backup is counted
+  like `init`'s. A workspace file can no longer pick which stored key is sent
+  (`provider.name`) or raise budgets above 1 048 576 context tokens, 65 536 output tokens,
+  3 retries and 600 s. Evidence and number registries above 16 MB and claim cards above
+  1 MB are refused instead of read whole.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.

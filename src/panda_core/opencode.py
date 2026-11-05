@@ -9,7 +9,6 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -240,13 +239,11 @@ def resolve_config_target(workspace: Workspace) -> Path:
 
 
 def _backup(path: Path, backups_dir: Path) -> Path | None:
-    if not path.is_file():
-        return None
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    destination = backups_dir / stamp / path.name
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(path, destination)
-    return destination
+    """The same counted backup as `panda init` (R2-309: two runs in a second collided)."""
+
+    from panda_core.init import _backup as counted_backup
+
+    return counted_backup(path, backups_dir)
 
 
 def _unique_rules(rules: list[dict[str, str]]) -> list[dict[str, str]]:

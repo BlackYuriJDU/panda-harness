@@ -269,6 +269,30 @@ def _enforce_provider_boundary(settings: ProviderSettings, path: Path) -> None:
             f"got {settings.api_key_env}",
             hint=f"a workspace file cannot choose the key variable; use {DEFAULT_API_KEY_ENV}",
         )
+    if settings.name != DEFAULT_PROVIDER:
+        # R2-110: the provider name picks which key of the user's store is sent.
+        raise ConfigError(
+            f"provider.name in {path} must be {DEFAULT_PROVIDER}, got {settings.name}",
+            hint="a workspace file cannot choose which stored key is used",
+        )
+    for field, ceiling in _WORKSPACE_CEILINGS.items():
+        value = getattr(settings, field)
+        if value > ceiling:
+            # R2-304: a corpus could set context_window=10M (no trim ever), 1M output
+            # tokens or an hour of timeout; a workspace may only lower the budgets.
+            raise ConfigError(
+                f"provider.{field} in {path} is {value}; a workspace file may set at most "
+                f"{ceiling}",
+                hint=f"lower provider.{field} or remove it to use the default",
+            )
+
+
+_WORKSPACE_CEILINGS: dict[str, float] = {
+    "context_window": 1_048_576,
+    "max_output_tokens": 65_536,
+    "max_retries": 3,
+    "timeout_seconds": 600.0,
+}
 
 
 def load_config(path: Path) -> PandaConfig:

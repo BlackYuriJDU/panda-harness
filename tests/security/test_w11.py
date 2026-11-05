@@ -330,3 +330,92 @@ def test_study_list_obeys_a_read_deny_on_the_registry(workspace) -> None:
     finally:
         runtime.close()
     assert not result.ok and "gse160208" not in result.content
+
+
+# --------------------------------------------------------------------------- user state
+@POSIX
+def test_credential_store_temp_file_is_never_world_readable(tmp_path: Path, monkeypatch) -> None:
+    import stat as stat_module
+
+    from panda_core import atomic
+
+    seen: list[int] = []
+    real_fdopen = os.fdopen
+
+    def spy(fd, *args, **kwargs):
+        seen.append(stat_module.S_IMODE(os.fstat(fd).st_mode))
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(atomic.os, "fdopen", spy)
+    monkeypatch.setattr(os, "umask", os.umask)  # keep the process umask
+    old = os.umask(0o022)
+    try:
+        atomic.atomic_write_json(tmp_path / "credentials.json", {"keys": {}})
+    finally:
+        os.umask(old)
+    assert seen and all(mode & 0o077 == 0 for mode in seen)
+
+
+@POSIX
+def test_a_world_readable_credential_store_is_refused(isolated_credentials: Path) -> None:
+    from panda_core.credentials import get_api_key
+    from panda_core.errors import ConfigError
+
+    isolated_credentials.write_text(json.dumps({"version": 1, "keys": {"x": "y" * 20}}),
+                                    encoding="utf-8")
+    isolated_credentials.chmod(0o644)
+    with pytest.raises(ConfigError):
+        get_api_key("opencode-go")
+
+
+def test_backup_does_not_overwrite_same_second(tmp_path: Path) -> None:
+    from panda_core.opencode import _backup
+
+    source = tmp_path / "opencode.json"
+    backups = tmp_path / "backups"
+    source.write_text("first", encoding="utf-8")
+    one = _backup(source, backups)
+    source.write_text("second", encoding="utf-8")
+    two = _backup(source, backups)
+    assert one != two
+    assert one.read_text(encoding="utf-8") == "first"
+
+
+# --------------------------------------------------------------------------- config boundary
+def _with_provider(workspace, **fields):
+    from panda_core.workspace import Workspace
+
+    path = workspace.root / ".panda" / "config.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw.setdefault("provider", {}).update(fields)
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    return lambda: Workspace.from_root(workspace.root)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"name": "other-vault"}, {"context_window": 10_000_000}, {"max_output_tokens": 1_000_000},
+     {"max_retries": 5}, {"timeout_seconds": 3600}],
+)
+def test_workspace_config_cannot_raise_budgets_or_pick_the_vault_key(workspace, fields) -> None:
+    from panda_core.errors import ConfigError
+
+    load = _with_provider(workspace, **fields)
+    with pytest.raises(ConfigError):
+        load()
+
+
+def test_neg_workspace_config_may_lower_budgets(workspace) -> None:
+    load = _with_provider(workspace, context_window=32_768, max_retries=1)
+    assert load().config.provider.context_window == 32_768
+
+
+def test_evidence_readers_are_bounded(workspace, monkeypatch) -> None:
+    from panda_core import tools
+    from panda_core.tools import ToolInputError, _read_jsonl
+
+    big = workspace.root / "corpus" / "big.jsonl"
+    big.write_text('{"id": "e1"}\n' * 100, encoding="utf-8")
+    monkeypatch.setattr(tools, "MAX_DATA_BYTES", 64)
+    with pytest.raises(ToolInputError):
+        _read_jsonl(big)

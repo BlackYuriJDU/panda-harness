@@ -85,13 +85,31 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
         handle.close()
 
 
+def _create_private(tmp: Path, mode: int) -> int:
+    """Create the temporary file with its final mode from the start (R2-301).
+
+    `open()` created it with the umask (0644) and chmod came after the content was
+    written, so a credential was briefly world-readable. O_EXCL and O_NOFOLLOW also
+    refuse a file or link planted under the temporary name.
+    """
+
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    return os.open(tmp, flags, mode)
+
+
 def atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
     """Write text atomically, never leaving a partially written destination."""
 
     ensure_dir(path.parent)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(_create_private(tmp, mode), "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -109,7 +127,7 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     ensure_dir(path.parent)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
-        with open(tmp, "wb") as handle:
+        with os.fdopen(_create_private(tmp, mode), "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())

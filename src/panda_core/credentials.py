@@ -67,6 +67,17 @@ def _validate_key(key: str) -> str:
 
 
 def _read_keys(path: Path) -> dict[str, str]:
+    if os.name != "nt":
+        try:
+            loose = path.stat().st_mode & 0o077
+        except FileNotFoundError:
+            loose = 0
+        if loose:
+            # R2-301: a store others can read is not accepted silently.
+            raise ConfigError(
+                f"the credential store is readable by other users: {path}",
+                hint=f"run `chmod 600 {path}` and rotate the key if the machine is shared",
+            )
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -120,6 +131,7 @@ def set_api_key(provider: str, key: str) -> Path:
     name = _validate_provider(provider)
     value = _validate_key(key)
     path = credentials_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with file_lock(path.with_name(f"{path.name}.lock")):
         keys = _read_keys(path)
         keys[name] = value

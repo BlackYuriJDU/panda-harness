@@ -372,11 +372,27 @@ def _id_list(value: Any) -> list[str]:
     return []
 
 
+# Data registries (evidence, numbers) may be larger than an ordinary file, never unbounded.
+MAX_DATA_BYTES = 16_000_000
+
+
+def _bounded_text(path: Path, limit: int | None = None) -> str:
+    """Read a corpus file only if it is no larger than `limit` (R2-302)."""
+
+    limit = MAX_DATA_BYTES if limit is None else limit
+    size = path.stat().st_size
+    if size > limit:
+        raise ToolInputError(
+            f"{path.name} is {size} bytes, more than {limit}; split it or use grep"
+        )
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise ToolInputError(f"file not found: {path.name}")
     records: list[dict[str, Any]] = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for number, line in enumerate(_bounded_text(path).splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -392,7 +408,7 @@ def _numbers_records(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise ToolInputError(f"file not found: {path.name}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_bounded_text(path))
     except json.JSONDecodeError as exc:
         raise ToolInputError(f"invalid JSON in {path.name}: {exc.msg}") from exc
     if isinstance(payload, list):
@@ -1081,6 +1097,8 @@ class ToolRegistry:
                 continue  # a link (SEC-011)
             if not _readable_by_policy(self.ctx, root, path):
                 continue
+            if path.stat().st_size > MAX_READ_BYTES:
+                continue  # a claim card larger than any readable file (R2-302)
             text = path.read_text(encoding="utf-8", errors="replace")
             try:
                 frontmatter, body = parse_frontmatter(text)
