@@ -109,9 +109,12 @@ class ApprovalRequest:
     reason: str
     preview: str = ""
     preview_kind: str = "none"
+    # From the resolved decision, never from a rule id (R2-500): what --auto reads.
+    effect_class: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "effect_class": self.effect_class or self.action,
             "tool": self.tool,
             "action": self.action,
             "resource": self.resource,
@@ -265,6 +268,7 @@ async def _ask(
         reason=decision.reason,
         preview=preview,
         preview_kind=preview_kind,
+        effect_class=decision.effect_class or action,
     )
     try:
         approved = bool(await ctx.approve(request))
@@ -882,6 +886,7 @@ class ToolRegistry:
                     risk="high",
                     rule_id="shell-git-hazard",
                     reason=f"git cannot be isolated here: {hardened.hazard}",
+                    effect_class="exec_unknown",
                 )
                 blocked = await _ask(
                     self.ctx,

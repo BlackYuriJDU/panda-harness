@@ -116,3 +116,101 @@ def test_no_notice_for_the_default_policy(workspace) -> None:
         assert policy_notice(runtime.policy_state) is None
     finally:
         runtime.close()
+
+
+# --------------------------------------------------------------------------- W8 provenance
+def _decisions(runtime):
+    return [e.data for e in runtime.session.events() if e.type == "approval.decision"]
+
+
+def test_the_ledger_says_who_approved(workspace) -> None:
+    import asyncio
+
+    from panda_cli.runtime import ChatRuntime
+
+    async def person(request) -> bool:
+        return True
+
+    for kwargs, expected in (({"auto": True}, "auto"), ({"approver": person}, "human"),
+                             ({}, "policy")):
+        runtime = ChatRuntime(workspace, label="w8", **kwargs)
+        try:
+            asyncio.run(runtime.tools.call("run_shell", {"argv": ["pytest", "--version"]}))
+            decision = _decisions(runtime)[-1]
+            assert decision["decided_by"] == expected
+            assert decision["effect_class"] == "exec_local"
+            start = next(e for e in runtime.session.events() if e.type == "session.start")
+            assert start.data["metadata"]["approval_mode"] in {"auto", "human", "none"}
+        finally:
+            runtime.close()
+
+
+def test_the_operator_shell_route_is_recorded_in_the_ledger(workspace) -> None:
+    import asyncio
+
+    from panda_cli.runtime import ChatRuntime
+
+    runtime = ChatRuntime(workspace, label="w8")
+    try:
+        asyncio.run(runtime.agent.operator_tool("run_shell", {"argv": ["git", "status"]}))
+        events = [e for e in runtime.session.events() if e.type in {"tool.call", "tool.result"}]
+        assert [e.type for e in events] == ["tool.call", "tool.result"]
+        assert all(e.data["origin"] == "operator" for e in events)
+    finally:
+        runtime.close()
+
+
+def test_the_operator_shell_route_stops_when_the_ledger_cannot_record(
+    workspace, monkeypatch
+) -> None:
+    import asyncio
+
+    import pytest
+
+    from panda_cli.runtime import ChatRuntime
+    from panda_core.errors import SessionIntegrityError
+
+    runtime = ChatRuntime(workspace, label="w8")
+    ran: list[object] = []
+    monkeypatch.setattr(runtime.tools, "call", lambda *a, **k: ran.append(a))
+
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runtime.session, "append", broken)
+    with pytest.raises(SessionIntegrityError):
+        asyncio.run(runtime.agent.operator_tool("run_shell", {"argv": ["git", "status"]}))
+    assert ran == []
+
+
+def test_session_end_records_a_cancelled_last_turn(workspace, monkeypatch) -> None:
+    import asyncio
+
+    import pytest
+
+    from panda_cli.runtime import ChatRuntime
+
+    runtime = ChatRuntime(workspace, label="w8")
+
+    async def cancelled(message):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(runtime.agent, "run_turn", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runtime.ask("x"))
+    runtime.close()
+    end = [e for e in runtime.session.events() if e.type == "session.end"][-1]
+    assert end.data["status"] == "cancelled"
+
+
+def test_a_failed_session_end_is_reported_not_swallowed(workspace, monkeypatch) -> None:
+    from panda_cli.runtime import ChatRuntime
+
+    runtime = ChatRuntime(workspace, label="w8")
+
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(runtime.session, "close", broken)
+    runtime.close()
+    assert runtime.close_error and "disk full" in runtime.close_error

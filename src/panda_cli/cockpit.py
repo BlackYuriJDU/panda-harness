@@ -1172,7 +1172,7 @@ class PandaCockpit(App[None]):
         await transcript.mount(card)
         transcript.scroll_end(animate=False)
         self._set_state("working")
-        result = await self.runtime.tools.call("run_shell", {"argv": argv})
+        result = await self.runtime.agent.operator_tool("run_shell", {"argv": argv})
         card.finish(
             ok=result.ok,
             blocked=result.blocked,
@@ -1207,14 +1207,23 @@ class PandaCockpit(App[None]):
         await self._welcome()
 
     def action_quit_app(self) -> None:
-        if self.runtime is not None:
-            self.runtime.close("completed")
+        self._close_runtime()
         self.exit()
+
+    def _close_runtime(self) -> None:
+        """End the session with the last turn's status; never hide a failed end."""
+
+        if self.runtime is None:
+            return
+        self.runtime.close()
+        if self.runtime.close_error:
+            with contextlib.suppress(Exception):
+                self._write_crash_log(RuntimeError(self.runtime.close_error), "session.end")
 
     def on_unmount(self) -> None:
         if self.runtime is not None:
             with contextlib.suppress(Exception):
-                self.runtime.close("completed")
+                self._close_runtime()
         # Safety net: a crash can skip the driver's own restore, leaving the
         # terminal in the alt screen with mouse tracking enabled.
         driver = getattr(self, "_driver", None)

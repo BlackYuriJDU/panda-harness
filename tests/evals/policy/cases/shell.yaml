@@ -81,3 +81,24 @@ cases:
      args: {argv: ["pytest", "-q"]}, expected: {executed: true}}
   - {id: benign-headless-asks-are-blocked, refs: [benign], route: run_shell, approver: none,
      args: {argv: ["pytest", "-q"]}, expected: {executed: false}}
+  # ---- W8: --auto is an allowlist of effect classes
+  - {id: auto-runs-a-local-check, refs: [R2-500, benign], route: run_shell, approver: auto,
+     args: {argv: ["pytest", "-q"]}, expected: {executed: true}}
+  - {id: auto-runs-python-m-pytest, refs: [benign], route: run_shell, approver: auto,
+     args: {argv: ["python3", "-m", "pytest", "-q"]}, expected: {executed: true}}
+  - {id: auto-refuses-an-unknown-program, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["make", "all"]}, expected: {executed: false}}
+  - {id: auto-refuses-python-c, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["python3", "-c", "print(1)"]}, expected: {executed: false}}
+  - {id: auto-refuses-network, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["curl", "https://example.invalid"]}, expected: {executed: false}}
+  - {id: auto-refuses-gh-pr-merge, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["gh", "pr", "merge", "--admin"]}, expected: {executed: false}}
+  - {id: auto-refuses-docker-push, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["docker", "push", "x/y"]}, expected: {executed: false}}
+  - {id: auto-refuses-remote-set-url-push, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["git", "remote", "set-url", "--push", "origin", "x"]}, expected: {executed: false}}
+  - {id: auto-refuses-pytest-wrapped-in-env, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["env", "FOO=1", "twine", "upload", "x"]}, expected: {executed: false}}
+  - {id: auto-refuses-sh-c-local-then-push, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["sh", "-c", "pytest -q && git push origin main"]}, expected: {executed: false}}

@@ -102,7 +102,7 @@ async def _run_shell_line(runtime: ChatRuntime, text: str) -> None:
     if not argv:
         _say("empty command", style="yellow")
         return
-    result = await runtime.tools.call("run_shell", {"argv": argv})
+    result = await runtime.agent.operator_tool("run_shell", {"argv": argv})
     _say(result.content)
 
 
@@ -242,7 +242,9 @@ def run_plain_chat(
                     render.print_error(exc)
         finally:
             await runtime.provider.aclose()
-            runtime.close("interrupted" if interrupted else "completed")
+            runtime.close("interrupted" if interrupted else None)
+            if runtime.close_error:
+                _say(runtime.close_error, style="yellow")
 
     try:
         asyncio.run(_loop())

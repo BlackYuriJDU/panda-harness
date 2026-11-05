@@ -203,6 +203,7 @@ class Agent:
         on_event: Callable[[AgentEvent], None] | None = None,
         private: bool = False,
         context_window: int | None = None,
+        decided_by: Callable[[], str] | None = None,
     ) -> None:
         self.workspace = workspace
         self.provider = provider
@@ -213,6 +214,8 @@ class Agent:
         self.active_study = active_study
         self.private = private
         self._approver = approver
+        self._decided_by = decided_by
+        self._operator_calls = 0
         self._on_event = on_event
         self.context_window = context_window or workspace.config.provider.context_window
         self.messages: list[dict[str, Any]] = [
@@ -287,6 +290,34 @@ class Agent:
                 hint="free disk space or run `panda session verify`; no action was taken",
             ) from exc
 
+    async def operator_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """Run a tool the operator typed (`!cmd`), recorded like the model's calls.
+
+        R2-111: the operator route ran run_shell with no ledger entry, even with a
+        broken ledger. It now writes tool.call before and tool.result after, through
+        the same fail-closed `_log`.
+        """
+
+        self._operator_calls += 1
+        call_id = f"operator-{self._operator_calls}"
+        self._log(
+            "tool.call",
+            {"id": call_id, "name": name, "arguments": arguments, "origin": "operator"},
+        )
+        result = await self.tools.call(name, arguments)
+        self._log(
+            "tool.result",
+            {
+                "id": call_id,
+                "name": name,
+                "ok": result.ok,
+                "blocked": getattr(result, "blocked", False),
+                "content": result.content,
+                "origin": "operator",
+            },
+        )
+        return result
+
     async def _approve(self, request: ApprovalRequest) -> bool:
         self._log("approval.request", request.to_dict())
         self._emit("approval_request", **request.to_dict())
@@ -296,9 +327,22 @@ class Agent:
                 approved = bool(await self._approver(request))
             except Exception:  # noqa: BLE001
                 approved = False
+        if self._approver is None:
+            who = "policy"
+        elif self._decided_by is not None:
+            who = self._decided_by()
+        else:
+            who = "human"
+        # Who consented is provenance: --auto and a person must not look the same (R2-405).
         self._log(
             "approval.decision",
-            {"tool": request.tool, "action": request.action, "approved": approved},
+            {
+                "tool": request.tool,
+                "action": request.action,
+                "approved": approved,
+                "decided_by": who,
+                "effect_class": request.effect_class or request.action,
+            },
         )
         self._emit(
             "approval_decision",

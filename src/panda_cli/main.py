@@ -174,7 +174,12 @@ def _main(
     model: str | None = typer.Option(
         None, "--model", help="Model id for the cockpit (opencode-go/<model>)."
     ),
-    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    auto: bool = typer.Option(
+        False,
+        "--auto",
+        help="Approve edits inside the write rules and local checks (pytest, ruff, mypy)."
+        " Never pushes, publishes, deletes, uses the network or runs unknown programs.",
+    ),
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps per turn."
     ),
@@ -445,7 +450,12 @@ def run_command(
     task: list[str] | None = typer.Argument(None, help="Task for the autonomous Panda agent."),
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
     model: str | None = typer.Option(None, "--model", help="Model id (opencode-go/<model>)."),
-    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    auto: bool = typer.Option(
+        False,
+        "--auto",
+        help="Approve edits inside the write rules and local checks (pytest, ruff, mypy)."
+        " Never pushes, publishes, deletes, uses the network or runs unknown programs.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit a JSON result."),
     session: str | None = typer.Option(None, "--session", help="Continue an existing session."),
     private: bool = typer.Option(
@@ -477,6 +487,7 @@ def run_command(
         "task_sha256": hashlib.sha256(task_text.encode("utf-8")).hexdigest(),
         "task_chars": len(task_text),
         "private": private,
+        "approval_mode": "auto" if auto else "none",
         "model": selected_model,
         "provider": workspace.config.provider.name,
         "max_steps": max_steps,
@@ -630,7 +641,12 @@ def chat_command(
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
     plain: bool = typer.Option(False, "--plain", help="Line REPL instead of the cockpit."),
     model: str | None = typer.Option(None, "--model", help="Model id (opencode-go/<model>)."),
-    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    auto: bool = typer.Option(
+        False,
+        "--auto",
+        help="Approve edits inside the write rules and local checks (pytest, ruff, mypy)."
+        " Never pushes, publishes, deletes, uses the network or runs unknown programs.",
+    ),
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps."
     ),

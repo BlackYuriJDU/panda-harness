@@ -7,6 +7,7 @@ renders events, and answers approvals; enforcement stays below it.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -43,7 +44,16 @@ def _env_names() -> list[str]:
 
 # Rules whose `ask` a person must answer: `--auto` does not approve them, so the
 # rule "never push" in the agent's instructions holds even without a human.
-NEVER_AUTO_RULES = frozenset({"shell-push", "shell-git-push", "git-push"})
+AUTO_SHELL_CLASSES = frozenset({"exec_local"})
+AUTO_ACTIONS = frozenset({"write", "edit", "validate"})
+
+
+def auto_eligible(request: ApprovalRequest) -> bool:
+    """What `--auto` may approve without a person."""
+
+    if request.action == "shell":
+        return request.effect_class in AUTO_SHELL_CLASSES
+    return request.action in AUTO_ACTIONS
 
 
 class ChatRuntime:
@@ -65,6 +75,9 @@ class ChatRuntime:
         self.private = private
         self.auto = auto
         self._approver = approver
+        self.last_decided_by = "policy"
+        self.last_turn_status: str | None = None
+        self.close_error: str | None = None
         self._on_event = on_event
         self._model_source = "config"
         policy, from_file = load_policy_or_default(workspace.policy_path)
@@ -84,6 +97,7 @@ class ChatRuntime:
                     "env_names": _env_names(),
                     "transport": "cockpit",
                     "workspace_policy": self.policy_state,
+                    "approval_mode": "auto" if auto else ("human" if approver else "none"),
                 },
                 private=private,
                 redact_enabled=workspace.config.logging.redact,
@@ -109,6 +123,7 @@ class ChatRuntime:
             max_steps=max_steps,
             active_study=active_study,
             approver=self._approve,
+            decided_by=lambda: self.last_decided_by,
             on_event=on_event,
             private=private,
         )
@@ -120,20 +135,30 @@ class ChatRuntime:
     # ---- approvals ----
     async def _approve(self, request: ApprovalRequest) -> bool:
         if self.auto:
-            # `--auto` approves ordinary asks, never publishing ones (APR-004), and
-            # never a shell command: a rule id cannot tell `env git push` from
-            # `git status` (R2-500). Commands go to a person until shell
-            # effects are classified (wave 8).
-            if request.action == "shell":
-                return False
-            return request.rule_id not in NEVER_AUTO_RULES
+            # `--auto` is an allowlist of effects, read from the resolved decision and
+            # never from a rule id (R2-500, R2-204): edits inside the write rules and
+            # local checks. Pushes, publishing, network, deletion and programs Panda
+            # does not classify always go to a person.
+            self.last_decided_by = "auto"
+            return auto_eligible(request)
         if self._approver is not None:
+            self.last_decided_by = "human"
             return bool(await self._approver(request))
+        self.last_decided_by = "policy"
         return False
 
     # ---- conversation ----
     async def ask(self, message: str) -> TurnResult:
-        return await self.agent.run_turn(message)
+        try:
+            result = await self.agent.run_turn(message)
+        except asyncio.CancelledError:
+            self.last_turn_status = "cancelled"
+            raise
+        except Exception:
+            self.last_turn_status = "error"
+            raise
+        self.last_turn_status = result.status
+        return result
 
     async def validate(self, *, release: bool = False) -> ToolResult:
         result = await self.tools.call("validate", {"release": release})
@@ -257,13 +282,20 @@ class ChatRuntime:
             for event in self.session.events()
         ]
 
-    def close(self, status: str = "completed") -> None:
-        import contextlib
+    def close(self, status: str | None = None) -> None:
+        """End the session; by default with the last turn's real status (R2-312).
+
+        A failure to write `session.end` is not swallowed silently any more: it is
+        returned to the caller through `close_error` so the UI can report it.
+        """
 
         if self.session.is_closed():
             return
-        with contextlib.suppress(Exception):
-            self.session.close(status, {"model": self.model, "turns": self.agent.turn_index})
+        final = status or _END_STATUS.get(self.last_turn_status or "", "completed")
+        try:
+            self.session.close(final, {"model": self.model, "turns": self.agent.turn_index})
+        except Exception as exc:  # noqa: BLE001 - reported, not raised, at shutdown
+            self.close_error = f"session.end was not recorded: {type(exc).__name__}: {exc}"
 
     async def aclose(self) -> None:
         await self.provider.aclose()
@@ -271,6 +303,9 @@ class ChatRuntime:
 
 
 __all__ = ["ApprovalCallback", "ChatRuntime", "EventCallback"]
+
+# A cancelled or failed last turn must not be recorded as a completed session.
+_END_STATUS = {"cancelled": "cancelled", "error": "error", "incomplete": "incomplete"}
 
 
 def _policy_state(policy: Any, from_file: bool, engine: Any) -> dict[str, Any]:

@@ -94,7 +94,7 @@ def create_server(
         Args:
             action: read, write, edit, delete, shell, network, git, release, spend, or tool.
             resource: A workspace-relative path, shell command, or tool name.
-            approved: Treat an `ask` decision as approved for this evaluation only.
+            approved: Deprecated and ignored. An MCP client cannot approve an action.
         """
 
         return service.policy_check(action, resource, approved=approved)

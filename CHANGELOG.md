@@ -48,6 +48,18 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   and `env -S` strings, and escalates an unknown wrapper around git/rm/find. The
   decision keeps the classifier's rule and risk on a tie, which is the root cause of
   the `env git push` auto-approval (R2-500).
+- `--auto` by effect class (R2-500, R2-204, R2-501, DRIFT-501): the never-auto list matched
+  rule ids, so any push not spelled `git push ...` and every other publishing command were
+  approved. The argv classifier now gives each command an effect class carried through the
+  decision and the approval request; `--auto` approves only edits, `validate` and
+  `exec_local` checks. `NEVER_AUTO_RULES` is gone and the `--auto` help says what it approves.
+- Approval provenance (R2-405, R2-406): `approval.decision` records `decided_by` and
+  `effect_class`; `approval_mode` is recorded at session and run start. MCP
+  `policy_check(approved=True)` no longer turns an `ask` into a logged allow.
+- Operator commands (R2-111): `!cmd` in the REPL and cockpit is recorded in the ledger like
+  the model's tool calls and stops when the ledger cannot record it.
+- Session end (R2-312): a cancelled or failed last turn is no longer recorded as
+  `completed`, and a failure to write `session.end` is reported.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.

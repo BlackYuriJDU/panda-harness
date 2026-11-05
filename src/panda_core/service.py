@@ -203,11 +203,13 @@ class PandaService:
         if action in {"read", "write", "edit", "delete"} and resource:
             normalized = self.workspace.relative_resource(resource)
         decision = engine.decide(action, normalized)
-        if approved and decision.effect == "ask":
-            decision = engine.authorize(action, normalized, approved=True)
+        # `approved` is deprecated and ignored: an MCP client is not an approver, and
+        # it used to turn an `ask` (even `git push`) into a logged allow (R2-406).
         payload = decision.to_dict()
         payload["policy_source"] = "file" if from_file else "built-in default"
-        payload["approved"] = approved
+        payload["approved"] = False
+        if approved:
+            payload["deprecated"] = "approved is ignored; approval needs a person"
         self._record(
             "policy.decision",
             {
@@ -216,7 +218,8 @@ class PandaService:
                 "effect": decision.effect,
                 "rule_id": decision.rule_id,
                 "risk": decision.risk,
-                "approved": approved,
+                "approved": False,
+                "approved_requested": approved,
             },
         )
         return payload

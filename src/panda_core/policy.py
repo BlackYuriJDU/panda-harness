@@ -12,7 +12,7 @@ import fnmatch
 import json
 import shlex
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -107,6 +107,8 @@ class Decision:
     rule_id: str | None
     reason: str
     matched_rules: tuple[str, ...] = field(default_factory=tuple)
+    # For shell, the classifier's effect class; for other actions, the action.
+    effect_class: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -125,6 +127,7 @@ class Decision:
             "rule_id": self.rule_id,
             "reason": self.reason,
             "matched_rules": list(self.matched_rules),
+            "effect_class": self.effect_class or self.action,
             "allowed": self.allowed,
             "requires_approval": self.requires_approval,
         }
@@ -550,7 +553,7 @@ class PolicyEngine:
         )
         verdict = classify_shell(argv)
         if verdict is None:
-            return base
+            return replace(base, effect_class="exec_unknown")
         worst = verdict
         for path in verdict.read_paths:
             read = self._decide_rules("read", path)
@@ -582,9 +585,10 @@ class PolicyEngine:
                 rule_id=worst.rule_id,
                 reason=worst.reason,
                 matched_rules=base.matched_rules,
+                effect_class=verdict.effect_class,
             )
         if SEVERITY[worst.effect] < SEVERITY[base.effect]:
-            return base
+            return replace(base, effect_class=verdict.effect_class)
         return Decision(
             action="shell",
             resource=base.resource,
@@ -593,6 +597,7 @@ class PolicyEngine:
             rule_id=worst.rule_id,
             reason=worst.reason,
             matched_rules=base.matched_rules,
+            effect_class=_class_of(verdict, worst),
         )
 
     def denied_read_patterns(self) -> tuple[str, ...]:
@@ -735,3 +740,12 @@ def engine_for(workspace: Any, policy: Policy, *, from_file: bool) -> PolicyEngi
     except (AttributeError, TypeError, ValueError):
         pass
     return PolicyEngine(policy, root=workspace.root, baseline=baseline, protected=protected)
+
+
+def _class_of(verdict: ShellVerdict, worst: ShellVerdict) -> str:
+    """A command that reads a denied path is still the command it is, unless denied."""
+
+    return worst.effect_class if SEVERITY[worst.effect] > SEVERITY[verdict.effect] else (
+        verdict.effect_class
+    )
+

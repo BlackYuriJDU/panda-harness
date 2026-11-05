@@ -76,9 +76,11 @@ def test_policy_check_matches_cli_semantics(service: PandaService) -> None:
     traversal = service.policy_check("write", "corpus/../README.md")
     assert traversal["effect"] == "deny"
 
+    # Owner-approved change (R2-406): `approved` is deprecated and ignored.
     approved = service.policy_check("shell", "cargo install x", approved=True)
-    assert approved["effect"] == "allow"
-    assert approved["approved"] is True
+    assert approved["effect"] == "ask"
+    assert approved["approved"] is False
+    assert approved["deprecated"]
 
 
 def test_study_tools(service: PandaService) -> None:

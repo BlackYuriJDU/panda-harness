@@ -31,6 +31,54 @@ class ShellVerdict:
     # Positional tokens of a read-only git command; the policy engine checks each
     # one against the `read` rules (so `git diff -- .env` is refused).
     read_paths: tuple[str, ...] = ()
+    # What the command does, decided from its argv here and nowhere else (R2-500):
+    # read, exec_local, publish, network, destructive or exec_unknown. `--auto`
+    # reads this, never a rule id.
+    effect_class: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.effect_class:
+            derived = _CLASS_BY_RULE.get(self.rule_id, "exec_unknown")
+            object.__setattr__(self, "effect_class", derived)
+
+
+_CLASS_BY_RULE = {
+    "shell-git-readonly": "read",
+    "shell-git-branch-list": "read",
+    "shell-git-push": "publish",
+    "shell-publish": "publish",
+    "shell-network": "network",
+    "shell-local": "exec_local",
+    "shell-git-push-force": "destructive",
+    "shell-git-reset-hard": "destructive",
+    "shell-git-clean": "destructive",
+    "shell-git-branch-delete": "destructive",
+    "shell-rm-recursive": "destructive",
+    "shell-find-delete": "destructive",
+}
+EFFECT_CLASSES = frozenset({*_CLASS_BY_RULE.values(), "exec_unknown"})
+
+# Programs that publish or send something outside the machine. Never `--auto` (R2-204).
+_PUBLISH_SUBCOMMANDS = {
+    "twine": {"upload", "register"},
+    "npm": {"publish", "unpublish", "deprecate", "dist-tag", "owner", "login", "adduser"},
+    "pnpm": {"publish"},
+    "yarn": {"publish", "npm"},
+    "cargo": {"publish", "yank", "owner", "login"},
+    "uv": {"publish"},
+    "poetry": {"publish"},
+    "flit": {"publish"},
+    "hatch": {"publish"},
+    "gem": {"push", "yank", "owner"},
+    "docker": {"push", "login"},
+    "podman": {"push", "login"},
+}
+_GH_READ_ONLY = {"view", "list", "status", "diff", "checks"}
+_NETWORK = frozenset({"curl", "wget", "scp", "sftp", "ssh", "rsync", "nc", "ncat", "netcat",
+                      "ftp", "telnet", "socat"})
+# Local checks whose only effect is to run the workspace's own code and report.
+_LOCAL_TOOLS = frozenset({"pytest", "py.test", "ruff", "mypy"})
+_LOCAL_MODULES = frozenset({"pytest", "ruff", "mypy", "compileall", "unittest"})
 
 
 # Wrappers that run the rest of argv as a command, with the options that take a
@@ -193,6 +241,8 @@ def _git_subcommand(
         return ShellVerdict("hard_deny", "critical", "discards local work", "shell-git-reset-hard")
     if sub == "clean" and _force(rest):
         return ShellVerdict("hard_deny", "critical", "deletes untracked files", "shell-git-clean")
+    if sub == "send-email" or (sub == "remote" and "set-url" in rest and "--push" in rest):
+        return ShellVerdict("ask", "high", "sends commits or redirects pushes", "shell-git-push")
     if sub == "branch":
         return _branch(rest, positional)
     if sub in _READ_ONLY:
@@ -354,6 +404,22 @@ def classify_shell(argv: Sequence[str], _depth: int = 0) -> ShellVerdict | None:
 
 
 def _classify_program(program: str, args: list[str]) -> ShellVerdict | None:
+    first = next((a for a in args if not a.startswith("-")), "")
+    if program in _PUBLISH_SUBCOMMANDS and first in _PUBLISH_SUBCOMMANDS[program]:
+        return ShellVerdict("ask", "high", f"{program} {first} publishes", "shell-publish")
+    if program == "gh":
+        words = [a for a in args if not a.startswith("-")]
+        if not (len(words) >= 2 and words[1] in _GH_READ_ONLY):
+            return ShellVerdict("ask", "high", "gh changes GitHub state", "shell-publish")
+    if program in _NETWORK:
+        return ShellVerdict("ask", "high", f"{program} talks to another machine", "shell-network")
+    if program in _LOCAL_TOOLS or (
+        program.startswith("python") and len(args) >= 2 and args[0] == "-m"
+        and args[1] in _LOCAL_MODULES
+    ):
+        # Not an objection: the rules decide (the catch-all asks). The class lets
+        # --auto approve it, because it only runs the workspace's own checks.
+        return ShellVerdict("allow", "medium", "local check of the workspace", "shell-local")
     recursive = _short(args, "r") or _short(args, "R") or _long_any(args, "--recursive", 3)
     if program == "rm" and recursive:
         return ShellVerdict("hard_deny", "critical", "recursive deletion", "shell-rm-recursive")

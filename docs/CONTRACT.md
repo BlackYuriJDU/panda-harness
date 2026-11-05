@@ -204,11 +204,24 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   the model call (exit `4` with a hint naming the environment variable).
 - A **turn** is one user message plus up to `--max-steps` model steps
   (default `24`) with tool calls in between.
-- `--auto` approves the `ask` decisions for the process, **except those in the
-  `never_auto` class**: publishing (`git push`, rules `shell-push`, `shell-git-push`,
-  `git-push`) is never approved by `--auto` and stays denied unless a person answers
-  the prompt. Destructive and force operations are `hard_deny`, which `--auto` cannot
-  approve either. Without a human at a prompt, `ask` is denied.
+- `--auto` is an **allowlist of effects**, read from the resolved decision and never
+  from a rule id. It approves `write`/`edit` asks, `validate`, and shell commands whose
+  effect class is `exec_local` (`pytest`, `ruff`, `mypy`, `python -m pytest|ruff|mypy|
+  compileall|unittest`). Every other class needs a person: `publish` (`git push` in any
+  spelling or wrapper, `git send-email`, `git remote set-url --push`, `twine upload`,
+  `npm|pnpm|yarn|cargo|uv|poetry|flit|hatch publish`, `gem push`, `docker|podman push`,
+  any `gh` command except view/list/status/diff/checks), `network` (`curl`, `wget`,
+  `ssh`, `scp`, `rsync`, ...), `destructive` (already `hard_deny`) and `exec_unknown`
+  (anything Panda does not classify, `python -c`, `make`, `sh -c` strings that contain a
+  push). Without a human at a prompt, `ask` is denied.
+- Each `approval.request` carries `effect_class`; each `approval.decision` carries
+  `decided_by` (`human`, `auto` or `policy`) and `effect_class`; `session.start` and
+  `run.start` record `approval_mode`. A command typed by the operator (`!cmd`) is
+  recorded as `tool.call`/`tool.result` with `origin: operator`, and stops if the ledger
+  cannot record it. `session.end` records the last turn's status (`cancelled`, `error`,
+  `incomplete`), and a failed `session.end` is reported, not swallowed.
+- MCP `policy_check(approved=...)` is deprecated and ignored: an MCP client is not an
+  approver. The answer carries `approved: false` and a `deprecated` note.
 - **What is shown is what runs.** Text from the model, tools and the workspace is
   printed literally in the REPL and in `panda run`: Rich markup is not interpreted,
   terminal control sequences (OSC 52 clipboard, window title, `ESC[2J`, carriage
