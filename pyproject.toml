@@ -105,6 +105,9 @@ ignore = ["S101"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests share helpers (`from tests.test_agent import make_agent`); `pytest` run as a
+# console script does not put the project root on sys.path, `python -m pytest` does.
+pythonpath = ["."]
 addopts = "-ra"
 markers = [
   "integration: requires a real corpus and external tools (skipped by default)",
