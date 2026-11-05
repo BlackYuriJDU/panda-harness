@@ -27,6 +27,7 @@ from panda_core.errors import ConfigError, PandaError
 from panda_core.policy import Decision, PolicyEngine
 from panda_core.process import run_command, scrubbed_env
 from panda_core.provider import status_snapshot
+from panda_core.redact import REDACTED, redact_text
 from panda_core.registry import find_study, load_registry, load_study_card, parse_frontmatter
 from panda_core.safe_read import ensure_plain_path
 from panda_core.session import SessionLog
@@ -277,6 +278,12 @@ async def _ask(
     if not approved:
         return _blocked(tool, decision, "approval denied by the operator")
     return None
+
+
+_MARKER_MESSAGE = (
+    "the text contains the `[redacted]` marker that Panda puts where a secret is; writing "
+    "it would replace the real value. Leave secret lines untouched or ask the user"
+)
 
 
 def _is_git(argv: Sequence[str]) -> bool:
@@ -730,7 +737,23 @@ class ToolRegistry:
                 raise ToolInputError(f"cannot read existing file: {exc}") from exc
             before = raw_before.decode("utf-8", errors="replace")
             hash_before = hashlib.sha256(raw_before).hexdigest()
-        preview = _diff_preview(relative, before, content)
+        protected = self.ctx.policy.decide("read", relative).effect != "allow"
+        if protected:
+            # N-01: the read policy denies this file, so its current content must not
+            # reach the approval card, the ledger or the model through a diff.
+            preview = (
+                f"--- {relative} (existing content protected by the read policy; "
+                f"sha256 {hash_before or 'none'})\n+++ {relative}\n"
+                + "".join(f"+{line}\n" for line in content.splitlines())
+            )
+            if REDACTED in content:
+                return _fail("write_file", _MARKER_MESSAGE)
+        else:
+            if REDACTED in content and redact_text(before) != before:
+                # N-02: the model saw `[redacted]` where a secret is; writing the
+                # marker back would destroy the real value.
+                return _fail("write_file", _MARKER_MESSAGE)
+            preview = _diff_preview(relative, before, content)
         _, blocked = await _authorize(
             self.ctx,
             tool="write_file",
@@ -785,6 +808,12 @@ class ToolRegistry:
             raise ToolInputError(f"file not found: {relative}")
         if path.stat().st_size > MAX_WRITE_BYTES:
             raise ToolInputError(f"file exceeds {MAX_WRITE_BYTES} bytes")
+        if self.ctx.policy.decide("read", relative).effect != "allow":
+            # N-01: editing needs the content in a diff; a read-denied file stays unread.
+            return _fail(
+                "edit_file",
+                f"{relative} is protected by the read policy; ask the user to edit it",
+            )
         raw = path.read_bytes()
         file_mode = stat.S_IMODE(path.stat().st_mode)
         try:
@@ -804,6 +833,8 @@ class ToolRegistry:
             raise ToolInputError(
                 f"old_string appears {count} times; provide more context or set replace_all"
             )
+        if REDACTED in new and redact_text(before) != before:
+            return _fail("edit_file", _MARKER_MESSAGE)
         after = before.replace(old, new) if replace_all else before.replace(old, new, 1)
         preview = _diff_preview(relative, before, after)
         _, blocked = await _authorize(

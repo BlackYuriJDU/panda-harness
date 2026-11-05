@@ -60,6 +60,28 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   the model's tool calls and stops when the ledger cannot record it.
 - Session end (R2-312): a cancelled or failed last turn is no longer recorded as
   `completed`, and a failure to write `session.end` is reported.
+- Secrets toward the provider (R2-218, R2-112, R2-219, R2-220): tool results were redacted
+  in the ledger but sent raw to the provider, and the redactor missed JSON keys
+  (`"password": "x"`), URL passwords, `Cookie:`, `Authorization: Basic`, `pwd`/`passphrase`,
+  `sk_live_`, `glpat-`, `hf_`, JWTs and encrypted/PGP/cut PEM keys. Tool output is now
+  redacted before it joins the conversation and before the UI sees it; the patterns cover
+  those formats; ordinary words (`Secretion:`, `Tokenization:`) are no longer redacted; the
+  assignment scan is linear (a hostile 240 KB input went from 5 s to 0.5 s).
+- Children's environment (R2-114): an allowlist (system, locale, toolchain, CA and proxy
+  variables) replaces the denylist that kept `PGPASSWORD`, `MYSQL_PWD`, `DATABASE_URL` and
+  `SSH_AUTH_SOCK`; a proxy URL with a password is dropped; the user may add names with
+  `PANDA_CHILD_ENV`, never a credential-looking one.
+- Credential files (R2-108): `.envrc`, `id_ecdsa`/`id_dsa`, `.kube/config`, Google ADC json,
+  `.vault-token`, `*.tfstate`, `.s3cfg`, `.boto`, `.htpasswd` join the read floor.
+- Workspace instructions (R2-303, R2-400, R2-415): `config.instructions` must be a `.md` file in
+  `.panda/` or `corpus/` that the read policy allows; the text is placed in a
+  `<workspace_instructions untrusted="true">` block that cannot be closed from inside, and
+  a new rule 10 says text from tools and the workspace is data. "The corpus wins" is gone;
+  the prompt names only the workspace folder and no longer mentions `--auto`.
+- Previews and the redaction marker (new, from the plan review): `write_file` showed the
+  current content of a read-denied file in the approval diff and the ledger; it now shows
+  only its hash, and `edit_file` refuses such a file. Writing `[redacted]` into a file that
+  holds a secret is refused, so redaction cannot destroy the real value.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.

@@ -182,7 +182,8 @@ def default_policy() -> Policy:
         _rule(
             "read-private-keys",
             ["read"],
-            ["*id_rsa*", "*id_ed25519*", "*/.ssh/*", "*/.aws/credentials"],
+            ["*id_rsa*", "*id_ed25519*", "*id_ecdsa*", "*id_dsa*", "*/.ssh/*",
+             "*/.aws/credentials"],
             "hard_deny",
             "critical",
             "private key or cloud credential",
@@ -197,6 +198,11 @@ def default_policy() -> Policy:
                 "*/credentials.json", ".aws/credentials", ".ssh/*", ".docker/config.json",
                 "*/.docker/config.json", "*.p12", "*.pfx", "*.kdbx", "*.keystore", "*.jks",
                 "secrets.*", "*/secrets.*",
+                # R2-108: common credential files the list missed.
+                ".envrc", "*/.envrc", ".kube/config", "*/.kube/config",
+                "application_default_credentials.json", "*/application_default_credentials.json",
+                ".vault-token", "*/.vault-token", "*.tfstate", "*.tfstate.*", ".s3cfg",
+                "*/.s3cfg", ".boto", "*/.boto", ".htpasswd", "*/.htpasswd",
             ],
             "hard_deny",
             "critical",

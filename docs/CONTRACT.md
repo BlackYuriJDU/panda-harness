@@ -448,6 +448,17 @@ and `git branch --list` with a closed set of flags and no `rev:path`, absolute o
 `git push origin fix-foo` is `ask`, no longer `hard_deny`. `node
 corpus/validation/validate.mjs` is no longer pre-approved: use the `validate` tool.
 
+**What reaches the provider.** Every tool result is redacted (`panda_core.redact`) before
+it joins the conversation, as it is before the ledger. The system prompt names only the
+workspace folder. Workspace instructions are corpus data: `config.instructions` must name a
+`.md` file in `.panda/` or `corpus/` that the `read` rules allow, and the text sits in a
+`<workspace_instructions untrusted="true">` block that never overrides the harness rules.
+Child processes (`run_shell`, the validator, grep) inherit an allowlist of environment
+variables; the user adds names with `PANDA_CHILD_ENV`, and credential-looking names are
+never passed. A file the `read` rules deny never appears in an approval preview, and
+`write_file`/`edit_file` refuse to write the `[redacted]` marker over a file that holds a
+secret.
+
 **Allowed git runs isolated (`panda_core.gitsafe`).** A git command that runs
 without an approval is rebuilt before it runs, because the repository's own config
 and attributes name programs that even `git status` executes (fsmonitor, clean

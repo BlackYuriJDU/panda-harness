@@ -314,5 +314,7 @@ def test_system_prompt_carries_the_rules(workspace) -> None:
     assert "fail-closed" in prompt
     assert "clinical advice" in prompt
     assert "gse160208" in prompt
-    assert str(workspace.root.as_posix()) in prompt
+    # Owner-approved change (R2-415): only the folder name reaches the provider.
+    assert workspace.root.name in prompt
+    assert str(workspace.root.as_posix()) not in prompt
     assert "validate" in prompt

@@ -139,23 +139,70 @@ _SECRET_ENV_SUFFIXES = (
 )
 
 
-def scrubbed_env(*, keep_prefixes: tuple[str, ...] = ()) -> dict[str, str]:
-    """The environment a child process may inherit, without credentials.
+# Children inherit only what a toolchain needs, never "everything but known secrets":
+# a denylist kept PGPASSWORD, MYSQL_PWD, DATABASE_URL and SSH_AUTH_SOCK (R2-114).
+_ENV_ALLOW = frozenset(
+    {
+        "PATH", "HOME", "USER", "USERNAME", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM",
+        "COLORTERM", "TZ", "TMPDIR", "TMP", "TEMP", "PWD", "NO_COLOR", "FORCE_COLOR",
+        # Windows
+        "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA",
+        "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+        "COMMONPROGRAMFILES", "NUMBER_OF_PROCESSORS", "OS", "HOMEDRIVE", "HOMEPATH",
+        "PROCESSOR_ARCHITECTURE", "PSMODULEPATH",
+        # toolchains
+        "VIRTUAL_ENV", "PYTHONPATH", "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONHASHSEED",
+        "JAVA_HOME", "R_HOME", "NODE_PATH", "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy",
+        "https_proxy", "no_proxy",
+    }
+)
+_ENV_ALLOW_PREFIXES = ("LC_", "XDG_", "CONDA_", "R_LIBS", "PIXI_", "MAMBA_")
+USER_ENV_ALLOW = "PANDA_CHILD_ENV"  # user-scoped extension: comma-separated names
 
-    Names that look like credentials are always removed. `keep_prefixes` only lifts
-    the blanket removal of an entire prefix (such as `PANDA_`, which holds settings,
-    not secrets); it never keeps a name that ends like a credential.
+
+def scrubbed_env(*, keep_prefixes: tuple[str, ...] = ()) -> dict[str, str]:
+    """The environment a child process may inherit: an allowlist, minus credentials.
+
+    Names come from `_ENV_ALLOW`, its prefixes, `keep_prefixes`, or the user's own
+    `PANDA_CHILD_ENV` (never from workspace config). Names that look like
+    credentials are removed even if listed, and a proxy URL that carries a
+    password is dropped.
     """
 
+    extra = {
+        name.strip().upper()
+        for name in os.environ.get(USER_ENV_ALLOW, "").split(",")
+        if name.strip()
+    }
     env: dict[str, str] = {}
     for name, value in os.environ.items():
         upper = name.upper()
+        allowed = (
+            name in _ENV_ALLOW
+            or upper in _ENV_ALLOW
+            or upper.startswith(_ENV_ALLOW_PREFIXES)
+            or upper in extra
+            or (keep_prefixes and upper.startswith(keep_prefixes))
+        )
+        if not allowed:
+            continue
         if upper in _SECRET_ENV_NAMES or upper.endswith(_SECRET_ENV_SUFFIXES):
             continue
         if upper.startswith(_SECRET_ENV_PREFIXES) and not upper.startswith(keep_prefixes):
             continue
+        if "PROXY" in upper and "@" in value:
+            continue
         env[name] = value
     return env
+
+
+def dropped_env_names() -> list[str]:
+    """Names of variables children do not get (for `doctor`; never values)."""
+
+    kept = set(scrubbed_env())
+    return sorted(name for name in os.environ if name not in kept)
 
 
 DEFAULT_MAX_OUTPUT_BYTES = 4_000_000
