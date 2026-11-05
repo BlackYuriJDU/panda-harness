@@ -145,6 +145,12 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
 
 ### Changed
 
+- **Breaking, `panda run` exit codes (R2-404):** a turn that stops at `max_steps`, a budget or
+  an incomplete stream now exits `7` (it exited `1`, which the CONTRACT reserves for a
+  failed validation), and a turn that completes with any blocked or denied action exits
+  `5` (it exited `0`). `--json` always prints one object, including on errors, with
+  `exit_code`, `blocked_calls` and an `error` object. Scripts that treated `1` as "did not
+  finish" must accept `7`.
 - `panda validate` through `run_shell` now needs an approval; the `validate` tool is the
   unattended route (owner approved the test change).
 - CI runs the Ubuntu and Windows matrix on every branch push.

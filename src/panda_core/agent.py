@@ -97,6 +97,9 @@ class TurnResult:
     context_tokens: int = 0
     context_window: int = 0
     session_id: str | None = None
+    # Tool calls the policy or the operator refused: a turn can "complete" with every
+    # action blocked, and a script must be able to tell (R2-404).
+    blocked_calls: int = 0
 
     @property
     def context_ratio(self) -> float:
@@ -110,6 +113,7 @@ class TurnResult:
             "text": self.text,
             "steps": self.steps,
             "tool_calls": self.tool_calls,
+            "blocked_calls": self.blocked_calls,
             "usage": self.usage.to_dict(),
             "context_tokens": self.context_tokens,
             "context_window": self.context_window,
@@ -494,6 +498,7 @@ class Agent:
         turn = self.turn_index
         steps = 0
         tool_calls = 0
+        blocked_calls = 0
         texts: list[str] = []
         usage = Usage()
         status = "completed"
@@ -598,6 +603,8 @@ class Agent:
                         arguments=call.arguments,
                     )
                     result = await self._execute_tool(call)
+                    if getattr(result, "blocked", False):
+                        blocked_calls += 1
                     self._log(
                         "tool.result",
                         {
@@ -682,6 +689,7 @@ class Agent:
             text="\n\n".join(texts).strip(),
             steps=steps,
             tool_calls=tool_calls,
+            blocked_calls=blocked_calls,
             usage=usage,
             context_tokens=self.last_context_tokens,
             context_window=self.context_window,

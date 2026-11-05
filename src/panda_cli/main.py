@@ -551,13 +551,19 @@ def run_command(
     except TimeoutError as exc:
         log.append("run.error", {"code": "execution_timeout", "message": "run timed out"})
         _close_quietly(log, "error")
-        raise ExecutionTimeout(
+        error = ExecutionTimeout(
             "run exceeded the timeout",
             hint="raise --timeout or narrow the task",
-        ) from exc
+        )
+        if json_output:
+            render.print_json(_error_payload(error, log.session_id))
+        raise error from exc
     except PandaError as exc:
         log.append("run.error", {"code": exc.code, "message": exc.message})
         _close_quietly(log, "error")
+        if json_output:
+            # --json always prints one object, also on failure (R2-404).
+            render.print_json(_error_payload(exc, log.session_id))
         raise
 
     log.append(
@@ -572,18 +578,42 @@ def run_command(
     _close_quietly(log, "ok" if result.status == "completed" else result.status)
     if not json_output and streamed["any"]:
         typer.echo()
+    exit_code = run_exit_code(result.status, result.blocked_calls)
     payload = {
-        "ok": result.status == "completed",
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
         "model": selected_model,
         "provider": workspace.config.provider.name,
         **result.to_dict(),
     }
     if json_output:
         render.print_json(payload)
-    if result.status == "cancelled":
-        raise typer.Exit(130)
-    if result.status != "completed":
-        raise typer.Exit(1)
+    if exit_code:
+        raise typer.Exit(exit_code)
+
+
+def run_exit_code(status: str, blocked_calls: int = 0) -> int:
+    """`panda run` status -> exit code (CONTRACT §5, R2-404).
+
+    0 completed with nothing blocked; 5 completed but an action was blocked or
+    denied; 7 stopped at a limit (max_steps, budget, incomplete stream); 130
+    cancelled. Errors keep their own codes (2, 3, 4, 6).
+    """
+
+    if status == "cancelled":
+        return 130
+    if status == "completed":
+        return 5 if blocked_calls else 0
+    return 7
+
+
+def _error_payload(error: PandaError, session_id: str | None) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "exit_code": error.exit_code,
+        "session_id": session_id,
+        "error": {"code": error.code, "message": error.message, "hint": error.hint},
+    }
 
 
 def _runtime(

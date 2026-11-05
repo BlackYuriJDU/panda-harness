@@ -286,9 +286,15 @@ about the adapter, not a promise that a call will succeed.
 | `2` | Usage or configuration error (bad flags, missing workspace, unsupported JSONC, unsupported model protocol, invalid config). |
 | `3` | Required dependency missing (Node.js, MCP SDK). |
 | `4` | Provider error (auth, rate limit, transport, protocol), execution timeout, or session-integrity failure. |
-| `5` | Policy denied, including `ask` outside an interactive approval. |
+| `5` | Policy denied, including `ask` outside an interactive approval. For `panda run`: the turn completed but at least one action was blocked or denied. |
 | `6` | Unexpected internal error. |
+| `7` | `panda run` stopped at a limit before completing: `max_steps`, a budget, or an incomplete provider stream. |
 | `130` | Interrupted with Ctrl-C. |
+
+`panda run --json` always prints exactly one JSON object on stdout, also on failure:
+`{"ok": false, "exit_code": N, "session_id": ..., "error": {"code", "message", "hint"}}`.
+On success it carries `ok`, `exit_code`, `status`, `steps`, `tool_calls`, `blocked_calls`
+and `usage`; `ok` is true only for exit code `0`.
 
 `panda status --json` returns `0` even when the directory is not a workspace; the
 payload carries `ok: false` and a stable `code`.
