@@ -103,6 +103,12 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
 - `panda init` (R2-305): it followed links shipped by the corpus, creating files outside
   the workspace and, with `--force`, overwriting a link's target and copying it into
   `.panda/backups/`. Init now refuses when any path it touches is a link.
+- Ledger (R2-224, R2-225, R2-227, R2-502): a long-lived writer (cockpit, MCP) trusted a
+  tail cached by file size, so a same-size rewrite of the last line went unnoticed; the
+  tail is now re-read under the lock on every append and its hash recomputed. Nothing is
+  appended after `session.end`. `panda session recover` refuses an unanchored approval or
+  policy event and one dated before its predecessor or in the future. A new test kills
+  the surviving mutant that skipped the anchor's hash comparison.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.

@@ -118,3 +118,111 @@ def test_init_refuses_a_linked_panda_directory(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         initialize_workspace(root)
     assert list(elsewhere.iterdir()) == []
+
+
+# --------------------------------------------------------------------------- ledger (W11)
+def _log(tmp_path: Path):
+    from panda_core.session import SessionLog
+
+    return SessionLog.create(tmp_path / "sessions", label="w11")
+
+
+def _rewrite_last_line(path: Path, mutate) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    record = json.loads(lines[-1])
+    mutate(record)
+    lines[-1] = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_long_lived_writer_refuses_same_size_forgery_of_the_tail(tmp_path: Path) -> None:
+    from panda_core.errors import SessionIntegrityError
+
+    log = _log(tmp_path)
+    log.append("note", {"text": "AAAA"})
+    size = log.path.stat().st_size
+    _rewrite_last_line(log.path, lambda r: r["data"].update(text="BBBB"))
+    assert log.path.stat().st_size == size  # same size: the old cache missed it
+    with pytest.raises(SessionIntegrityError):
+        log.append("note", {"text": "next"})
+
+
+def test_append_refuses_tail_with_same_seq_but_different_hash(tmp_path: Path) -> None:
+    from panda_core.errors import SessionIntegrityError
+
+    log = _log(tmp_path)
+    log.append("note", {"text": "a"})
+    _rewrite_last_line(log.path, lambda r: r.update(hash="0" * 64))
+    with pytest.raises(SessionIntegrityError):
+        log.append("note", {"text": "b"})
+
+
+def test_no_append_after_session_end(tmp_path: Path) -> None:
+    from panda_core.errors import SessionIntegrityError
+
+    log = _log(tmp_path)
+    log.close("completed")
+    with pytest.raises(SessionIntegrityError):
+        log.append("note", {"text": "late"})
+    assert log.verify().ok
+
+
+def _unanchored(tmp_path: Path, event_type: str, ts: str | None = None):
+    """A log whose last event was appended without updating the anchor."""
+
+    log = _log(tmp_path)
+    log.append("note", {"text": "anchored"})
+    anchor = log.anchor_path.read_text(encoding="utf-8")
+    log.append(event_type, {"x": 1})
+    log.anchor_path.write_text(anchor, encoding="utf-8")
+    if ts is not None:
+        from panda_core.session import event_hash
+
+        def backdate(record):
+            record["ts"] = ts
+            body = {k: v for k, v in record.items() if k != "hash"}
+            record["hash"] = event_hash(body)
+
+        _rewrite_last_line(log.path, backdate)
+    from panda_core.session import SessionLog
+
+    return SessionLog.open(log.path) if hasattr(SessionLog, "open") else log
+
+
+def test_recover_adopts_a_plausible_crash_event(tmp_path: Path) -> None:
+    log = _unanchored(tmp_path, "tool.call")
+    assert log.recover() is True
+
+
+@pytest.mark.parametrize(
+    ("event_type", "ts"),
+    [("approval.decision", None), ("note", "2020-01-01T00:00:00Z"),
+     ("note", "2999-01-01T00:00:00Z")],
+)
+def test_recover_refuses_backdated_or_approval_events(
+    tmp_path: Path, event_type: str, ts: str | None
+) -> None:
+    from panda_core.errors import SessionIntegrityError
+
+    log = _unanchored(tmp_path, event_type, ts)
+    with pytest.raises(SessionIntegrityError):
+        log.recover()
+
+
+def test_a_rehashed_forged_tail_is_caught_by_the_anchor(tmp_path: Path) -> None:
+    """Kills mutant M12: only the anchor hash comparison catches a valid re-hash."""
+
+    from panda_core.errors import SessionIntegrityError
+    from panda_core.session import event_hash
+
+    log = _log(tmp_path)
+    log.append("note", {"text": "real"})
+
+    def forge(record):
+        record["data"] = {"text": "forged"}
+        body = {k: v for k, v in record.items() if k != "hash"}
+        record["hash"] = event_hash(body)
+
+    _rewrite_last_line(log.path, forge)
+    with pytest.raises(SessionIntegrityError, match="anchor"):
+        log.append("note", {"text": "next"})

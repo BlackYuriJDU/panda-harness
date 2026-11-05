@@ -266,11 +266,18 @@ class SessionLog:
             ) from exc
         if not HASH_RE.match(digest):
             raise SessionIntegrityError(f"invalid tail hash in {self.path}")
+        body = {key: value for key, value in record.items() if key != "hash"}
+        if event_hash(body) != digest:
+            # R2-224: a rewritten last line keeps its old `hash` field; recompute it.
+            raise SessionIntegrityError(
+                f"the last session event does not match its hash: {self.path}",
+                hint="the session log was modified; run `panda session verify`",
+            )
         return seq, digest
 
-    def _refresh_tail(self) -> None:
+    def _refresh_tail(self, *, force: bool = False) -> None:
         size = self.path.stat().st_size if self.path.exists() else 0
-        if size != self._size:
+        if force or size != self._size:
             self._tail = self._read_tail()
             self._size = size
 
@@ -344,9 +351,17 @@ class SessionLog:
     def _append_locked(
         self, event_type: str, payload: dict[str, Any], *, check_anchor: bool = True
     ) -> SessionEvent:
-        self._refresh_tail()
+        # Re-read the tail under the lock every time: a same-size rewrite of the last
+        # line was invisible to the size-keyed cache of a long-lived writer (R2-224).
+        self._refresh_tail(force=True)
         if check_anchor:
             self._check_anchor()
+        if self._tail_type == "session.end" and event_type != "session.recovered":
+            # R2-225: a closed session stays closed; appending after it broke verify.
+            raise SessionIntegrityError(
+                f"session {self.session_id} is closed; start a new session",
+                hint="run `panda session start`",
+            )
         seq = (self._tail[0] + 1) if self._tail else 1
         prev = self._tail[1] if self._tail else None
         ts = utc_now()
@@ -429,6 +444,14 @@ class SessionLog:
                     f"cannot recover {self.path}: the anchor does not name the previous event"
                 )
             adopted = events[-1]
+            problem = _implausible_crash_event(events[-2], adopted)
+            if problem:
+                # R2-227: recovery adopts the one event a crash can leave unanchored;
+                # it must not legitimise a backdated or approval event added by hand.
+                raise SessionIntegrityError(
+                    f"cannot recover {self.path}: {problem}",
+                    hint="the log was edited, not interrupted; restore a backup",
+                )
             self._append_locked(
                 "session.recovered",
                 {
@@ -650,3 +673,20 @@ def list_sessions(sessions_dir: Path, *, redact_enabled: bool = True) -> list[Se
         with contextlib.suppress(ConfigError, OSError, SessionIntegrityError):
             summaries.append(SessionLog.open(path, redact_enabled=redact_enabled).summary())
     return summaries
+
+
+_NEVER_ADOPTED = frozenset({"approval.request", "approval.decision", "policy.decision"})
+
+
+def _implausible_crash_event(previous: Any, adopted: Any) -> str | None:
+    """Why an unanchored event cannot be the result of a crash, or None."""
+
+    if adopted.type in _NEVER_ADOPTED:
+        return f"an unanchored {adopted.type} is never adopted"
+    if adopted.ts < previous.ts:
+        return "the unanchored event is dated before the event it follows"
+    now = utc_now()
+    if adopted.ts > now and adopted.ts[:16] > now[:16]:
+        return "the unanchored event is dated in the future"
+    return None
+
