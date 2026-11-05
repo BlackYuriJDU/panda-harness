@@ -336,7 +336,8 @@ def _schema_problem(schema: dict[str, Any], args: dict[str, Any]) -> str | None:
     where = ".".join(str(part) for part in error.path) or "arguments"
     if error.validator == "additionalProperties":
         unknown = sorted(set(args) - set(strict.get("properties", {})))
-        return f"unknown argument(s) {', '.join(unknown)}; allowed: {', '.join(strict['properties'])}"
+        allowed = ", ".join(strict["properties"])
+        return f"unknown argument(s) {', '.join(unknown)}; allowed: {allowed}"
     if error.validator == "required":
         return f"missing required argument: {error.message.split(chr(39))[1]}"
     expected = error.schema.get("type") or error.schema.get("enum") or error.validator
