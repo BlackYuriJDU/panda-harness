@@ -184,7 +184,12 @@ def _main(
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps per turn."
     ),
-    session: str | None = typer.Option(None, "--session", help="Continue a Panda session."),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Append to an existing session's ledger. The model starts without that"
+        " session's conversation.",
+    ),
     private: bool = typer.Option(False, "--private", help="Never persist task text."),
 ) -> None:
     if plain:
@@ -459,7 +464,12 @@ def run_command(
         " Never pushes, publishes, deletes, uses the network or runs unknown programs.",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit a JSON result."),
-    session: str | None = typer.Option(None, "--session", help="Continue an existing session."),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Append to an existing session's ledger. The model starts without that"
+        " session's conversation.",
+    ),
     private: bool = typer.Option(
         False, "--private", help="Persist only a hash of the task, never its text."
     ),
@@ -709,7 +719,12 @@ def chat_command(
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps."
     ),
-    session: str | None = typer.Option(None, "--session", help="Continue an existing session."),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Append to an existing session's ledger. The model starts without that"
+        " session's conversation.",
+    ),
     private: bool = typer.Option(False, "--private", help="Never persist task text."),
 ) -> None:
     _start_chat(

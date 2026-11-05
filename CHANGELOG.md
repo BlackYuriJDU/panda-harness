@@ -189,6 +189,9 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   that uses up `max_steps` gets one more reply with no tools, so it ends with a summary
   instead of an empty answer. `panda run --max-tokens` and `--max-cost` stop the turn
   before the next model call with status `budget_exceeded` (exit `7`).
+- `--session` help (R2-407) on `panda`, `panda run` and `panda chat` no longer says
+  "continue": it appends to the session's ledger, and the model starts without that
+  session's conversation.
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

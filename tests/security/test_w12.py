@@ -380,3 +380,16 @@ def test_run_accepts_budget_options() -> None:
 
     out = CliRunner().invoke(app, ["run", "--help"], env={"COLUMNS": "200"}).output
     assert "--max-tokens" in out and "--max-cost" in out
+
+
+# --------------------------------------------------------------------------- R2-407
+@pytest.mark.parametrize("command", [[], ["run"], ["chat"]])
+def test_session_help_does_not_promise_the_conversation_back(command) -> None:
+    from typer.testing import CliRunner
+
+    from panda_cli.main import app
+
+    result = CliRunner().invoke(app, [*command, "--help"], env={"COLUMNS": "300"})
+    assert result.exit_code == 0
+    assert "Continue" not in result.output
+    assert "without that session's conversation" in " ".join(result.output.split())
