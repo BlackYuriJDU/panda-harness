@@ -265,6 +265,86 @@ def parse_google_usage(raw: Any) -> Usage | None:
 _OPENAI_MESSAGE_KEYS = frozenset({"role", "content", "name", "tool_call_id"})
 
 
+def unique_tool_call_ids(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Give every assistant tool call a distinct id across the history (R2-123).
+
+    A provider may reuse an id in a later step (or send none); Anthropic and the
+    Responses API reject or mis-pair repeated ids. A repeat is renamed
+    `<id>_<n>`, and the tool results right after that assistant message follow it.
+    """
+
+    seen: set[str] = set()
+    pending: dict[str, list[str]] = {}
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        calls = message.get("tool_calls") if role == "assistant" else None
+        if isinstance(calls, list) and calls:
+            pending = {}
+            renamed: list[Any] = []
+            for call in calls:
+                if not isinstance(call, dict):
+                    renamed.append(call)
+                    continue
+                old = str(call.get("id") or "")
+                new = old
+                if not old or old in seen:
+                    base, n = old or "call", 2
+                    while f"{base}_{n}" in seen:
+                        n += 1
+                    new = f"{base}_{n}"
+                seen.add(new)
+                pending.setdefault(old, []).append(new)
+                renamed.append(call if new == old else {**call, "id": new})
+            out.append({**message, "tool_calls": renamed})
+            continue
+        if role == "tool":
+            old = str(message.get("tool_call_id") or "")
+            queue = pending.get(old)
+            if queue:
+                new = queue.pop(0)
+                out.append(message if new == old else {**message, "tool_call_id": new})
+                continue
+        out.append(message)
+    return out
+
+
+def _pair_chat(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every chat tool call is answered right after it, and no result is orphaned (R2-124).
+
+    The same repair the other protocols get (ADP-001): a missing result becomes
+    NO_TOOL_RESULT, and a tool message with no call before it is dropped.
+    """
+
+    out: list[dict[str, Any]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        index += 1
+        if message.get("role") == "tool":
+            continue  # not directly after its call: orphaned (by trimming, for instance)
+        out.append(message)
+        calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        if not calls:
+            continue
+        ids = [str(call.get("id") or "") for call in calls if isinstance(call, dict)]
+        results: dict[str, dict[str, Any]] = {}
+        while index < len(messages) and messages[index].get("role") == "tool":
+            result = messages[index]
+            index += 1
+            call_id = str(result.get("tool_call_id") or "")
+            if call_id in ids and call_id not in results:
+                results[call_id] = result
+        for call_id in ids:
+            out.append(
+                results.get(call_id)
+                or {"role": "tool", "tool_call_id": call_id, "content": NO_TOOL_RESULT}
+            )
+    return out
+
+
 def sanitize_messages_for_openai(
     messages: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -275,9 +355,7 @@ def sanitize_messages_for_openai(
     """
 
     cleaned: list[dict[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
+    for message in unique_tool_call_ids(messages):
         item = {key: message[key] for key in _OPENAI_MESSAGE_KEYS if key in message}
         raw_calls = message.get("tool_calls")
         if isinstance(raw_calls, list):
@@ -303,7 +381,7 @@ def sanitize_messages_for_openai(
             if calls:
                 item["tool_calls"] = calls
         cleaned.append(item)
-    return cleaned
+    return _pair_chat(cleaned)
 
 
 def _text_content(value: Any) -> str:
@@ -452,6 +530,7 @@ def convert_messages_for_anthropic(
     the result always alternates user/assistant.
     """
 
+    messages = unique_tool_call_ids(messages)
     system_parts: list[str] = []
     converted: list[dict[str, Any]] = []
     for message in messages:
@@ -578,6 +657,7 @@ def convert_messages_for_responses(
     which is the stateless shape the Responses API expects.
     """
 
+    messages = unique_tool_call_ids(messages)
     system_parts: list[str] = []
     items: list[dict[str, Any]] = []
     for message in messages:
@@ -739,6 +819,7 @@ def convert_messages_for_google(
     requires for multi-turn tool use.
     """
 
+    messages = unique_tool_call_ids(messages)
     system_parts: list[str] = []
     contents: list[dict[str, Any]] = []
     pending_names: dict[str, str] = {}

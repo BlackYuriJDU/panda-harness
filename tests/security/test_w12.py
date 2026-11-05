@@ -447,3 +447,50 @@ def test_neg_normal_stop_reasons_still_complete(workspace, reason) -> None:
 
     agent, _, _ = _agent(workspace, [[TextDelta("ok"), DoneEvent(finish_reason=reason)]])
     assert asyncio.run(agent.run_turn("go")).status == "completed"
+
+
+# --------------------------------------------------------------------------- R2-123 / R2-124
+def _call_msg(call_id: str) -> dict:
+    return {"role": "assistant", "content": None, "tool_calls": [
+        {"id": call_id, "type": "function",
+         "function": {"name": "read_file", "arguments": "{}"}}]}
+
+
+def _result(call_id: str, text: str) -> dict:
+    return {"role": "tool", "tool_call_id": call_id, "content": text}
+
+
+def test_a_reused_provider_id_is_made_unique_with_its_result() -> None:
+    from panda_core.provider import convert_messages_for_anthropic
+
+    history = [{"role": "user", "content": "go"}, _call_msg("toolu_1"), _result("toolu_1", "A"),
+               _call_msg("toolu_1"), _result("toolu_1", "B")]
+    _, converted = convert_messages_for_anthropic(history)
+    uses = [b["id"] for m in converted for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "tool_use"]
+    results = {b["tool_use_id"]: b["content"] for m in converted for b in m["content"]
+               if isinstance(b, dict) and b.get("type") == "tool_result"}
+    assert len(set(uses)) == 2
+    assert "B" in str(results[uses[1]]) and "A" in str(results[uses[0]])
+
+
+def test_chat_history_gets_a_result_for_every_call_and_drops_orphans() -> None:
+    from panda_core.provider import NO_TOOL_RESULT, sanitize_messages_for_openai
+
+    history = [{"role": "user", "content": "go"},
+               _result("ghost", "orphan"),
+               _call_msg("c1"),
+               {"role": "user", "content": "[harness note] interrupted"}]
+    cleaned = sanitize_messages_for_openai(history)
+    assert all(m.get("tool_call_id") != "ghost" for m in cleaned)
+    index = next(i for i, m in enumerate(cleaned) if m.get("tool_calls"))
+    assert cleaned[index + 1] == {"role": "tool", "tool_call_id": "c1",
+                                  "content": NO_TOOL_RESULT}
+
+
+def test_neg_a_well_formed_chat_history_is_unchanged() -> None:
+    from panda_core.provider import sanitize_messages_for_openai
+
+    history = [{"role": "user", "content": "go"}, _call_msg("c1"), _result("c1", "A"),
+               {"role": "assistant", "content": "done"}]
+    assert sanitize_messages_for_openai(history) == history
