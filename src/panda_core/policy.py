@@ -606,6 +606,23 @@ class PolicyEngine:
             effect_class=_class_of(verdict, worst),
         )
 
+    def rule_source(self, rule_id: str | None) -> str:
+        """Where a rule comes from, for the consent card: built-in, workspace or classifier.
+
+        A workspace rule that is not identical to the built-in rule of the same id is
+        labelled `workspace`, so its reason is read as corpus text (R2-207).
+        """
+
+        if not rule_id:
+            return "default"
+        built_in = {rule.id: rule for rule in (*default_policy().rules, *self._floor)}
+        for rule in self.policy.rules:
+            if rule.id == rule_id and built_in.get(rule_id) != rule:
+                return "workspace"
+        if rule_id in built_in or rule_id in _BUILT_IN_IDS:
+            return "built-in"
+        return "classifier"
+
     def denied_read_patterns(self) -> tuple[str, ...]:
         """Globs of every read rule that does not allow: excluded from git output."""
 
@@ -754,4 +771,7 @@ def _class_of(verdict: ShellVerdict, worst: ShellVerdict) -> str:
     return worst.effect_class if SEVERITY[worst.effect] > SEVERITY[verdict.effect] else (
         verdict.effect_class
     )
+
+
+_BUILT_IN_IDS = frozenset(rule.id for rule in (*default_policy().rules, *_BASELINE_RULES))
 

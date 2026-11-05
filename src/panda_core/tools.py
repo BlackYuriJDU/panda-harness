@@ -13,6 +13,7 @@ import difflib
 import hashlib
 import json
 import re
+import shlex
 import stat
 import sys
 import threading
@@ -52,7 +53,8 @@ IGNORED_DIRS = {
 }
 MAX_READ_BYTES = 1_048_576
 MAX_WRITE_BYTES = 2_097_152
-PREVIEW_LIMIT = 6_000
+# A diff is shown whole up to this size; past it the action cannot be approved (R2-125).
+PREVIEW_LIMIT = 200_000
 DEFAULT_OUTPUT_LIMIT = 30_000
 
 
@@ -112,10 +114,21 @@ class ApprovalRequest:
     preview_kind: str = "none"
     # From the resolved decision, never from a rule id (R2-500): what --auto reads.
     effect_class: str = ""
+    # The consent card (R2-229, R2-117): exactly what runs, where, under which rule.
+    argv: tuple[str, ...] = ()
+    cwd: str = ""
+    rule_source: str = ""
+    payload_sha256: str = ""
+    preview_complete: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "effect_class": self.effect_class or self.action,
+            "argv": list(self.argv),
+            "cwd": self.cwd,
+            "rule_source": self.rule_source,
+            "payload_sha256": self.payload_sha256,
+            "preview_complete": self.preview_complete,
             "tool": self.tool,
             "action": self.action,
             "resource": self.resource,
@@ -232,6 +245,8 @@ async def _authorize(
     preview: str = "",
     preview_kind: str = "none",
     argv: Sequence[str] | None = None,
+    cwd: str = "",
+    payload_sha256: str = "",
 ) -> tuple[Decision | None, ToolResult | None]:
     decision = (
         ctx.policy.decide_shell(argv) if argv is not None else ctx.policy.decide(action, resource)
@@ -240,8 +255,18 @@ async def _authorize(
         return decision, None
     if decision.effect in {"deny", "hard_deny"}:
         return decision, _blocked(tool, decision, "policy denies this action")
-    return decision, await _ask(ctx, decision, tool=tool, action=action, resource=resource,
-                                preview=preview, preview_kind=preview_kind)
+    return decision, await _ask(
+        ctx,
+        decision,
+        tool=tool,
+        action=action,
+        resource=resource,
+        preview=preview,
+        preview_kind=preview_kind,
+        argv=tuple(argv or ()),
+        cwd=cwd,
+        payload_sha256=payload_sha256,
+    )
 
 
 async def _ask(
@@ -253,6 +278,9 @@ async def _ask(
     resource: str,
     preview: str,
     preview_kind: str,
+    argv: tuple[str, ...] = (),
+    cwd: str = "",
+    payload_sha256: str = "",
 ) -> ToolResult | None:
     """Ask the approver; `None` means approved, a result means blocked."""
 
@@ -270,6 +298,11 @@ async def _ask(
         preview=preview,
         preview_kind=preview_kind,
         effect_class=decision.effect_class or action,
+        argv=argv,
+        cwd=cwd,
+        rule_source=ctx.policy.rule_source(decision.rule_id),
+        payload_sha256=payload_sha256,
+        preview_complete="\n[truncated " not in preview[-120:],
     )
     try:
         approved = bool(await ctx.approve(request))
@@ -761,6 +794,7 @@ class ToolRegistry:
             resource=relative,
             preview=preview,
             preview_kind="diff",
+            payload_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
         )
         if blocked:
             return blocked
@@ -844,6 +878,7 @@ class ToolRegistry:
             resource=relative,
             preview=preview,
             preview_kind="diff",
+            payload_sha256=hashlib.sha256(after.encode("utf-8")).hexdigest(),
         )
         if blocked:
             return blocked
@@ -888,14 +923,22 @@ class ToolRegistry:
         if not cwd.is_dir():
             raise ToolInputError(f"cwd is not a directory: {cwd_relative}")
         command_text = " ".join(argv)
+        # The preview keeps token boundaries (R2-117): `['a b']` and `['a', 'b']`
+        # must not look the same to the person approving.
+        shown = shlex.join(argv)
+        payload_hash = hashlib.sha256(
+            json.dumps({"argv": argv, "cwd": cwd_relative}).encode("utf-8")
+        ).hexdigest()
         decision, blocked = await _authorize(
             self.ctx,
             tool="run_shell",
             action="shell",
             resource=command_text,
-            preview=command_text,
+            preview=shown,
             preview_kind="command",
             argv=argv,
+            cwd=cwd_relative,
+            payload_sha256=payload_hash,
         )
         if blocked:
             return blocked
@@ -925,8 +968,11 @@ class ToolRegistry:
                     tool="run_shell",
                     action="shell",
                     resource=command_text,
-                    preview=command_text,
+                    preview=shown,
                     preview_kind="command",
+                    argv=tuple(argv),
+                    cwd=cwd_relative,
+                    payload_sha256=payload_hash,
                 )
                 if blocked:
                     return blocked

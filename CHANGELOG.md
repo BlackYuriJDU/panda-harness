@@ -82,6 +82,19 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   current content of a read-denied file in the approval diff and the ledger; it now shows
   only its hash, and `edit_file` refuses such a file. Writing `[redacted]` into a file that
   holds a secret is refused, so redaction cannot destroy the real value.
+- Terminal output (R2-221, R2-222, R2-223, R2-306, R2-310): sanitizing was done per call
+  site and the cockpit transcript, tool cards, CLI tables, `print_error`, `panda models` and
+  validator output were missed. Every CLI console now writes through a sink that keeps only
+  colour sequences, with Rich markup off, so `[link=...]` stays literal; the cockpit builds
+  every block with `SafeText`, which sanitizes on construction and on every append; model
+  Markdown is sanitized and its links are never clickable (N-03); `--json` output escapes
+  bidi, invisible and C1 characters. The sanitizer also covers U+2028/2029, U+061C,
+  U+180E, U+00AD, Hangul fillers, variation selectors and tag characters.
+- Approval card (R2-229, R2-117, R2-125): the card shows the exact argv (quoted token by
+  token, with the token count), the working directory, the effect class, where the rule
+  comes from (a workspace rule's reason is labelled as workspace text) and the payload's
+  SHA-256, which is also written to `approval.request`. A diff is shown whole up to 200 000
+  characters; a truncated preview cannot be approved in the cockpit or the REPL.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.

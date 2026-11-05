@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import typer
+from rich.text import Text
 
 from panda_cli import render
 from panda_cli.terminal import reset_terminal as _reset_terminal
@@ -281,7 +282,8 @@ def auth_set(
         render.print_json({"ok": True, "provider": name, "path": str(path)})
         return
     render.console().print(
-        f"[green]stored[/green] {name} in {path} (mode 0600, outside the workspace)"
+        Text("stored", style=render.GREEN),
+        Text(f"{name} in {path} (mode 0600, outside the workspace)"),
     )
 
 
@@ -351,7 +353,7 @@ def auth_clear(
         render.print_json({"ok": True, "target": target, "removed": removed})
         return
     if removed:
-        render.console().print(f"[green]cleared[/green] {target}")
+        render.console().print(Text("cleared", style=render.GREEN), Text(str(target)))
     else:
         render.console().print(f"no stored key for {target}")
 

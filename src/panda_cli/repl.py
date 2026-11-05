@@ -47,10 +47,19 @@ def _say(message: str, *, style: str | None = None) -> None:
 
 
 def _print_approval(request: ApprovalRequest) -> None:
+    import shlex
+
+    where = ""
+    if request.argv:
+        where = f"\n  runs: {shlex.join(request.argv)}\n  in: {request.cwd or '.'}"
+    source = request.rule_source or "built-in"
+    reason = ("[text from the workspace policy] " if source == "workspace" else "") + request.reason
     _say(
-        f"[approval] {request.tool}: {request.action} {request.resource}\n"
-        f"  rule: {request.rule_id or '-'}  risk: {request.risk}\n"
-        f"  reason: {request.reason}"
+        f"[approval] {request.tool}: {request.action} {request.resource}{where}\n"
+        f"  effect: {request.effect_class or request.action}  rule: {request.rule_id or '-'}"
+        f" ({source})  risk: {request.risk}\n"
+        f"  reason: {reason}"
+        + (f"\n  sha256: {request.payload_sha256[:16]}" if request.payload_sha256 else "")
     )
     if request.preview:
         label = "diff" if request.preview_kind == "diff" else "command"
@@ -59,6 +68,9 @@ def _print_approval(request: ApprovalRequest) -> None:
 
 async def _ask_approval(request: ApprovalRequest) -> bool:
     _print_approval(request)
+    if not request.preview_complete or "\n[truncated " in (request.preview or "")[-120:]:
+        _say("  the preview is too large to show in full; denied (R2-125)", style="yellow")
+        return False
     answer = await asyncio.to_thread(input, "approve? [y/N] ")
     return answer.strip().lower() in {"y", "yes"}
 def _banner(runtime: ChatRuntime) -> None:

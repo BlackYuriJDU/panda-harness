@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterable
 from typing import Any
 
@@ -12,6 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from panda_cli.brand import PALETTE, brand_lines, color_enabled
+from panda_core.display import SafeWriter, json_safe
 
 GREEN = PALETTE["green"]
 GREEN_DIM = PALETTE["green.dim"]
@@ -22,8 +24,21 @@ WHITE_SHADOW = PALETTE["white.shadow"]
 INK = PALETTE["ink"]
 
 
-def console() -> Console:
-    return Console(highlight=False, emoji=False, soft_wrap=False)
+def console(*, stderr: bool = False) -> Console:
+    """Every CLI console: no markup from strings, and a sanitizing sink (R2-306, R2-223).
+
+    `markup=False` keeps corpus text such as `[link=...]` or `[/]` literal; the
+    SafeWriter strips any terminal sequence except colour from what reaches the tty.
+    """
+
+    stream = sys.stderr if stderr else sys.stdout
+    return Console(
+        file=SafeWriter(stream),
+        highlight=False,
+        emoji=False,
+        soft_wrap=False,
+        markup=False,
+    )
 
 
 def banner(version: str) -> None:
@@ -51,7 +66,7 @@ def status_text(status: str) -> Text:
 
 
 def print_error(exc: Any) -> None:
-    output = Console(stderr=True, highlight=False, emoji=False, soft_wrap=False)
+    output = console(stderr=True)
     output.print(Text("error", style=f"bold {AMBER}"), Text(str(getattr(exc, "message", exc))))
     hint = getattr(exc, "hint", None)
     if hint:
@@ -62,7 +77,8 @@ def print_error(exc: Any) -> None:
 
 
 def print_json(payload: Any) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    # Valid JSON, with C1, bidi and invisible characters escaped (R2-223).
+    print(json_safe(json.dumps(payload, ensure_ascii=False, indent=2)))
 
 
 def validation_report(report: Any) -> None:

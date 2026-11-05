@@ -448,6 +448,14 @@ and `git branch --list` with a closed set of flags and no `rev:path`, absolute o
 `git push origin fix-foo` is `ask`, no longer `hard_deny`. `node
 corpus/validation/validate.mjs` is no longer pre-approved: use the `validate` tool.
 
+**What reaches the terminal, and what an approval shows.** CLI output goes through a sink
+that keeps only colour sequences, with markup off; the cockpit renders untrusted text only
+through `SafeText`, and model links are shown, never clickable; `--json` escapes invisible
+and C1 characters. An `approval.request` carries `argv`, `cwd`, `effect_class`,
+`rule_source` (`built-in`, `workspace`, `classifier`), `payload_sha256` and
+`preview_complete`. The card shows all of them, labels a workspace rule's reason as
+workspace text, and refuses to approve a preview that is not complete.
+
 **What reaches the provider.** Every tool result is redacted (`panda_core.redact`) before
 it joins the conversation, as it is before the ledger. The system prompt names only the
 workspace folder. Workspace instructions are corpus data: `config.instructions` must name a
