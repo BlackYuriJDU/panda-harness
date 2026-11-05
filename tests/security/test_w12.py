@@ -373,12 +373,20 @@ def test_budget_exceeded_is_a_limit_exit_code() -> None:
     assert run_exit_code("budget_exceeded") == 7
 
 
+def _plain(text: str) -> str:
+    """Help text without ANSI styling (CI forces colour; Rich styles `--max` and `-tokens`)."""
+
+    import re
+
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+
+
 def test_run_accepts_budget_options() -> None:
     from typer.testing import CliRunner
 
     from panda_cli.main import app
 
-    out = CliRunner().invoke(app, ["run", "--help"], env={"COLUMNS": "200"}).output
+    out = _plain(CliRunner().invoke(app, ["run", "--help"], env={"COLUMNS": "200"}).output)
     assert "--max-tokens" in out and "--max-cost" in out
 
 
@@ -391,8 +399,9 @@ def test_session_help_does_not_promise_the_conversation_back(command) -> None:
 
     result = CliRunner().invoke(app, [*command, "--help"], env={"COLUMNS": "300"})
     assert result.exit_code == 0
-    assert "Continue" not in result.output
-    assert "without that session's conversation" in " ".join(result.output.split())
+    out = _plain(result.output)
+    assert "Continue" not in out
+    assert "without that session's conversation" in " ".join(out.split())
 
 
 # --------------------------------------------------------------------------- R2-120 / R2-115
