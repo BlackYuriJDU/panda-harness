@@ -7,10 +7,12 @@ them `<server>_<tool>`; with the server named `panda` they become
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from panda_core.errors import ConfigError, DependencyError, PandaError
 from panda_core.service import PandaService
@@ -70,66 +72,85 @@ def create_server(
         ) from exc
 
     server = FastMCP("panda", instructions=INSTRUCTIONS, host=host, port=port)
+    # R2-228: FastMCP calls a sync tool on its event loop, so a `validate` (corpus
+    # code, up to minutes) froze every client. Tools are async and run the service
+    # in a worker thread; one lock keeps ledger writes in order.
+    lock = threading.Lock()
+
+    async def call(fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        def locked() -> Any:
+            with lock:
+                return fn(*args, **kwargs)
+
+        return await asyncio.to_thread(locked)
 
     @server.tool()
-    def workspace_info() -> dict[str, Any]:
+    async def workspace_info() -> dict[str, Any]:
         """Return the workspace root, model, validator, policy, and session state."""
 
-        return service.workspace_info()
+        return cast(dict[str, Any], await call(service.workspace_info))
 
     @server.tool()
-    def validate(release: bool = False) -> dict[str, Any]:
+    async def validate(release: bool = False) -> dict[str, Any]:
         """Run the canonical corpus validator and return all check results.
 
         Args:
             release: Also enforce the public-face release checks.
         """
 
-        return service.validate(release=release)
+        return cast(dict[str, Any], await call(service.validate, release=release))
 
     @server.tool()
-    def policy_check(action: str, resource: str, approved: bool = False) -> dict[str, Any]:
+    async def policy_check(
+        action: str, resource: str, approved: bool = False
+    ) -> dict[str, Any]:
         """Evaluate the policy for one action/resource pair.
 
         Args:
-            action: read, write, edit, delete, shell, network, git, release, spend, or tool.
+            action: read, write, edit, shell or validate (enforced); other actions are
+                answered with enforced: false.
             resource: A workspace-relative path, shell command, or tool name.
             approved: Deprecated and ignored. An MCP client cannot approve an action.
         """
 
-        return service.policy_check(action, resource, approved=approved)
+        return cast(
+            dict[str, Any],
+            await call(service.policy_check, action, resource, approved=approved),
+        )
 
     @server.tool()
-    def study_list(
+    async def study_list(
         track: str | None = None, status: str | None = None
     ) -> list[dict[str, Any]]:
         """List registered studies, optionally filtered by track or status."""
 
-        return service.study_list(track=track, status=status)
+        return cast(
+            list[dict[str, Any]], await call(service.study_list, track=track, status=status)
+        )
 
     @server.tool()
-    def study_show(study_id: str) -> dict[str, Any]:
+    async def study_show(study_id: str) -> dict[str, Any]:
         """Return one study card, its frontmatter, and its body."""
 
-        return service.study_show(study_id)
+        return cast(dict[str, Any], await call(service.study_show, study_id))
 
     @server.tool()
-    def session_note(message: str) -> dict[str, Any]:
+    async def session_note(message: str) -> dict[str, Any]:
         """Append a durable note to the current provenance session."""
 
-        return service.note(message)
+        return cast(dict[str, Any], await call(service.note, message))
 
     @server.resource("panda://workspace")
-    def workspace_resource() -> str:
+    async def workspace_resource() -> str:
         """Workspace snapshot as JSON."""
 
-        return json.dumps(service.workspace_info(), ensure_ascii=False, indent=2)
+        return json.dumps(await call(service.workspace_info), ensure_ascii=False, indent=2)
 
     @server.resource("panda://studies")
-    def studies_resource() -> str:
+    async def studies_resource() -> str:
         """Study registry as JSON."""
 
-        return json.dumps(service.study_list(), ensure_ascii=False, indent=2)
+        return json.dumps(await call(service.study_list), ensure_ascii=False, indent=2)
 
     return server
 

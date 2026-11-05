@@ -206,6 +206,9 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   instead of an exception that ended the turn.
 - `grep` and `list_files` enumerate files and check the read policy per file in a worker
   thread, so a large tree no longer blocks the event loop (cockpit, MCP clients) (R2-216).
+- MCP tools and resources are async and run the service in a worker thread (one at a time,
+  so ledger writes stay ordered): a long `validate` no longer freezes the server for every
+  client (R2-228). The `policy_check` docstring lists the enforced actions.
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

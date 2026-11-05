@@ -548,3 +548,38 @@ def test_search_enumeration_runs_off_the_event_loop(workspace, monkeypatch, tool
     monkeypatch.setattr(tools, "_iter_files", spy)
     _call(_registry(workspace), tool, args)
     assert seen and all(ident != loop_thread for ident in seen)
+
+
+# --------------------------------------------------------------------------- R2-228
+def test_a_slow_mcp_tool_does_not_freeze_the_server_loop(workspace) -> None:
+    import asyncio
+    import time
+
+    pytest.importorskip("mcp.server.fastmcp")
+    from panda_core.mcp_server import create_server
+    from panda_core.service import PandaService
+
+    service = PandaService(workspace, autocreate_session=False)
+
+    def slow_validate(*, release: bool = False) -> dict:
+        time.sleep(0.6)
+        return {"ok": True}
+
+    service.validate = slow_validate  # type: ignore[method-assign]
+    server = create_server(service)
+
+    async def scenario() -> float:
+        ticks = 0
+
+        async def heartbeat() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        await server.call_tool("validate", {})
+        beat.cancel()
+        return ticks
+
+    assert asyncio.run(scenario()) >= 5  # the loop kept running while validate slept
