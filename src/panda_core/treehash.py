@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +33,10 @@ class TreeHash:
     truncated: bool
 
 
+# Only where st_ctime is the inode change time (POSIX).
+_CACHE_TRUSTED = sys.platform != "win32"
+
+
 def file_sha256(path: Path) -> str:
     sha = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -45,7 +50,10 @@ def tree_hash(root: Path, cache: dict[str, tuple[object, ...]] | None = None) ->
 
     `cache` maps a path to (ctime_ns, mtime_ns, size, inode, sha) to skip rehashing.
     ctime and the inode change on any write or replace and cannot be set back by
-    the writer, unlike mtime (R2-226).
+    the writer, unlike mtime (R2-226). Windows `os.stat` reports the creation
+    time as `st_ctime` and exposes no change time, so no stat field proves a
+    same-size rewrite with mtime put back; there the cache is not trusted and
+    every file is hashed.
     """
 
     base = root / SCOPE
@@ -67,7 +75,7 @@ def tree_hash(root: Path, cache: dict[str, tuple[object, ...]] | None = None) ->
                     continue
                 key = str(path)
                 identity = (stat.st_ctime_ns, stat.st_mtime_ns, stat.st_size, stat.st_ino)
-                hit = cache.get(key) if cache is not None else None
+                hit = cache.get(key) if cache is not None and _CACHE_TRUSTED else None
                 if hit and tuple(hit[:4]) == identity:
                     digest = str(hit[4])
                 else:

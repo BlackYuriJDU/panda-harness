@@ -445,6 +445,23 @@ def test_tree_hash_cache_is_not_fooled_by_a_restored_mtime(workspace) -> None:
     assert tree_hash(workspace.root, cache).digest != first
 
 
+def test_tree_hash_does_not_trust_the_cache_without_a_change_time(
+    workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import panda_core.treehash as treehash
+
+    path = workspace.root / "corpus" / "claims.md"
+    path.write_text("aaaa\n", encoding="utf-8")
+    cache: dict = {}
+    first = treehash.tree_hash(workspace.root, cache).digest
+    # A stale entry that matches the stat identity exactly, as on Windows, where
+    # st_ctime is the creation time and a rewrite leaves the identity unchanged.
+    key = str(path)
+    cache[key] = (*cache[key][:4], "0" * 64)
+    monkeypatch.setattr(treehash, "_CACHE_TRUSTED", False)
+    assert treehash.tree_hash(workspace.root, cache).digest == first
+
+
 def test_python_dash_m_ignores_panda_cli_portion_in_cwd(tmp_path: Path) -> None:
     import subprocess
 

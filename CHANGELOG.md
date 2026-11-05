@@ -124,7 +124,8 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   1 MB are refused instead of read whole.
 - Tree hash and packaging (R2-226, R2-313): `tree_sha256` no longer skips
   `corpus/node_modules`, `.venv` or `__pycache__` (code the validator can load), and its
-  cache keys on ctime and inode, which a writer cannot restore like mtime. `panda_cli` is
+  cache keys on ctime and inode, which a writer cannot restore like mtime; on Windows, where
+  `st_ctime` is the creation time, the cache is not used. `panda_cli` is
   a regular package, and the MCP command Panda writes runs `python -P -m panda_cli`, so a
   `panda_cli/` folder in a corpus cannot be imported.
 - Tool arguments (R2-401): only `required` was checked, so `replace_all: "false"` replaced
