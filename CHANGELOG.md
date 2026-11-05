@@ -162,6 +162,14 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   (`next_start_line` in the data); a line over 2 000 characters is cut and counted in
   `lines_cut`; a `start_line` past the end is an error instead of an empty `99-3` range.
   Any other tool's result over the budget is cut with a note and `result_truncated: true`.
+- Completeness signals (R2-402, R2-403, R2-413): `grep` counts only files against its
+  5 000-file cap and returns `search_complete`, `file_cap_reached`,
+  `files_skipped_too_large` and a `next_step`, so `count: 0` is not read as absence
+  after a partial search; `list_files` returns `truncated`; `claim_list` reports
+  `omitted_by_policy`/`omitted_links`/`omitted_too_large`, and `claim_show` of a card the
+  policy denies is a blocked result naming the rule, not "claim not found";
+  `evidence_list.total` counts the filtered records (the file total is
+  `records_in_file`).
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

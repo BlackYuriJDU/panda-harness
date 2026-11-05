@@ -489,7 +489,14 @@ def _numbers_records(path: Path) -> list[dict[str, Any]]:
     raise ToolInputError(f"{path.name} must contain a list or object of numbers")
 
 
-def _iter_files(root: Path, pattern: str, limit: int) -> list[Path]:
+def _iter_files(
+    root: Path, pattern: str, limit: int, *, files_only: bool = False
+) -> tuple[list[Path], bool]:
+    """Up to `limit` matches in sorted order, and whether more exist (R2-402, R2-413).
+
+    `files_only` counts only regular files, so directories do not use the cap.
+    """
+
     if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
         raise ToolInputError("pattern must be relative and stay inside the workspace")
     found: list[Path] = []
@@ -500,10 +507,29 @@ def _iter_files(root: Path, pattern: str, limit: int) -> list[Path]:
             continue
         if any(part in IGNORED_DIRS for part in relative.parts):
             continue
-        found.append(candidate)
+        if files_only and (candidate.is_symlink() or not candidate.is_file()):
+            continue
         if len(found) >= limit:
-            break
-    return found
+            return found, True
+        found.append(candidate)
+    return found, False
+
+
+GREP_FILE_CAP = 5_000
+
+
+def _grep_next_step(capped: bool, too_large: int) -> dict[str, str]:
+    if capped:
+        return {
+            "next_step": f"more than {GREP_FILE_CAP} files match the glob and the rest were "
+            "not searched; narrow glob (for example corpus/claims/**/*.md)"
+        }
+    if too_large:
+        return {
+            "next_step": f"{too_large} file(s) over {MAX_READ_BYTES} bytes were not "
+            "searched; a missing match there is not evidence of absence"
+        }
+    return {}
 
 
 def _readable_by_policy(ctx: ToolContext, root: Path, candidate: Path) -> bool:
@@ -683,7 +709,7 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        found = _iter_files(self.ctx.workspace.root, pattern, limit)
+        found, more = _iter_files(self.ctx.workspace.root, pattern, limit)
         entries: list[str] = []
         omitted = 0
         root = self.ctx.workspace.root
@@ -699,8 +725,11 @@ class ToolRegistry:
                 "pattern": pattern,
                 "count": len(entries),
                 "omitted_by_policy": omitted,
+                "truncated": more,
                 "entries": entries,
                 "rule": decision.rule_id if decision else None,
+                **({"next_step": f"more than {limit} entries match; raise limit "
+                    "(max 2000) or narrow the pattern"} if more else {}),
             },
         )
 
@@ -723,8 +752,13 @@ class ToolRegistry:
         omitted = 0
         root = self.ctx.workspace.root.resolve()
         candidates: list[list[object]] = []
-        for candidate in _iter_files(self.ctx.workspace.root, glob, 5_000):
-            if not candidate.is_file() or candidate.stat().st_size > MAX_READ_BYTES:
+        files, capped = _iter_files(
+            self.ctx.workspace.root, glob, GREP_FILE_CAP, files_only=True
+        )
+        too_large = 0
+        for candidate in files:
+            if candidate.stat().st_size > MAX_READ_BYTES:
+                too_large += 1
                 continue
             if not _readable_by_policy(self.ctx, root, candidate):
                 omitted += 1
@@ -771,6 +805,11 @@ class ToolRegistry:
                 "count": len(found["matches"]),
                 "matches": found["matches"],
                 "truncated": found["truncated"],
+                # R2-402: a count of 0 means "not found" only when the search was complete.
+                "search_complete": not (capped or too_large),
+                "files_skipped_too_large": too_large,
+                "file_cap_reached": capped,
+                **_grep_next_step(capped, too_large),
             },
         )
 
@@ -1149,7 +1188,10 @@ class ToolRegistry:
             {
                 "path": relative,
                 "count": len(summaries[:limit]),
-                "total": len(records),
+                # R2-413: `total` counts the matches, like claim_list; the file total is
+                # separate so a filter never reads as "more to page through".
+                "total": len(summaries),
+                "records_in_file": len(records),
                 "truncated": len(summaries) > limit,
                 "evidence": summaries[:limit],
             },
@@ -1168,21 +1210,31 @@ class ToolRegistry:
                 return _ok("evidence_show", {"path": relative, "evidence": record})
         raise ToolInputError(f"evidence not found: {evidence_id}")
 
-    def _claim_records(self) -> list[dict[str, Any]]:
+    def _claim_records(self) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Readable claim cards, and the cards left out keyed by file stem (R2-403).
+
+        The reason is `policy`, `link` or `too_large`; the caller reports them so a
+        missing claim is never mistaken for an absent one.
+        """
+
         directory = self.ctx.workspace.root / "corpus/claims"
         if not directory.is_dir():
             raise ToolInputError("claims directory not found: corpus/claims")
         records: list[dict[str, Any]] = []
+        omitted: dict[str, str] = {}
         root = self.ctx.workspace.root
         for path in sorted(directory.glob("*.md")):
             try:
                 ensure_plain_path(root, path)
             except ConfigError:
-                continue  # a link (SEC-011)
+                omitted[path.stem] = "link"  # SEC-011
+                continue
             if not _readable_by_policy(self.ctx, root, path):
+                omitted[path.stem] = "policy"
                 continue
             if path.stat().st_size > MAX_READ_BYTES:
-                continue  # a claim card larger than any readable file (R2-302)
+                omitted[path.stem] = "too_large"  # R2-302
+                continue
             text = path.read_text(encoding="utf-8", errors="replace")
             try:
                 frontmatter, body = parse_frontmatter(text)
@@ -1193,7 +1245,7 @@ class ToolRegistry:
             record["file"] = path.name
             record["body"] = body
             records.append(record)
-        return records
+        return records, omitted
 
     async def _claim_list(self, args: dict[str, Any]) -> ToolResult:
         _, blocked = await _authorize(
@@ -1201,7 +1253,7 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        records = self._claim_records()
+        records, omitted = self._claim_records()
         limit = _int_arg(args, "limit", default=100, minimum=1, maximum=1_000)
         summaries = [
             {
@@ -1221,6 +1273,9 @@ class ToolRegistry:
                 "count": len(summaries[:limit]),
                 "total": len(summaries),
                 "truncated": len(summaries) > limit,
+                "omitted_by_policy": sum(1 for why in omitted.values() if why == "policy"),
+                "omitted_links": sum(1 for why in omitted.values() if why == "link"),
+                "omitted_too_large": sum(1 for why in omitted.values() if why == "too_large"),
                 "claims": summaries[:limit],
             },
         )
@@ -1232,11 +1287,25 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        for record in self._claim_records():
+        records, omitted = self._claim_records()
+        for record in records:
             if _record_id(record, ("claim_id", "id")) == claim_id:
                 payload = dict(record)
                 payload["body"] = _cap(str(payload.get("body", "")), 8_000)
                 return _ok("claim_show", {"claim": payload})
+        why = omitted.get(claim_id)
+        if why == "policy":
+            decision = self.ctx.policy.decide("read", f"corpus/claims/{claim_id}.md")
+            return _blocked("claim_show", decision, "policy denies reading this claim card")
+        if why == "link":
+            raise ToolInputError(f"claim card {claim_id}.md is a link and is not read")
+        if why == "too_large":
+            raise ToolInputError(f"claim card {claim_id}.md is larger than {MAX_READ_BYTES} bytes")
+        if omitted:
+            raise ToolInputError(
+                f"claim not found: {claim_id} ({len(omitted)} card(s) were not readable; "
+                "their ids are taken from the file name only)"
+            )
         raise ToolInputError(f"claim not found: {claim_id}")
 
     def _numbers_path(self) -> tuple[Path, str]:

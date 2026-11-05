@@ -127,3 +127,79 @@ def test_read_file_past_the_end_is_an_error(workspace) -> None:
     result = _call(_registry(workspace), "read_file", {"path": "corpus/short.md",
                                                        "start_line": 99})
     assert not result.ok and "start_line 99 is past the end (3 lines)" in result.content
+
+
+# --------------------------------------------------------------------------- R2-402/403/413
+def test_grep_says_when_the_file_cap_hid_part_of_the_search(workspace, monkeypatch) -> None:
+    import panda_core.tools as tools
+
+    monkeypatch.setattr(tools, "GREP_FILE_CAP", 5)
+    corpus = workspace.root / "corpus"
+    for n in range(4):
+        (corpus / f"dir{n}").mkdir()  # directories no longer use the cap
+    for n in range(8):
+        (corpus / f"f{n}.md").write_text("NEEDLE\n" if n == 7 else "hay\n", encoding="utf-8")
+    result = _call(_registry(workspace), "grep", {"pattern": "NEEDLE", "glob": "corpus/**/*"})
+    assert result.data["count"] == 0
+    assert result.data["search_complete"] is False and result.data["file_cap_reached"] is True
+    assert "narrow glob" in result.data["next_step"]
+    assert result.data["files_scanned"] == 5
+
+
+def test_grep_reports_a_complete_search(workspace) -> None:
+    (workspace.root / "corpus" / "a.md").write_text("NEEDLE\n", encoding="utf-8")
+    result = _call(_registry(workspace), "grep", {"pattern": "NEEDLE"})
+    assert result.data["search_complete"] is True and "next_step" not in result.data
+
+
+def test_list_files_says_when_more_entries_exist(workspace) -> None:
+    for n in range(7):
+        (workspace.root / "corpus" / f"x{n}.md").write_text("x", encoding="utf-8")
+    result = _call(_registry(workspace), "list_files", {"pattern": "corpus/x*", "limit": 5})
+    assert result.data["count"] == 5 and result.data["truncated"] is True
+    whole = _call(_registry(workspace), "list_files", {"pattern": "corpus/x*", "limit": 7})
+    assert whole.data["truncated"] is False
+
+
+def _claims(workspace):
+    claims = workspace.root / "corpus" / "claims"
+    claims.mkdir(parents=True, exist_ok=True)
+    (claims / "c-open.md").write_text("---\nclaim_id: c-open\n---\nbody\n", encoding="utf-8")
+    (claims / "c-secret.md").write_text("---\nclaim_id: c-secret\n---\nx\n", encoding="utf-8")
+    policy = json.loads((workspace.root / ".panda" / "policy.json").read_text("utf-8"))
+    policy["rules"].append({"id": "deny-secret-claim", "effect": "deny",
+                               "actions": ["read"], "resources": ["corpus/claims/c-secret.md"],
+                               "reason": "test"})
+    (workspace.root / ".panda" / "policy.json").write_text(json.dumps(policy), "utf-8")
+
+
+def _workspace_registry(workspace):
+    from panda_core.policy import engine_for, load_policy_or_default
+    from panda_core.tools import ToolContext, ToolRegistry
+
+    policy, from_file = load_policy_or_default(workspace.policy_path)
+    engine = engine_for(workspace, policy, from_file=from_file)
+    return ToolRegistry(ToolContext(workspace=workspace, policy=engine))
+
+
+def test_claim_list_counts_cards_hidden_by_policy(workspace) -> None:
+    _claims(workspace)
+    result = _call(_workspace_registry(workspace), "claim_list", {})
+    assert result.data["total"] == 1 and result.data["omitted_by_policy"] == 1
+
+
+def test_claim_show_of_a_denied_card_is_blocked_not_missing(workspace) -> None:
+    _claims(workspace)
+    result = _call(_workspace_registry(workspace), "claim_show", {"claim_id": "c-secret"})
+    assert result.blocked and result.data["rule"] == "deny-secret-claim"
+    assert "x\n" not in result.content
+
+
+def test_evidence_list_total_counts_the_filtered_records(workspace) -> None:
+    lines = [{"evidence_id": f"e{n}", "study_id": "s1" if n < 2 else "s2"} for n in range(5)]
+    evidence = workspace.root / "corpus" / "evidence" / "evidence.jsonl"
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    result = _call(_registry(workspace), "evidence_list", {"study_id": "s1"})
+    assert result.data["total"] == 2 and result.data["records_in_file"] == 5
