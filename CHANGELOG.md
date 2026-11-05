@@ -200,6 +200,10 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   renamed `<id>_<n>` (with its result) before any protocol sees the history, and the
   OpenAI chat protocol now gets the same pairing as the others: a call without a result
   gets `[no result was recorded for this tool call]`, and an orphaned result is dropped.
+- Robustness (R2-119, R2-121): `edit_file` refuses a bare carriage return in
+  `old_string`/`new_string` instead of writing mixed line endings, and tool arguments
+  nested deeply enough to exhaust the JSON parser are an invalid-arguments tool result
+  instead of an exception that ended the turn.
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

@@ -965,11 +965,14 @@ class ToolCall:
             return {}
         try:
             value = json.loads(self.arguments)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # R2-121: nesting deep enough to exhaust the parser's recursion is a bad
+            # argument like any other, not a crash of the turn.
+            message = exc.msg if isinstance(exc, json.JSONDecodeError) else type(exc).__name__
             raise ProviderError(
                 f"model returned invalid JSON arguments for tool {self.name}",
                 hint="the tool call was not executed; retry the turn",
-                details={"tool": self.name, "error": exc.msg},
+                details={"tool": self.name, "error": message},
             ) from exc
         if not isinstance(value, dict):
             raise ProviderError(

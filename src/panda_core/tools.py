@@ -1068,6 +1068,13 @@ class ToolRegistry:
         ending = _line_ending(text)
         before = text.replace(ending, "\n") if ending != "\n" else text
         old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
+        if "\r" in new or "\r" in old:
+            # R2-119: a bare CR would give the file mixed line endings, and the next
+            # edit would be refused.
+            raise ToolInputError(
+                "old_string/new_string contain a bare carriage return (\\r); use \\n for "
+                "line breaks (the file's own line ending is kept)"
+            )
         count = before.count(old)
         if count == 0:
             raise ToolInputError("old_string was not found; read the file before editing")

@@ -494,3 +494,36 @@ def test_neg_a_well_formed_chat_history_is_unchanged() -> None:
     history = [{"role": "user", "content": "go"}, _call_msg("c1"), _result("c1", "A"),
                {"role": "assistant", "content": "done"}]
     assert sanitize_messages_for_openai(history) == history
+
+
+# --------------------------------------------------------------------------- R2-119 / R2-121
+def test_edit_refuses_a_bare_carriage_return(workspace) -> None:
+    path = workspace.root / "corpus" / "lf.md"
+    path.write_bytes(b"one\ntwo\n")
+    result = _call(_registry(workspace), "edit_file",
+                   {"path": "corpus/lf.md", "old_string": "two", "new_string": "2\r3"})
+    assert not result.ok and "bare carriage return" in result.content
+    assert path.read_bytes() == b"one\ntwo\n"
+
+
+def test_neg_crlf_in_new_string_is_still_normalised(workspace) -> None:
+    path = workspace.root / "corpus" / "lf.md"
+    path.write_bytes(b"one\ntwo\n")
+    result = _call(_registry(workspace), "edit_file",
+                   {"path": "corpus/lf.md", "old_string": "two", "new_string": "2\r\n3"})
+    assert result.ok and path.read_bytes() == b"one\n2\n3\n"
+
+
+def test_deeply_nested_arguments_are_a_tool_error_not_a_crash(workspace) -> None:
+    import asyncio
+
+    from panda_core.provider import DoneEvent, TextDelta, ToolCall
+
+    nested = '{"path": ' + "[" * 100_000 + "]" * 100_000 + "}"
+    call = ToolCall(id="c1", name="read_file", arguments=nested)
+    agent, _, _ = _agent(workspace, [[DoneEvent(finish_reason="tool_calls", tool_calls=(call,))],
+                                     [TextDelta("ok"), DoneEvent(finish_reason="stop")]])
+    result = asyncio.run(agent.run_turn("go"))
+    assert result.status == "completed"
+    tool_message = next(m for m in agent.messages if m.get("role") == "tool")
+    assert "invalid JSON arguments" in tool_message["content"]
