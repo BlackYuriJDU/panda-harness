@@ -192,6 +192,10 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
 - `--session` help (R2-407) on `panda`, `panda run` and `panda chat` no longer says
   "continue": it appends to the session's ledger, and the model starts without that
   session's conversation.
+- Stream endings (R2-120, R2-115): `[DONE]` no longer completes an Anthropic, Responses or
+  Google stream cut off mid-tool-call, and stop reasons are an allowlist (`stop`,
+  `tool_calls`, `function_call`, `end_turn`): an unknown one, or a context-window
+  overflow, makes the turn `incomplete` and its tool calls are not run.
 - `git_state()["dirty"]` is now `None` (unknown) everywhere: only git can compute it,
   and running git on a corpus is what R2-106 was about. `panda status`, `doctor` and
   the cockpit header show the branch and commit without a dirty marker.

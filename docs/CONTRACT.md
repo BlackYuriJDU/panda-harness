@@ -242,10 +242,14 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   tool runs, with a session-integrity error (exit `4`). The turn ends with status
   `ledger_failed` when the ledger still accepts that final event. There is no
   degraded mode.
-- **A cut-off answer is not `completed`.** When the provider stops with
-  `length`, `max_tokens`, `content_filter`, `refusal` or `incomplete`, the turn
-  status is `incomplete` and `turn.end` carries `finish_reason`. Tool calls from a
-  cut-off step are dropped, not executed, because their arguments may be truncated.
+- **A cut-off answer is not `completed`.** Only `stop`, `tool_calls`,
+  `function_call` and `end_turn` (after each protocol's own mapping) end a step
+  normally. Any other stop reason (`length`, `content_filter`, a context-window
+  overflow, one Panda does not know) makes the turn `incomplete`, and `turn.end`
+  carries `finish_reason`. Tool calls from such a step are dropped, not executed,
+  because their arguments may be truncated. `data: [DONE]` ends only an OpenAI chat
+  stream; on the Anthropic, Responses and Google protocols a stream without its own
+  terminal event is an error.
 - **A turn that runs out of steps still answers.** Before its last step the model
   is told it is the last one that can run tools; when the steps are used up, the
   harness asks once more for a summary (a `harness.note`) and runs none of the tool

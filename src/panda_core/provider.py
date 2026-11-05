@@ -1486,7 +1486,9 @@ class OpenCodeProvider:
                     )
                 async for data in _sse_data(response):
                     if data == "[DONE]":
-                        terminal = True
+                        # R2-120: `[DONE]` ends an OpenAI chat stream only. Here the end
+                        # is the protocol's own terminal event; without it the stream was
+                        # cut off, whatever sentinel follows.
                         break
                     try:
                         chunk = json.loads(data)
@@ -1652,7 +1654,9 @@ class OpenCodeProvider:
                     )
                 async for data in _sse_data(response):
                     if data == "[DONE]":
-                        terminal = True
+                        # R2-120: `[DONE]` ends an OpenAI chat stream only. Here the end
+                        # is the protocol's own terminal event; without it the stream was
+                        # cut off, whatever sentinel follows.
                         break
                     try:
                         chunk = json.loads(data)
@@ -1844,7 +1848,9 @@ class OpenCodeProvider:
                     )
                 async for data in _sse_data(response):
                     if data == "[DONE]":
-                        terminal = True
+                        # R2-120: `[DONE]` ends an OpenAI chat stream only. Here the end
+                        # is the protocol's own terminal event; without it the stream was
+                        # cut off, whatever sentinel follows.
                         break
                     try:
                         chunk = json.loads(data)

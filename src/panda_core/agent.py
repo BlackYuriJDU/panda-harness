@@ -133,7 +133,10 @@ class TurnResult:
         }
 
 KEEP_RECENT_MESSAGES = 6
-INCOMPLETE_REASONS = frozenset({"length", "max_tokens", "content_filter", "incomplete", "refusal"})
+# R2-115: an allowlist of normal endings. Any other stop reason (a new one, a
+# context-window overflow, a malformed tool call) is incomplete, and its tool calls
+# are not run.
+COMPLETE_REASONS = frozenset({"stop", "tool_calls", "function_call", "end_turn"})
 
 
 def _shrink(value: Any, *, limit: int = LOG_STRING_LIMIT) -> Any:
@@ -620,7 +623,7 @@ class Agent:
                     self._handle_provider_event(event, step_parts, usage_box, calls, finish_box)
                 step_usage = usage_box[0]
                 dropped = 0
-                if finish_box[0] in INCOMPLETE_REASONS:
+                if finish_box[0] is not None and finish_box[0] not in COMPLETE_REASONS:
                     # Cut off by the provider (AGT-003): tool-call arguments may be
                     # truncated, so none of them is run or kept in the history.
                     status, finish_reason = "incomplete", finish_box[0]

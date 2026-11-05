@@ -393,3 +393,57 @@ def test_session_help_does_not_promise_the_conversation_back(command) -> None:
     assert result.exit_code == 0
     assert "Continue" not in result.output
     assert "without that session's conversation" in " ".join(result.output.split())
+
+
+# --------------------------------------------------------------------------- R2-120 / R2-115
+def _anthropic_cut_after_tool_use():
+    from tests.test_provider import anthropic_sse
+
+    return anthropic_sse(
+        {"type": "message_start", "message": {"usage": {"input_tokens": 3}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "tool_use", "id": "t1", "name": "run_shell", "input": {}}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "input_json_delta", "partial_json": '{"argv": ["rm", "-'}},
+    ) + "data: [DONE]\n\n"
+
+
+def test_done_sentinel_does_not_complete_an_anthropic_stream() -> None:
+    import asyncio
+
+    import httpx
+    from tests.test_provider import collect, provider_with
+
+    from panda_core.errors import PandaError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_anthropic_cut_after_tool_use())
+
+    provider = provider_with(handler, model="claude-haiku-5-5")
+    with pytest.raises(PandaError, match="without a terminal event"):
+        asyncio.run(collect(provider))
+
+
+@pytest.mark.parametrize("reason", ["model_context_window_exceeded", "malformed_response",
+                                    "something_new"])
+def test_an_unknown_stop_reason_is_incomplete_and_runs_no_tool(workspace, reason) -> None:
+    import asyncio
+
+    from panda_core.provider import DoneEvent, ToolCall
+
+    call = ToolCall(id="c1", name="read_file", arguments='{"path":"README.md"}')
+    agent, session, _ = _agent(
+        workspace, [[DoneEvent(finish_reason=reason, tool_calls=(call,))]])
+    result = asyncio.run(agent.run_turn("go"))
+    assert result.status == "incomplete" and result.tool_calls == 0
+    assert '"type":"tool.result"' not in session.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("reason", ["stop", "tool_calls", "end_turn"])
+def test_neg_normal_stop_reasons_still_complete(workspace, reason) -> None:
+    import asyncio
+
+    from panda_core.provider import DoneEvent, TextDelta
+
+    agent, _, _ = _agent(workspace, [[TextDelta("ok"), DoneEvent(finish_reason=reason)]])
+    assert asyncio.run(agent.run_turn("go")).status == "completed"
