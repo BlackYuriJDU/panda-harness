@@ -39,8 +39,41 @@ _GIT_BRANCH_REF = re.compile(r"refs/heads/[A-Za-z0-9._/+-]{1,200}")
 
 
 def _candidates(start: Path) -> list[Path]:
+    """Directories searched for a workspace: `start`, then ancestors Panda may adopt.
+
+    R2-300 (git's CVE-2022-24765 class): climbing every ancestor adopted a `.panda/`
+    planted in a shared directory (`/tmp`, `C:\\`). The search now stops at the
+    user's home, never adopts a filesystem root above `start`, and on POSIX never
+    climbs into a directory owned by another user.
+    """
+
     current = start.resolve()
-    return [current, *current.parents]
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        home = None
+    found = [current]
+    if current == home:
+        return found
+    for parent in current.parents:
+        if parent == Path(parent.anchor):
+            break
+        if not _owned_by_user(parent):
+            break
+        found.append(parent)
+        if parent == home:
+            break
+    return found
+
+
+def _owned_by_user(path: Path) -> bool:
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:  # Windows: ownership is not in st_uid; the root/home limits apply
+        return True
+    try:
+        return path.stat().st_uid == getuid()
+    except OSError:
+        return False
 
 
 def find_workspace_root(start: Path | None = None) -> Path | None:

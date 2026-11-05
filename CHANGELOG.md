@@ -95,6 +95,14 @@ causes, not single routes, and each bypass becomes a permanent adversarial case.
   comes from (a workspace rule's reason is labelled as workspace text) and the payload's
   SHA-256, which is also written to `approval.request`. A diff is shown whole up to 200 000
   characters; a truncated preview cannot be approved in the cockpit or the REPL.
+- Workspace discovery (R2-300): the search for `.panda/config.json` climbed every
+  ancestor, so a `.panda/` planted in `/tmp` or `C:\` became the workspace of anyone below
+  it (the git CVE-2022-24765 class). It now stops at the user's home, never adopts a
+  filesystem root above the start directory, and on POSIX never climbs into a directory
+  owned by another user.
+- `panda init` (R2-305): it followed links shipped by the corpus, creating files outside
+  the workspace and, with `--force`, overwriting a link's target and copying it into
+  `.panda/backups/`. Init now refuses when any path it touches is a link.
 - Validator closure (R2-105, R2-210): the configured validator, its directory,
   `node_modules/`, `package.json` and `.npmrc` (root and `corpus/`), and nested
   `*/.panda/*` and `*/corpus/validation/*` are floor `hard_deny` for writes.
