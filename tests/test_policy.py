@@ -58,7 +58,9 @@ def test_secret_reads_are_hard_denied_even_with_approval() -> None:
 def test_shell_readonly_allowed_and_push_asks() -> None:
     engine = PolicyEngine(default_policy())
     assert engine.decide("shell", "git status --short").effect == "allow"
-    assert engine.decide("shell", "node corpus/validation/validate.mjs").effect == "allow"
+    # SEC-002: running the validator through the shell is no longer pre-approved;
+    # the `validate` tool is the way (RESULT.md SEC-002, WAVE-CARDS W1).
+    assert engine.decide("shell", "node corpus/validation/validate.mjs").effect == "ask"
     assert engine.decide("shell", "git push origin main").effect == "ask"
 
 

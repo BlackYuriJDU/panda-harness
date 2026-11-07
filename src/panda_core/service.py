@@ -6,18 +6,40 @@ adapter) means the same rules apply regardless of the client.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
+from collections.abc import Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from panda_core.errors import PandaError
-from panda_core.policy import PolicyEngine, load_policy_or_default
+from panda_core import errors
+from panda_core.errors import PandaError, PolicyDenied, SessionIntegrityError
+from panda_core.policy import ENFORCED_ACTIONS, engine_for, load_policy_or_default
 from panda_core.provider import status_snapshot
-from panda_core.registry import find_study, load_registry, load_study_card
 from panda_core.session import SessionLog, list_sessions
-from panda_core.validator import Validator
+from panda_core.tools import ToolContext, ToolRegistry, ToolResult
 from panda_core.workspace import Workspace
+
+_ERROR_CLASSES: dict[str, type[PandaError]] = {
+    errors.ConfigError.code: errors.ConfigError,
+    errors.DependencyError.code: errors.DependencyError,
+    errors.ProtocolError.code: errors.ProtocolError,
+    errors.ExecutionTimeout.code: errors.ExecutionTimeout,
+    errors.UsageError.code: errors.UsageError,
+}
+
+
+def _run(coro: Coroutine[Any, Any, ToolResult]) -> ToolResult:
+    """Run a coroutine from sync code, also when an event loop is already running."""
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 class PandaService:
@@ -70,18 +92,54 @@ class PandaService:
                     "mcp.connect",
                     {"cwd": str(Path.cwd()), "pid": os.getpid()},
                 )
-            except (PandaError, OSError):
+            except (PandaError, OSError) as exc:
                 self.session = None
-                return False
+                raise SessionIntegrityError(
+                    f"cannot create the MCP session ledger: {exc}",
+                    hint="free disk space or fix .panda/sessions; the tool did not run",
+                ) from exc
         if self.session is None:
             return False
         try:
             self.session.append(event_type, data)
             return True
-        except (PandaError, OSError):
-            # Read-only tools remain usable if provenance is unavailable; the
-            # tool result tells the client that it was not logged.
-            return False
+        except SessionIntegrityError:
+            raise
+        except (PandaError, OSError) as exc:
+            raise SessionIntegrityError(
+                f"cannot write the session ledger ({event_type}): {exc}",
+                hint="run `panda session verify`; the result was not returned",
+            ) from exc
+
+    def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run a tool through the same registry and policy the agent uses (MCP-002).
+
+        MCP has no approver, so an `ask` is denied exactly as in `panda run`
+        without `--auto`. A denial is recorded and raised; a tool error is raised
+        with its original class.
+        """
+
+        policy, from_file = load_policy_or_default(self.workspace.policy_path)
+        registry = ToolRegistry(
+            ToolContext(
+                workspace=self.workspace,
+                policy=engine_for(self.workspace, policy, from_file=from_file),
+                session=self.session,
+                approve=None,
+            )
+        )
+        result = _run(registry.call(name, arguments))
+        data = dict(result.data)
+        if result.blocked:
+            keys = ("tool", "action", "resource", "effect", "rule", "reason")
+            self._record("policy.decision", {key: data.get(key) for key in keys})
+            raise PolicyDenied(
+                f"{name} denied by policy", hint=str(data.get("reason") or ""), details=data
+            )
+        if "error" in data:
+            error_class = _ERROR_CLASSES.get(str(data.get("code")), PandaError)
+            raise error_class(str(data["error"]))
+        return data
 
     @property
     def session_id(self) -> str | None:
@@ -113,29 +171,24 @@ class PandaService:
 
     def validate(self, *, release: bool = False) -> dict[str, Any]:
         logged = self._record("tool.call", {"tool": "validate", "release": release})
-        validator = Validator(
-            self.workspace.root,
-            script=self.workspace.validator_path,
-            node=self.workspace.config.node,
-            min_major=self.workspace.config.node_min_major,
-            timeout=self.workspace.config.timeouts.validate_seconds,
-        )
-        report = validator.run(release=release)
-        payload = report.to_dict()
+        payload = self._call_tool("validate", {"release": release})
+        payload.pop("tool", None)
         payload["session_logged"] = logged
+        summary = payload["summary"]
         self._record(
             "validate.result",
             {
-                "ok": report.ok,
-                "release_mode": report.release_mode,
-                "passed": report.passed,
-                "failed": report.failed,
-                "skipped": report.skipped,
+                "ok": payload["ok"],
+                "release_mode": payload["release_mode"],
+                "passed": summary["passed"],
+                "failed": summary["failed"],
+                "skipped": summary["skipped"],
                 "failed_checks": [
-                    check.name
-                    for check in report.checks
-                    if not check.ok and not check.skipped
+                    check["name"]
+                    for check in payload["checks"]
+                    if not check["ok"] and not check["skipped"]
                 ],
+                "validator_sha256": payload.get("validator_sha256"),
             },
         )
         return payload
@@ -144,16 +197,21 @@ class PandaService:
         self, action: str, resource: str, *, approved: bool = False
     ) -> dict[str, Any]:
         policy, from_file = load_policy_or_default(self.workspace.policy_path)
-        engine = PolicyEngine(policy, root=self.workspace.root)
+        engine = engine_for(self.workspace, policy, from_file=from_file)
         normalized = resource
         if action in {"read", "write", "edit", "delete"} and resource:
             normalized = self.workspace.relative_resource(resource)
         decision = engine.decide(action, normalized)
-        if approved and decision.effect == "ask":
-            decision = engine.authorize(action, normalized, approved=True)
+        # `approved` is deprecated and ignored: an MCP client is not an approver, and
+        # it used to turn an `ask` (even `git push`) into a logged allow (R2-406).
         payload = decision.to_dict()
         payload["policy_source"] = "file" if from_file else "built-in default"
-        payload["approved"] = approved
+        # R2-410: say whether any tool applies this action; a planned action's rule
+        # describes a control that does not exist yet.
+        payload["enforced"] = action in ENFORCED_ACTIONS
+        payload["approved"] = False
+        if approved:
+            payload["deprecated"] = "approved is ignored; approval needs a person"
         self._record(
             "policy.decision",
             {
@@ -162,7 +220,8 @@ class PandaService:
                 "effect": decision.effect,
                 "rule_id": decision.rule_id,
                 "risk": decision.risk,
-                "approved": approved,
+                "approved": False,
+                "approved_requested": approved,
             },
         )
         return payload
@@ -170,23 +229,19 @@ class PandaService:
     def study_list(
         self, *, track: str | None = None, status: str | None = None
     ) -> list[dict[str, Any]]:
-        studies = [study.to_dict() for study in load_registry(self.workspace.root)]
+        # Through the registry, like the agent: the read policy on INDEX.md applies
+        # and the call is recorded by the same path (R2-118, MCP-002 parity).
+        arguments: dict[str, Any] = {}
         if track:
-            studies = [study for study in studies if study["track"] == track]
+            arguments["track"] = track
         if status:
-            studies = [study for study in studies if study["status"] == status]
-        self._record(
-            "tool.call",
-            {"tool": "study_list", "track": track, "status": status, "count": len(studies)},
-        )
-        return studies
+            arguments["status"] = status
+        data = self._call_tool("study_list", arguments)
+        return list(data.get("studies", []))
 
     def study_show(self, study_id: str) -> dict[str, Any]:
-        study = find_study(self.workspace.root, study_id)
-        card = load_study_card(study)
-        payload = study.to_dict()
-        payload["frontmatter"] = card["frontmatter"]
-        payload["body"] = card["body"][:8000]
+        data = self._call_tool("study_show", {"study_id": study_id})
+        payload = {key: value for key, value in data.items() if key not in {"ok", "tool"}}
         self._record("tool.call", {"tool": "study_show", "study_id": study_id})
         return payload
 

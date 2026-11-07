@@ -72,27 +72,25 @@ def test_git_state_without_repo(fake_corpus: Path) -> None:
     assert workspace.git_state()["repo"] is False
 
 
-def test_git_state_uses_one_subprocess(
+def test_git_state_reads_files_without_a_subprocess(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "repo"
-    (root / ".git").mkdir(parents=True)
+    (root / ".git" / "refs" / "heads").mkdir(parents=True)
+    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    oid = "a" * 40
+    (root / ".git" / "refs" / "heads" / "main").write_text(oid + "\n", encoding="utf-8")
     workspace = Workspace.from_root(root)
-    calls: list[list[str]] = []
 
-    class Result:
-        stdout = "# branch.oid abc123\n# branch.head main\n1 .M N... 100644 0 0 x\n"
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("git_state must not start a process (R2-106)")
 
-    def fake_run(args: list[str], **kwargs: object) -> Result:
-        calls.append(args)
-        return Result()
-
-    monkeypatch.setattr("panda_core.workspace.subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.run", refuse)
+    monkeypatch.setattr("subprocess.Popen", refuse)
 
     state = workspace.git_state()
 
-    assert state == {"repo": True, "commit": "abc123", "branch": "main", "dirty": True}
-    assert calls == [["git", "status", "--porcelain=v2", "--branch"]]
+    assert state == {"repo": True, "commit": oid, "branch": "main", "dirty": None}
 
 
 def test_node_version_is_cached(

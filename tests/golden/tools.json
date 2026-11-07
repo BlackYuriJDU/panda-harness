@@ -1,0 +1,419 @@
+[
+  {
+    "description": "Describe the workspace: root, provider and model, validator, policy source, registered studies, active study and session id. Call it first when you need to know what this corpus is; it reads no file contents.",
+    "name": "workspace_info",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Read a UTF-8 text file inside the workspace. Each line comes back as '<number>  <text>'; the number and the two spaces are not part of the file, so never copy them into edit_file. Long results stop early and end with the start_line to continue from; lines over 2000 characters are cut. Files over 1 MiB are refused (use grep). Secret files are denied by policy.",
+    "name": "read_file",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "max_lines": {
+          "default": 400,
+          "description": "Maximum number of lines to return (1-2000).",
+          "maximum": 2000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "path": {
+          "description": "Workspace-relative path, e.g. corpus/claims/c1.md.",
+          "type": "string"
+        },
+        "start_line": {
+          "default": 1,
+          "description": "First line to return (1-based). Use the next_start_line of a truncated read to continue.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "List workspace paths matching a glob (directories end with '/'). '*' matches the top level only; use '**/*' or 'corpus/**/*.md' to recurse. VCS, virtualenv, cache and dependency directories are skipped, and paths the read policy denies are counted in omitted_by_policy, not listed. truncated: true means more paths match than limit.",
+    "name": "list_files",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 200,
+          "description": "Return at most this many paths (1-2000).",
+          "maximum": 2000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pattern": {
+          "default": "*",
+          "description": "Glob relative to the workspace root.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Search text files with a Python regular expression; each match is 'path:line: text' (text cut at 300 characters). Case-insensitive unless case_sensitive is true. Searches at most 5000 files and skips files over 1 MiB: when search_complete is false, count 0 is not evidence of absence; narrow the glob. Stops after 10 s; use fixed_strings for literal text.",
+    "name": "grep",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "case_sensitive": {
+          "default": false,
+          "description": "Match case exactly.",
+          "type": "boolean"
+        },
+        "fixed_strings": {
+          "default": false,
+          "description": "Treat pattern as literal text, not a regex.",
+          "type": "boolean"
+        },
+        "glob": {
+          "default": "**/*",
+          "description": "Which files to search, relative to the root.",
+          "type": "string"
+        },
+        "max_matches": {
+          "default": 100,
+          "description": "Return at most this many matching lines (1-1000).",
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pattern": {
+          "description": "Regular expression (or literal text with fixed_strings).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "List the studies registered in corpus/studies/INDEX.md, optionally filtered by track or status. Use study_show for one study's card.",
+    "name": "study_list",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Only studies with this status.",
+          "enum": [
+            "planned",
+            "active",
+            "done"
+          ],
+          "type": "string"
+        },
+        "track": {
+          "description": "Only studies on this track.",
+          "enum": [
+            "public",
+            "simulated",
+            "real"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Show one registered study card: its frontmatter and body.",
+    "name": "study_show",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "study_id": {
+          "description": "The study id from study_list, exactly as listed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "study_id"
+      ],
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Run the corpus's own validator (Node) and return its JSON report. Run it after edits and before claiming the corpus is consistent; a failing report lists each error with its file.",
+    "name": "validate",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "release": {
+          "default": false,
+          "description": "Pass --release to the validator, which runs the release checks the corpus defines.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Ask what the policy would decide for an action before trying it: allow, ask (needs the user's approval), deny or hard_deny, with the rule. It changes nothing and grants nothing. Use it to explain a block, not to look for another route around one.",
+    "name": "policy_check",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "description": "read, write or edit a path; shell a command; validate the corpus.",
+          "enum": [
+            "edit",
+            "read",
+            "shell",
+            "validate",
+            "write"
+          ],
+          "type": "string"
+        },
+        "resource": {
+          "description": "Workspace-relative path, or the command line for shell.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "action",
+        "resource"
+      ],
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Append a short observation to the session ledger (hash-chained, kept after the session). Use it for decisions and findings worth auditing later, not for chat. At most 4000 characters are kept.",
+    "name": "session_note",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "message": {
+          "description": "The note to record.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Create a file or replace it with the full new content (up to 2 MiB). Prefer edit_file for changes to an existing file. Writes are checked against the policy: some paths ask the user (they see a diff), some are always denied (.git, .panda, the validator). Content must not contain the [redacted] marker that stands for a hidden secret.",
+    "name": "write_file",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "The complete file content (UTF-8).",
+          "type": "string"
+        },
+        "path": {
+          "description": "Workspace-relative path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "read_only": false
+  },
+  {
+    "description": "Replace an exact string in an existing UTF-8 file. old_string must match the file text exactly (without read_file's line-number prefix) and occur once, unless replace_all is true; include surrounding lines to make it unique. Line endings are kept. Checked against the policy like write_file.",
+    "name": "edit_file",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "new_string": {
+          "description": "Replacement text.",
+          "type": "string"
+        },
+        "old_string": {
+          "description": "Exact text to replace; must not be empty.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Workspace-relative path.",
+          "type": "string"
+        },
+        "replace_all": {
+          "default": false,
+          "description": "Replace every occurrence instead of exactly one.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "old_string",
+        "new_string"
+      ],
+      "type": "object"
+    },
+    "read_only": false
+  },
+  {
+    "description": "Run one program with an argv array. There is no shell: pipes, globs, redirection, '&&' and variables are not interpreted (pass each argument as its own string). The environment is cleaned of credentials. Most commands ask the user first; destructive ones (force-push, rm -rf, git reset --hard) are always denied. stdout and stderr are each cut at about 15000 characters.",
+    "name": "run_shell",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "argv": {
+          "description": "Program and arguments, e.g. [\"pytest\", \"-q\"].",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cwd": {
+          "default": ".",
+          "description": "Working directory, relative to the root.",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 60,
+          "description": "Stop the command after this many seconds.",
+          "maximum": 600,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "argv"
+      ],
+      "type": "object"
+    },
+    "read_only": false
+  },
+  {
+    "description": "List evidence records from corpus/evidence/evidence.jsonl (id, study, track, source path and line, license). total counts the records that match the filter.",
+    "name": "evidence_list",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 100,
+          "description": "Return at most this many records (1-1000).",
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "study_id": {
+          "description": "Only evidence for this study.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Show one full evidence record from corpus/evidence/evidence.jsonl.",
+    "name": "evidence_show",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "description": "The evidence id from evidence_list, exactly as listed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "evidence_id"
+      ],
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "List claims from the frontmatter of corpus/claims/*.md, with their evidence and number ids. Cards the policy hides, links and oversized cards are counted (omitted_by_policy, omitted_links, omitted_too_large), not listed.",
+    "name": "claim_list",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 100,
+          "description": "Return at most this many claims (1-1000).",
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Show one claim card: frontmatter and body (body cut at 8000 characters).",
+    "name": "claim_show",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "description": "The claim id from claim_list, exactly as listed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_id"
+      ],
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "List the numbers in corpus/numbers.json with their value and evidence link. Cite a number by its number_id.",
+    "name": "number_list",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 100,
+          "description": "Return at most this many numbers (1-1000).",
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "read_only": true
+  },
+  {
+    "description": "Show one full number record from corpus/numbers.json.",
+    "name": "number_show",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "number_id": {
+          "description": "The number id from number_list, exactly as listed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "number_id"
+      ],
+      "type": "object"
+    },
+    "read_only": true
+  }
+]

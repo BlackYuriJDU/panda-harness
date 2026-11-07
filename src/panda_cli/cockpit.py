@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import os
+import stat
 import tempfile
 import time
 import traceback
@@ -31,9 +32,11 @@ from textual.worker import Worker
 
 from panda_cli import mascot
 from panda_cli.brand import PALETTE, spark_lines
-from panda_cli.runtime import ChatRuntime
+from panda_cli.runtime import ChatRuntime, policy_notice
 from panda_core.agent import DEFAULT_MAX_STEPS
+from panda_core.display import SafeText, sanitize_display
 from panda_core.errors import PandaError
+from panda_core.redact import redact_text
 from panda_core.registry import find_study, load_registry
 from panda_core.session import SessionLog
 from panda_core.tools import ApprovalRequest
@@ -47,6 +50,8 @@ WHITE = PALETTE["white"]
 SHADOW = PALETTE["white.shadow"]
 INK = PALETTE["ink"]
 MOUSE_OFF = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+
+IDLE_FREE_COMMANDS = frozenset({"/help", "/quit", "/exit"})
 
 HELP_TEXT = """Panda cockpit commands
 
@@ -70,7 +75,7 @@ Input is never blocked by a running turn.
 
 
 def _dim(text: str) -> Text:
-    return Text(text, style=SHADOW)
+    return SafeText(text, style=SHADOW)
 
 
 def _short(value: str, limit: int = 72) -> str:
@@ -84,6 +89,36 @@ def _loads(value: str) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _quote(token: str) -> str:
+    import shlex
+
+    return shlex.quote(token)
+
+
+def _open_private_log(path: Path) -> int:
+    """Open a crash log without following a link or using someone else's file (R2-307).
+
+    `.panda/logs/cockpit.log` comes with the corpus and can be a link; the /tmp
+    fallback can be pre-created by another user. O_NOFOLLOW, a regular-file check
+    and (POSIX) an owner check refuse both.
+    """
+
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    info = os.fstat(fd)
+    getuid = getattr(os, "getuid", None)
+    if not stat.S_ISREG(info.st_mode) or (getuid is not None and info.st_uid != getuid()):
+        os.close(fd)
+        raise OSError(f"refusing crash log {path}: not a private regular file")
+    return fd
+
+
+def _markdown(text: str) -> RichMarkdown:
+    """Model Markdown, sanitized, with links shown as text and never made clickable (N-03)."""
+
+    return RichMarkdown(sanitize_display(text), hyperlinks=False)
 
 
 class ToolCard(Static):
@@ -101,7 +136,7 @@ class ToolCard(Static):
             "blocked": ("×", AMBER),
             "failed": ("!", AMBER),
         }[self.state]
-        line = Text()
+        line = SafeText()
         line.append(f"{icon} ", style=style)
         line.append(self.tool_name, style=f"bold {WHITE}")
         if self.arguments:
@@ -130,7 +165,7 @@ class ValidationPanel(Static):
     def _build_text(payload: dict[str, Any]) -> Text:
         summary = payload.get("summary", {})
         ok = bool(payload.get("ok"))
-        line = Text()
+        line = SafeText()
         line.append("VALIDATION ", style=f"bold {WHITE}")
         line.append("✓ ok" if ok else "× failed", style=f"bold {GREEN if ok else AMBER}")
         line.append(
@@ -144,6 +179,10 @@ class ValidationPanel(Static):
                 for error in check.get("errors", [])[:2]:
                     line.append(f"\n    {_short(str(error), 120)}", style=SHADOW)
         return line
+ARM_DELAY_SECONDS = 0.4
+CONFIRM_WINDOW_SECONDS = 5.0
+
+
 class ApprovalScreen(ModalScreen[bool]):
     """One approval decision. Nothing executes until this returns True."""
 
@@ -177,11 +216,23 @@ class ApprovalScreen(ModalScreen[bool]):
         height: auto;
         margin: 1 0 0 0;
     }
+    #approval-preview-scroll {
+        height: auto;
+        max-height: 16;
+        margin: 1 0 0 0;
+        border: round #3A3A3A;
+    }
+    #approval-preview-scroll:focus {
+        border: round #F5A623;
+    }
     #approval-preview {
         color: #C9C9D9;
-        max-height: 16;
         height: auto;
-        margin: 1 0;
+    }
+    #approval-status {
+        height: auto;
+        color: #F5A623;
+        margin: 0 0 1 0;
     }
     #approval-buttons {
         height: 3;
@@ -195,27 +246,47 @@ class ApprovalScreen(ModalScreen[bool]):
     def __init__(self, request: ApprovalRequest) -> None:
         super().__init__()
         self.request = request
+        self._armed_at = time.monotonic() + ARM_DELAY_SECONDS
+        self._confirm_until = 0.0
 
     def compose(self) -> ComposeResult:
         request = self.request
-        summary = Text()
+        summary = SafeText()
         summary.append("tool     ", style=SHADOW)
-        summary.append(request.tool, style=f"bold {WHITE}")
+        summary.append(sanitize_display(request.tool), style=f"bold {WHITE}")
         summary.append("\naction   ", style=SHADOW)
         summary.append(request.action, style=WHITE)
-        summary.append("  ", style=WHITE)
-        summary.append(request.resource, style=WHITE)
+        summary.append("  effect ", style=SHADOW)
+        effect = request.effect_class or request.action
+        summary.append(effect, style=AMBER if effect not in {"read", "write", "edit"} else WHITE)
+        if request.argv:
+            # Each token on its own, quoted as the shell would: what runs, exactly (R2-117).
+            summary.append(f"\nruns     {len(request.argv)} tokens  ", style=SHADOW)
+            summary.append(" ".join(_quote(token) for token in request.argv), style=WHITE)
+            summary.append("\nin       ", style=SHADOW)
+            summary.append(request.cwd or ".", style=WHITE)  # R2-229: where it runs
+        else:
+            summary.append("\nresource ", style=SHADOW)
+            summary.append(request.resource, style=WHITE)
         summary.append("\nrule     ", style=SHADOW)
         summary.append(request.rule_id or "-", style=WHITE)
+        summary.append(f" ({request.rule_source or 'built-in'})", style=SHADOW)
         summary.append("   risk ", style=SHADOW)
-        summary.append(request.risk, style=AMBER if request.risk in {"high", "critical"} else WHITE)
+        summary.append(request.risk, style=AMBER if self._high_risk else WHITE)
         summary.append("\nreason   ", style=SHADOW)
+        if request.rule_source == "workspace":
+            summary.append("[text from the workspace policy] ", style=AMBER)
         summary.append(request.reason or "-", style=SHADOW)
-        preview = Text(request.preview or "(no preview)", style=SHADOW)
+        if request.payload_sha256:
+            summary.append("\nsha256   ", style=SHADOW)
+            summary.append(request.payload_sha256[:16], style=SHADOW)
+        # Text, never markup: what is shown is exactly what will run (APR-002/003).
+        preview = SafeText(sanitize_display(request.preview or "(no preview)"), style=SHADOW)
         yield Vertical(
-            Static(Text("APPROVAL REQUIRED", style=f"bold {AMBER}"), id="approval-title"),
+            Static(SafeText("APPROVAL REQUIRED", style=f"bold {AMBER}"), id="approval-title"),
             Static(summary, id="approval-summary"),
-            Static(preview, id="approval-preview"),
+            VerticalScroll(Static(preview, id="approval-preview"), id="approval-preview-scroll"),
+            Static("", id="approval-status"),
             Horizontal(
                 Button("Allow", id="allow"),
                 Button("Deny", id="deny", variant="warning"),
@@ -224,10 +295,75 @@ class ApprovalScreen(ModalScreen[bool]):
             id="approval-dialog",
         )
 
+    # ---- gate: nothing is approved before it has been seen and meant ----
+    @property
+    def _incomplete(self) -> bool:
+        tail = (self.request.preview or "")[-120:]
+        return not self.request.preview_complete or "\n[truncated " in tail
+
+    @property
+    def _high_risk(self) -> bool:
+        return self.request.risk in {"high", "critical"}
+
+    def on_mount(self) -> None:
+        self.query_one("#approval-preview-scroll", VerticalScroll).focus()
+        self.set_interval(0.1, self._refresh_status)
+        self._refresh_status()
+
+    def _hidden_lines(self) -> int:
+        scroll = self.query_one("#approval-preview-scroll", VerticalScroll)
+        return max(0, int(round(scroll.max_scroll_y - scroll.scroll_y)))
+
+    def _refresh_status(self) -> None:
+        try:
+            status = self.query_one("#approval-status", Static)
+        except NoMatches:
+            return
+        now = time.monotonic()
+        parts: list[str] = []
+        hidden = self._hidden_lines()
+        if self._incomplete:
+            parts.append(
+                "preview truncated: too large to show in full, so this cannot be approved here;"
+                " n denies"
+            )
+        elif now < self._armed_at:
+            parts.append("approval unlocks in a moment")
+        elif hidden:
+            parts.append(
+                f"+{hidden} lines hidden below: scroll (↓, PageDown, End) to read all of it "
+                "before approving"
+            )
+        elif self._confirm_until > now:
+            parts.append(f"risk {self.request.risk}: press y again to approve, n to deny")
+        else:
+            parts.append("y allow · n deny")
+        status.update(SafeText("\n".join(parts)))
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key not in {"y", "n", "escape"}:
+            self._confirm_until = 0.0  # any other key cancels a pending confirmation
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "allow")
+        if event.button.id == "allow":
+            self.action_allow()
+        else:
+            self.dismiss(False)
 
     def action_allow(self) -> None:
+        now = time.monotonic()
+        if self._incomplete:
+            self._refresh_status()
+            return  # nobody can consent to what was not shown (R2-125)
+        if now < self._armed_at:
+            return  # a key typed ahead of the modal must not approve (UI-001)
+        if self._hidden_lines():
+            self._refresh_status()
+            return  # the operator has not seen the whole preview (APR-002)
+        if self._high_risk and self._confirm_until <= now:
+            self._confirm_until = now + CONFIRM_WINDOW_SECONDS
+            self._refresh_status()
+            return
         self.dismiss(True)
 
     def action_deny(self) -> None:
@@ -426,7 +562,7 @@ class PandaCockpit(App[None]):
             self._report_exception(exc, "setup")
 
     def _mount_setup_error(self, exc: BaseException) -> None:
-        block = Text()
+        block = SafeText()
         block.append("SETUP ERROR ", style=f"bold {AMBER}")
         block.append(f"{type(exc).__name__}: {_short(str(exc), 160)}", style=WHITE)
         block.append(
@@ -449,7 +585,7 @@ class PandaCockpit(App[None]):
     async def _write_welcome(self) -> None:
         status = self._status
         model = str(status.get("model", "")).split("/", 1)[-1]
-        text = Text()
+        text = SafeText()
         text.append("PANDA ", style=f"bold {WHITE}")
         text.append(__version__, style=GREEN)
         text.append("  autonomous evidence harness", style=SHADOW)
@@ -468,6 +604,9 @@ class PandaCockpit(App[None]):
                 " · /validate fails until it exists",
                 style=AMBER,
             )
+        notice = policy_notice(status.get("workspace_policy") or {})
+        if notice:
+            text.append(f"\n{notice}", style=AMBER)
         text.append('\n"Evidence or it did not happen."  /help for commands', style=SHADOW)
         await self.query_one("#transcript", VerticalScroll).mount(
             Static(text, classes="block")
@@ -549,7 +688,7 @@ class PandaCockpit(App[None]):
         else:
             validation_text, validation_style = "val ×", AMBER
         icon = mascot.STATE_ICON.get(self._state, "·")
-        line = Text()
+        line = SafeText()
         line.append("PANDA", style=f"bold {WHITE}")
         if self._width >= 120:
             line.append(f"  {status.get('root', '')}", style=SHADOW)
@@ -588,8 +727,8 @@ class PandaCockpit(App[None]):
         else:
             lines = spark_lines()
             if tick % 4 in (1, 3):
-                lines = [Text(" "), *lines[:-1]]
-        block = Text()
+                lines = [SafeText(" "), *lines[:-1]]
+        block = SafeText()
         for index, line in enumerate(lines):
             if index:
                 block.append("\n")
@@ -621,7 +760,7 @@ class PandaCockpit(App[None]):
                 context=context,
                 tokens=total or None,
             )
-            block = Text()
+            block = SafeText()
             for index, line in enumerate(mascot.metrics_lines(metrics)):
                 if index:
                     block.append("\n")
@@ -632,7 +771,7 @@ class PandaCockpit(App[None]):
             block.append(cost_text, style=WHITE)
             return block
         icon = mascot.STATE_ICON.get(self._state, "·")
-        compact = Text()
+        compact = SafeText()
         state_style = GREEN if self._state not in {"blocked", "alert"} else AMBER
         compact.append(f"{icon} {self._state}", style=state_style)
         compact.append(f"\n{_short(model, 18)}", style=WHITE)
@@ -709,7 +848,7 @@ class PandaCockpit(App[None]):
         self.run_worker(_mount(), group="ui", exit_on_error=False)
 
     def _notice(self, text: str) -> None:
-        block = Text()
+        block = SafeText()
         block.append("panda  ", style=f"bold {GREEN_DIM}")
         block.append(text, style=SHADOW)
         self._mount_widget(Static(block, classes="block"))
@@ -725,14 +864,16 @@ class PandaCockpit(App[None]):
     def _write_crash_log(self, exc: BaseException, where: str) -> Path | None:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        entry = f"[{stamp}] {where}: {type(exc).__name__}: {exc}\n{body}\n"
+        # A traceback can carry a key or a path; redact it and keep the file private.
+        entry = redact_text(f"[{stamp}] {where}: {type(exc).__name__}: {exc}\n{body}\n")
         for path in self._log_targets():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as handle:
-                    handle.write(entry)
+                fd = _open_private_log(path)
             except OSError:
                 continue
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                handle.write(entry)
             return path
         return None
 
@@ -791,7 +932,7 @@ class PandaCockpit(App[None]):
             if self._assistant_widget is not None and now - self._last_markdown >= 0.06:
                 self._last_markdown = now
                 self._assistant_widget.update(
-                    RichMarkdown("".join(self._assistant_buffer))
+                    _markdown("".join(self._assistant_buffer))
                 )
         elif kind == "tool_call":
             card = ToolCard(str(data.get("name", "")), str(data.get("arguments", "")))
@@ -850,6 +991,13 @@ class PandaCockpit(App[None]):
         if self.runtime is None:
             self._notice("runtime unavailable; restart panda to build it")
             return
+        if self._busy and (
+            text.startswith("!")
+            or (text.startswith("/") and text.split()[0].lower() not in IDLE_FREE_COMMANDS)
+        ):
+            # These change the conversation or run a command beside the turn (AGT-004).
+            self._notice("a turn is running; wait for it or press Ctrl+C first")
+            return
         if text.startswith("/"):
             self._run_command(text)
             return
@@ -862,7 +1010,7 @@ class PandaCockpit(App[None]):
         self._turn_worker = self._turn(text)
 
     async def _append_user(self, text: str) -> None:
-        block = Text()
+        block = SafeText()
         block.append("you  ", style=f"bold {GREEN}")
         block.append(text, style=WHITE)
         transcript = self.query_one("#transcript", VerticalScroll)
@@ -874,7 +1022,7 @@ class PandaCockpit(App[None]):
             return
         text = "".join(self._assistant_buffer).strip()
         if text:
-            self._assistant_widget.update(RichMarkdown(text))
+            self._assistant_widget.update(_markdown(text))
         else:
             self._assistant_widget.remove()
 
@@ -904,7 +1052,7 @@ class PandaCockpit(App[None]):
         await self._append_user(text)
         self._assistant_buffer = []
         self._last_markdown = 0.0
-        self._assistant_widget = Static(RichMarkdown("…"), classes="block")
+        self._assistant_widget = Static(_markdown("…"), classes="block")
         await self.query_one("#transcript", VerticalScroll).mount(self._assistant_widget)
         result = await self.runtime.ask(text)
         self._finalize_assistant()
@@ -959,7 +1107,7 @@ class PandaCockpit(App[None]):
             return
         if command == "/models":
             models = await self.runtime.models()
-            block = Text()
+            block = SafeText()
             block.append("MODELS ", style=f"bold {WHITE}")
             block.append(
                 f"{len(models)} · source {self.runtime.models_source}", style=SHADOW
@@ -996,7 +1144,7 @@ class PandaCockpit(App[None]):
             except PandaError as exc:
                 self._notice(f"{exc.code}: {exc.message}")
                 return
-            block = Text()
+            block = SafeText()
             block.append("STUDIES", style=f"bold {WHITE}")
             for study in studies:
                 question = _short(study.question, 60)
@@ -1009,7 +1157,7 @@ class PandaCockpit(App[None]):
         if command == "/status":
             status = self.runtime.status()
             usage = status.get("usage") or {}
-            block = Text()
+            block = SafeText()
             block.append("STATUS", style=f"bold {WHITE}")
             for label, value in (
                 ("provider", f"{status.get('provider')} · {status.get('base_url')}"),
@@ -1039,7 +1187,7 @@ class PandaCockpit(App[None]):
             self._status = self.runtime.status()
             return
         if command == "/policy":
-            block = Text()
+            block = SafeText()
             block.append("POLICY", style=f"bold {WHITE}")
             for row in self.runtime.policy_rows():
                 actions = _short(row["actions"], 40)
@@ -1050,7 +1198,7 @@ class PandaCockpit(App[None]):
             self._mount_widget(Static(block, classes="block"))
             return
         if command == "/session":
-            block = Text()
+            block = SafeText()
             block.append("SESSION", style=f"bold {WHITE}")
             for row in self.runtime.session_rows()[-15:]:
                 block.append(f"\n{row['seq']:>4}  {row['type']:<20} {row['ts']}", style=SHADOW)
@@ -1082,7 +1230,7 @@ class PandaCockpit(App[None]):
         await transcript.mount(card)
         transcript.scroll_end(animate=False)
         self._set_state("working")
-        result = await self.runtime.tools.call("run_shell", {"argv": argv})
+        result = await self.runtime.agent.operator_tool("run_shell", {"argv": argv})
         card.finish(
             ok=result.ok,
             blocked=result.blocked,
@@ -1105,6 +1253,9 @@ class PandaCockpit(App[None]):
         self._notice("cancelling…")
 
     async def action_clear_transcript(self) -> None:
+        if self._busy:
+            self._notice("a turn is running; wait for it or press Ctrl+C first")
+            return
         transcript = self.query_one("#transcript", VerticalScroll)
         await transcript.remove_children()
         if self.runtime is not None:
@@ -1114,14 +1265,23 @@ class PandaCockpit(App[None]):
         await self._welcome()
 
     def action_quit_app(self) -> None:
-        if self.runtime is not None:
-            self.runtime.close("completed")
+        self._close_runtime()
         self.exit()
+
+    def _close_runtime(self) -> None:
+        """End the session with the last turn's status; never hide a failed end."""
+
+        if self.runtime is None:
+            return
+        self.runtime.close()
+        if self.runtime.close_error:
+            with contextlib.suppress(Exception):
+                self._write_crash_log(RuntimeError(self.runtime.close_error), "session.end")
 
     def on_unmount(self) -> None:
         if self.runtime is not None:
             with contextlib.suppress(Exception):
-                self.runtime.close("completed")
+                self._close_runtime()
         # Safety net: a crash can skip the driver's own restore, leaving the
         # terminal in the alt screen with mouse tracking enabled.
         driver = getattr(self, "_driver", None)

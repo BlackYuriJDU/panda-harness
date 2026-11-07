@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import typer
+from rich.text import Text
 
 from panda_cli import render
 from panda_cli.terminal import reset_terminal as _reset_terminal
 from panda_cli.terminal import snapshot_console_mode
+from panda_core.agent import _shrink
 from panda_core.credentials import (
     clear_all,
     clear_api_key,
@@ -25,6 +27,7 @@ from panda_core.credentials import (
     mask_key,
     set_api_key,
 )
+from panda_core.display import sanitize_display
 from panda_core.errors import ConfigError, ExecutionTimeout, PandaError, UsageError
 from panda_core.limits import DEFAULT_MAX_STEPS
 from panda_core.session import SessionLog, list_sessions
@@ -112,7 +115,7 @@ def _session_metadata(workspace: Workspace) -> dict[str, Any]:
         "cwd": str(Path.cwd()),
         "panda_version": __version__,
         "git": workspace.git_state(),
-        "tools": workspace.tool_versions(),
+        "tools": workspace.tool_versions(probe=False),
         "env_names": env_names,
     }
 
@@ -172,11 +175,21 @@ def _main(
     model: str | None = typer.Option(
         None, "--model", help="Model id for the cockpit (opencode-go/<model>)."
     ),
-    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    auto: bool = typer.Option(
+        False,
+        "--auto",
+        help="Approve edits inside the write rules and local checks (pytest, ruff, mypy)."
+        " Never pushes, publishes, deletes, uses the network or runs unknown programs.",
+    ),
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps per turn."
     ),
-    session: str | None = typer.Option(None, "--session", help="Continue a Panda session."),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Append to an existing session's ledger. The model starts without that"
+        " session's conversation.",
+    ),
     private: bool = typer.Option(False, "--private", help="Never persist task text."),
 ) -> None:
     if plain:
@@ -274,7 +287,8 @@ def auth_set(
         render.print_json({"ok": True, "provider": name, "path": str(path)})
         return
     render.console().print(
-        f"[green]stored[/green] {name} in {path} (mode 0600, outside the workspace)"
+        Text("stored", style=render.GREEN),
+        Text(f"{name} in {path} (mode 0600, outside the workspace)"),
     )
 
 
@@ -344,7 +358,7 @@ def auth_clear(
         render.print_json({"ok": True, "target": target, "removed": removed})
         return
     if removed:
-        render.console().print(f"[green]cleared[/green] {target}")
+        render.console().print(Text("cleared", style=render.GREEN), Text(str(target)))
     else:
         render.console().print(f"no stored key for {target}")
 
@@ -443,14 +457,37 @@ def run_command(
     task: list[str] | None = typer.Argument(None, help="Task for the autonomous Panda agent."),
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
     model: str | None = typer.Option(None, "--model", help="Model id (opencode-go/<model>)."),
-    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    auto: bool = typer.Option(
+        False,
+        "--auto",
+        help="Approve edits inside the write rules and local checks (pytest, ruff, mypy)."
+        " Never pushes, publishes, deletes, uses the network or runs unknown programs.",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit a JSON result."),
-    session: str | None = typer.Option(None, "--session", help="Continue an existing session."),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Append to an existing session's ledger. The model starts without that"
+        " session's conversation.",
+    ),
     private: bool = typer.Option(
         False, "--private", help="Persist only a hash of the task, never its text."
     ),
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps."
+    ),
+    max_tokens: int | None = typer.Option(
+        None,
+        "--max-tokens",
+        min=1,
+        help="Stop before the next model call once the turn has used this many tokens.",
+    ),
+    max_cost: float | None = typer.Option(
+        None,
+        "--max-cost",
+        min=0.0,
+        help="Stop before the next model call once the provider-reported cost reaches this"
+        " many USD (no effect when the provider reports no cost).",
     ),
     timeout: int | None = typer.Option(None, "--timeout", help="Run timeout in seconds."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print the plan; do not call the model."),
@@ -475,16 +512,19 @@ def run_command(
         "task_sha256": hashlib.sha256(task_text.encode("utf-8")).hexdigest(),
         "task_chars": len(task_text),
         "private": private,
+        "approval_mode": "auto" if auto else "none",
         "model": selected_model,
         "provider": workspace.config.provider.name,
         "max_steps": max_steps,
+        **({"max_tokens": max_tokens} if max_tokens else {}),
+        **({"max_cost": max_cost} if max_cost else {}),
         "cwd": str(workspace.root),
         "git": workspace.git_state(),
     }
 
     if dry_run:
         runtime = _runtime(workspace, log, selected_model, max_steps, private, auto)
-        log.append("run.plan", {**run_data, "tools": runtime.tools.names()})
+        log.append("run.plan", _shrink({**run_data, "tools": runtime.tools.names()}))
         _close_quietly(log, "planned")
         typer.echo(f"model: {selected_model}")
         provider = workspace.config.provider
@@ -503,18 +543,32 @@ def run_command(
         if json_output:
             return
         if event.kind == "text_delta":
-            typer.echo(event.data.get("text", ""), nl=False)
+            typer.echo(sanitize_display(str(event.data.get("text", ""))), nl=False)
             streamed["any"] = True
         elif event.kind == "tool_call":
-            typer.echo(f"\n[tool] {event.data.get('name')}", err=True)
+            typer.echo(f"\n[tool] {sanitize_display(str(event.data.get('name')))}", err=True)
         elif event.kind == "tool_result":
             state = "blocked" if event.data.get("blocked") else "ok"
-            typer.echo(f"[tool] {event.data.get('name')}: {state}", err=True)
+            name = sanitize_display(str(event.data.get("name")))
+            typer.echo(f"[tool] {name}: {state}", err=True)
 
     async def _execute() -> Any:
+        from panda_cli.runtime import policy_notice
+
         runtime = _runtime(
-            workspace, log, selected_model, max_steps, private, auto, on_event=on_event
+            workspace,
+            log,
+            selected_model,
+            max_steps,
+            private,
+            auto,
+            on_event=on_event,
+            max_tokens=max_tokens,
+            max_cost=max_cost,
         )
+        notice = policy_notice(runtime.policy_state)
+        if notice and not quiet:
+            typer.echo(notice, err=True)
         try:
             return await runtime.ask(task_text)
         finally:
@@ -530,13 +584,19 @@ def run_command(
     except TimeoutError as exc:
         log.append("run.error", {"code": "execution_timeout", "message": "run timed out"})
         _close_quietly(log, "error")
-        raise ExecutionTimeout(
+        error = ExecutionTimeout(
             "run exceeded the timeout",
             hint="raise --timeout or narrow the task",
-        ) from exc
+        )
+        if json_output:
+            render.print_json(_error_payload(error, log.session_id))
+        raise error from exc
     except PandaError as exc:
         log.append("run.error", {"code": exc.code, "message": exc.message})
         _close_quietly(log, "error")
+        if json_output:
+            # --json always prints one object, also on failure (R2-404).
+            render.print_json(_error_payload(exc, log.session_id))
         raise
 
     log.append(
@@ -551,18 +611,42 @@ def run_command(
     _close_quietly(log, "ok" if result.status == "completed" else result.status)
     if not json_output and streamed["any"]:
         typer.echo()
+    exit_code = run_exit_code(result.status, result.blocked_calls)
     payload = {
-        "ok": result.status == "completed",
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
         "model": selected_model,
         "provider": workspace.config.provider.name,
         **result.to_dict(),
     }
     if json_output:
         render.print_json(payload)
-    if result.status == "cancelled":
-        raise typer.Exit(130)
-    if result.status != "completed":
-        raise typer.Exit(1)
+    if exit_code:
+        raise typer.Exit(exit_code)
+
+
+def run_exit_code(status: str, blocked_calls: int = 0) -> int:
+    """`panda run` status -> exit code (CONTRACT §5, R2-404).
+
+    0 completed with nothing blocked; 5 completed but an action was blocked or
+    denied; 7 stopped at a limit (max_steps, budget, incomplete stream); 130
+    cancelled. Errors keep their own codes (2, 3, 4, 6).
+    """
+
+    if status == "cancelled":
+        return 130
+    if status == "completed":
+        return 5 if blocked_calls else 0
+    return 7
+
+
+def _error_payload(error: PandaError, session_id: str | None) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "exit_code": error.exit_code,
+        "session_id": session_id,
+        "error": {"code": error.code, "message": error.message, "hint": error.hint},
+    }
 
 
 def _runtime(
@@ -575,6 +659,8 @@ def _runtime(
     *,
     on_event: Any = None,
     approver: Any = None,
+    max_tokens: int | None = None,
+    max_cost: float | None = None,
 ) -> ChatRuntime:
     from panda_cli.runtime import ChatRuntime
 
@@ -582,6 +668,8 @@ def _runtime(
         workspace,
         model=model,
         max_steps=max_steps,
+        max_tokens=max_tokens,
+        max_cost=max_cost,
         private=private,
         auto=auto,
         session=log,
@@ -622,11 +710,21 @@ def chat_command(
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
     plain: bool = typer.Option(False, "--plain", help="Line REPL instead of the cockpit."),
     model: str | None = typer.Option(None, "--model", help="Model id (opencode-go/<model>)."),
-    auto: bool = typer.Option(False, "--auto", help="Approve every `ask` action."),
+    auto: bool = typer.Option(
+        False,
+        "--auto",
+        help="Approve edits inside the write rules and local checks (pytest, ruff, mypy)."
+        " Never pushes, publishes, deletes, uses the network or runs unknown programs.",
+    ),
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, max=200, help="Maximum model steps."
     ),
-    session: str | None = typer.Option(None, "--session", help="Continue an existing session."),
+    session: str | None = typer.Option(
+        None,
+        "--session",
+        help="Append to an existing session's ledger. The model starts without that"
+        " session's conversation.",
+    ),
     private: bool = typer.Option(False, "--private", help="Never persist task text."),
 ) -> None:
     _start_chat(
@@ -950,6 +1048,29 @@ def session_verify(
     raise typer.Exit(0 if all(item.ok for item in verifications) else 1)
 
 
+@session_app.command("recover")
+@handle
+def session_recover(
+    session_id: str = typer.Argument(..., help="Session id or 'latest'."),
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Adopt a single event left unanchored by a crash and record `session.recovered`."""
+
+    workspace = _load_workspace(root)
+    log = SessionLog.resolve(
+        workspace.sessions_dir, session_id, redact_enabled=workspace.config.logging.redact
+    )
+    recovered = log.recover()
+    payload = {"ok": True, "session_id": log.session_id, "recovered": recovered}
+    if json_output:
+        render.print_json(payload)
+    elif recovered:
+        typer.echo(f"recovered {log.session_id}: one unanchored event adopted and recorded")
+    else:
+        typer.echo(f"nothing to recover in {log.session_id}")
+
+
 @session_app.command("close")
 @handle
 def session_close(
@@ -972,17 +1093,21 @@ def session_close(
 
 # ---- policy ------------------------------------------------------------------
 def _policy_engine(workspace: Workspace) -> tuple[PolicyEngine, str]:
-    from panda_core.policy import PolicyEngine, load_policy_or_default
+    from panda_core.policy import engine_for, load_policy_or_default
 
     policy, from_file = load_policy_or_default(workspace.policy_path)
-    return PolicyEngine(policy, root=workspace.root), "file" if from_file else "built-in default"
+    engine = engine_for(workspace, policy, from_file=from_file)
+    return engine, "file" if from_file else "built-in default"
 
 
 @policy_app.command("check")
 @handle
 def policy_check(
     action: str = typer.Argument(
-        ..., help="read, write, edit, delete, shell, git, release, spend, tool."
+        ...,
+        help="Enforced: read, write, edit, shell, validate. Planned (no tool applies "
+        "them yet): delete, network, webfetch, websearch, tool, question, external_read, "
+        "external_write.",
     ),
     resource: str = typer.Argument(..., help="Path, shell command, or tool name."),
     root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
@@ -1001,11 +1126,19 @@ def policy_check(
         decision = engine.authorize(action, normalized, approved=True)
     payload = decision.to_dict()
     payload["policy_source"] = source
+    payload["workspace_policy_trusted"] = source == "file" and engine.baseline is None
     payload["approved"] = approve
+    from panda_core.policy import ENFORCED_ACTIONS
+
+    payload["enforced"] = action in ENFORCED_ACTIONS  # R2-410
     if json_output:
         render.print_json(payload)
     else:
         render.decision_panel(decision)
+        if not payload["enforced"]:
+            typer.echo(
+                f"note: no tool applies `{action}` yet; this rule describes a planned control"
+            )
         if decision.effect == "ask":
             typer.echo("hint: rerun with --approve to allow this action once")
         elif decision.effect in {"deny", "hard_deny"}:
@@ -1035,6 +1168,7 @@ def policy_explain(
             {
                 "ok": True,
                 "policy_source": source,
+                "workspace_policy_trusted": source == "file" and engine.baseline is None,
                 "decision": decision.to_dict(),
                 "matching_rules": [rule.to_dict() for rule in matched],
             }
@@ -1065,6 +1199,80 @@ def policy_show(
         return
     typer.echo(f"policy: {'file' if from_file else 'built-in default'} ({workspace.policy_path})")
     render.rules_table(policy.rules)
+
+
+@policy_app.command("trust")
+@handle
+def policy_trust(
+    root: Path | None = typer.Option(None, "--root", "-r", help="Corpus root (default: cwd)."),
+    show: bool = typer.Option(
+        False, "--show", help="List what trusting would allow; change nothing."
+    ),
+    revoke: bool = typer.Option(
+        False, "--revoke", help="Withdraw trust in this workspace's policy."
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Trust without the typed confirmation."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    """Trust this workspace's policy file, so its allow rules apply.
+
+    Untrusted, a workspace policy can only tighten the built-in policy. Trust is
+    stored outside the workspace and bound to the file's SHA-256: editing the file
+    withdraws it. The floor and the shell classifier always apply.
+    """
+
+    from panda_core.policy import load_policy
+    from panda_core.trust import grant, is_trusted, is_wildcard, loosening_rules
+    from panda_core.trust import revoke as drop
+
+    workspace = _load_workspace(root)
+    if revoke:
+        removed = drop(workspace.root)
+        if json_output:
+            render.print_json({"ok": True, "revoked": removed})
+        else:
+            typer.echo("trust withdrawn" if removed else "this workspace was not trusted")
+        return
+    if not workspace.policy_path.is_file():
+        raise ConfigError(
+            "this workspace has no policy file; the built-in policy applies",
+            hint="nothing to trust",
+        )
+    policy = load_policy(workspace.policy_path)
+    rules = loosening_rules(policy)
+    trusted = is_trusted(workspace.root, workspace.policy_path)
+    listing = [
+        {**rule.to_dict(), "wildcard": is_wildcard(rule)} for rule in rules
+    ]
+    if json_output and (show or not yes):
+        render.print_json({"ok": True, "trusted": trusted, "loosening_rules": listing})
+        return
+    if not json_output:
+        render.trust_listing(workspace.policy_path, listing, trusted=trusted)
+    if show:
+        return
+    if not rules:
+        if not json_output:
+            typer.echo("nothing to trust: the file only tightens the built-in policy")
+        else:
+            render.print_json({"ok": True, "trusted": trusted, "loosening_rules": []})
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            raise ConfigError(
+                "trusting a policy needs a person at the terminal",
+                hint="rerun interactively, or pass --yes after reading `panda policy trust --show`",
+            )
+        word = "trust " + workspace.root.name if any(r["wildcard"] for r in listing) else "trust"
+        answer = typer.prompt(f"type `{word}` to trust these rules", default="", show_default=False)
+        if answer.strip() != word:
+            typer.echo("not trusted")
+            raise typer.Exit(code=5)
+    digest = grant(workspace.root, workspace.policy_path)
+    if json_output:
+        render.print_json({"ok": True, "trusted": True, "policy_sha256": digest})
+    else:
+        typer.echo(f"trusted policy sha256 {digest[:16]}; editing the file withdraws trust")
 
 
 # ---- study -------------------------------------------------------------------
@@ -1101,7 +1309,7 @@ def study_show(
 
     workspace = _load_workspace(root)
     study = find_study(workspace.root, study_id)
-    card = load_study_card(study)
+    card = load_study_card(study, workspace.root)
     if json_output:
         payload = study.to_dict()
         payload["frontmatter"] = card["frontmatter"]

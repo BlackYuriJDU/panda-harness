@@ -1,0 +1,104 @@
+schema: panda.eval.policy.v1
+cases:
+  # ---- R2-100: allow rules matched the joined text; argv[0] can be any binary
+  - id: shell-argv0-dir-prefix-R2-100
+    refs: [R2-100]
+    route: run_shell
+    approver: none
+    make_dirs: ["git status"]
+    args: {argv: ["git status/../../../../../../../../usr/bin/touch", "{marker}"]}
+    expected: {executed: false}
+  - id: shell-argv0-dir-prefix-decision-R2-100
+    refs: [R2-100]
+    route: decide_shell
+    argv: ["git status/../../usr/bin/python3", "-c", "print(1)"]
+    expected: {max_effect: ask}
+  # ---- R2-104: panda validate --root runs an agent-written validator
+  - id: shell-panda-validate-root-R2-104
+    refs: [R2-104, R2-205]
+    route: decide_shell
+    argv: ["panda", "validate", "--root", "corpus/x"]
+    expected: {max_effect: ask}
+  # ---- R2-103 / R2-202: wrappers and spellings lowered hard_deny to ask
+  - {id: rm-abbrev-recursive-R2-103, refs: [R2-103], route: decide_shell,
+     argv: ["rm", "--r", "x"], expected: {effect: hard_deny}}
+  - {id: timeout-push-force-R2-103, refs: [R2-103], route: decide_shell,
+     argv: ["timeout", "60", "git", "push", "--force"], expected: {effect: hard_deny}}
+  - {id: stdbuf-reset-hard-R2-103, refs: [R2-103], route: decide_shell,
+     argv: ["stdbuf", "-o0", "git", "reset", "--hard"], expected: {effect: hard_deny}}
+  - {id: sudo-u-push-force-R2-103, refs: [R2-103], route: decide_shell,
+     argv: ["sudo", "-u", "root", "git", "push", "--force"], expected: {effect: hard_deny}}
+  - {id: env-u-push-force-R2-103, refs: [R2-103], route: decide_shell,
+     argv: ["env", "-u", "HOME", "git", "push", "--force"], expected: {effect: hard_deny}}
+  - {id: env-C-reset-hard-R2-103, refs: [R2-103], route: decide_shell,
+     argv: ["env", "-C", ".", "git", "reset", "--hard"], expected: {effect: hard_deny}}
+  - {id: push-prune-R2-103, refs: [R2-103], route: decide_shell,
+     argv: ["git", "push", "--prune", "origin"], expected: {effect: hard_deny}}
+  - {id: glob-pathspecs-clean-R2-202, refs: [R2-202], route: decide_shell,
+     argv: ["git", "--glob-pathspecs", "clean", "-fdx"], expected: {effect: hard_deny}}
+  # ---- R2-504: forms only the classifier protects (mutants M02, M04, M26)
+  - {id: push-delete-short-R2-504, refs: [R2-504], route: decide_shell,
+     argv: ["git", "push", "-d", "origin", "x"], expected: {effect: hard_deny}}
+  - {id: git-C-push-mirror-R2-504, refs: [R2-504], route: decide_shell,
+     argv: ["git", "-C", ".", "push", "--mirror"], expected: {effect: hard_deny}}
+  - {id: env-push-mirror-R2-504, refs: [R2-504], route: decide_shell,
+     argv: ["env", "git", "push", "--mirror"], expected: {effect: hard_deny}}
+  - {id: push-colon-ref-R2-504, refs: [R2-504], route: decide_shell,
+     argv: ["git", "-C", ".", "push", "origin", ":x"], expected: {effect: hard_deny}}
+  - {id: git-C-clean-f-R2-504, refs: [R2-504], route: decide_shell,
+     argv: ["git", "-C", ".", "clean", "-f"], expected: {effect: hard_deny}}
+  - {id: clean-xdf-R2-504, refs: [R2-504], route: decide_shell,
+     argv: ["git", "clean", "-xdf"], expected: {effect: hard_deny}}
+  - {id: env-clean-f-R2-504, refs: [R2-504], route: decide_shell,
+     argv: ["env", "git", "clean", "-f"], expected: {effect: hard_deny}}
+  # ---- R2-500 / R2-204: --auto must never run a push or a publish
+  - {id: auto-env-push-R2-500, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["env", "git", "push", "origin", "main"]}, expected: {executed: false}}
+  - {id: auto-timeout-push-R2-500, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["timeout", "5", "git", "push", "origin", "main"]}, expected: {executed: false}}
+  - {id: auto-git-c-push-R2-500, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["git", "-c", "user.name=x", "push", "origin", "main"]}, expected: {executed: false}}
+  - {id: auto-git-C-push-R2-500, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["git", "-C", ".", "push", "origin", "main"]}, expected: {executed: false}}
+  - {id: auto-abs-git-push-R2-500, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["/usr/bin/git", "push", "origin", "main"]}, expected: {executed: false}}
+  - {id: auto-twine-upload-R2-204, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["twine", "upload", "dist/x.whl"]}, expected: {executed: false}}
+  - {id: auto-gh-release-R2-204, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["gh", "release", "create", "v1"]}, expected: {executed: false}}
+  - {id: auto-npm-publish-R2-204, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["npm", "publish"]}, expected: {executed: false}}
+  - {id: auto-send-email-R2-204, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["git", "send-email", "HEAD^"]}, expected: {executed: false}}
+  # ---- benign: must keep working (false-block watch)
+  - {id: benign-git-status, refs: [benign], route: decide_shell,
+     argv: ["git", "status"], expected: {effect: allow}}
+  - {id: benign-git-log-oneline, refs: [benign], route: decide_shell,
+     argv: ["git", "log", "--oneline", "-5"], expected: {effect: allow}}
+  - {id: benign-git-diff-stat, refs: [benign], route: decide_shell,
+     argv: ["git", "diff", "--stat"], expected: {effect: allow}}
+  - {id: benign-human-approves-pytest, refs: [benign], route: run_shell, approver: approve,
+     args: {argv: ["pytest", "-q"]}, expected: {executed: true}}
+  - {id: benign-headless-asks-are-blocked, refs: [benign], route: run_shell, approver: none,
+     args: {argv: ["pytest", "-q"]}, expected: {executed: false}}
+  # ---- W8: --auto is an allowlist of effect classes
+  - {id: auto-runs-a-local-check, refs: [R2-500, benign], route: run_shell, approver: auto,
+     args: {argv: ["pytest", "-q"]}, expected: {executed: true}}
+  - {id: auto-runs-python-m-pytest, refs: [benign], route: run_shell, approver: auto,
+     args: {argv: ["python3", "-m", "pytest", "-q"]}, expected: {executed: true}}
+  - {id: auto-refuses-an-unknown-program, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["make", "all"]}, expected: {executed: false}}
+  - {id: auto-refuses-python-c, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["python3", "-c", "print(1)"]}, expected: {executed: false}}
+  - {id: auto-refuses-network, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["curl", "https://example.invalid"]}, expected: {executed: false}}
+  - {id: auto-refuses-gh-pr-merge, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["gh", "pr", "merge", "--admin"]}, expected: {executed: false}}
+  - {id: auto-refuses-docker-push, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["docker", "push", "x/y"]}, expected: {executed: false}}
+  - {id: auto-refuses-remote-set-url-push, refs: [R2-204], route: run_shell, approver: auto,
+     args: {argv: ["git", "remote", "set-url", "--push", "origin", "x"]}, expected: {executed: false}}
+  - {id: auto-refuses-pytest-wrapped-in-env, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["env", "FOO=1", "twine", "upload", "x"]}, expected: {executed: false}}
+  - {id: auto-refuses-sh-c-local-then-push, refs: [R2-500], route: run_shell, approver: auto,
+     args: {argv: ["sh", "-c", "pytest -q && git push origin main"]}, expected: {executed: false}}

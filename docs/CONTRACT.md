@@ -1,6 +1,6 @@
 # Panda Harness — v0.2 Contract
 
-**Version:** `0.2.0a4` (unreleased)
+**Version:** `0.2.0a5` (unreleased)
 **Status:** frozen for the v0.2 line once tagged
 **Runtime:** Panda cockpit + REPL + headless run, over the OpenCode Go provider
 **License:** MIT
@@ -36,7 +36,7 @@ the action.
 | Python | 3.12 or newer |
 | Node.js | 20 or newer, only for the corpus validator |
 | OpenCode Go | `https://opencode.ai/inference/go` by default |
-| API key | `OPENCODE_API_KEY` (name configurable via `provider.api_key_env`) |
+| API key | `OPENCODE_API_KEY` (a workspace file cannot change the variable name) |
 | Git | optional, used for provenance metadata |
 | OpenCode CLI | **not required and not used** |
 
@@ -75,6 +75,19 @@ Expected layout:
 └── opencode.json            # legacy, only if `init --opencode` was used
 ```
 
+### 3.0 Validator contract
+
+The validator prints one JSON report: `ok`, and a `checks` array of `{name, ok,
+skipped, reason, errors, warnings}`. Panda does not re-implement the checks, but it
+refuses a report that proves nothing: the nine unconditional checks (`schema`, `study`,
+`track`, `evidence`, `numbers`, `claims`, `findings`, `license`, `secrets`) must be
+present and must not be skipped, otherwise it is a protocol error (exit `4`) and
+`{"ok": true, "checks": []}` is not a pass. `public-face` is conditional: it may be
+skipped or absent, with a warning. The validator runs with the harness environment
+minus credentials: names such as `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, the
+`OPENCODE_`/`OPENROUTER_` prefixes and known provider variables are removed, while
+`PANDA_*` settings are kept.
+
 ### 3.1 Initialization
 
 `panda init`:
@@ -98,6 +111,28 @@ enabled legacy export both produce a warning line.
 
 `.panda/config.json` is validated with Pydantic (`extra="forbid"`). Defaults:
 
+**Read-only commands run nothing.** `panda status` and the session metadata
+never execute the configured `node`; the Node.js version is reported from the
+user-scoped cache or as unknown. Node runs only for `panda doctor`,
+`panda validate`, and the validator tools.
+
+**Symbolic links.** The files the workspace names -- `.panda/config.json`,
+`.panda/policy.json`, the instructions file, and the validator script -- must be
+regular files reached through regular directories. A symbolic link anywhere
+below the workspace root is refused with exit `2` (`config_error`); nothing is
+read or executed through it. Instructions are redacted before they enter the
+system prompt. On Windows the `lstat` walk applies but `O_NOFOLLOW` does not
+exist; junction handling there is not verified.
+
+**Workspace trust boundary.** `.panda/config.json` is meant to be committed, so a
+corpus received from a third party controls it. When the file is loaded, only the
+official provider is accepted: `provider.base_url` must be `https` on
+`opencode.ai` (default port, no credentials in the URL) and `provider.api_key_env`
+must be `OPENCODE_API_KEY`. Anything else is a configuration error (exit `2`) and
+no request is made, so a corpus cannot choose where the provider key is sent. The
+`ProviderSettings` model itself is unchanged; the restriction applies to workspace
+files only.
+
 | Key | Default |
 |---|---|
 | `schema_version` | `2` (v1 files still load and are rewritten as v2) |
@@ -110,7 +145,7 @@ enabled legacy export both produce a warning line.
 | `provider.max_output_tokens` | `8192` |
 | `provider.temperature` | `0.2` |
 | `validator` | `corpus/validation/validate.mjs` |
-| `node` | `node` |
+| `node` | `node` (a plain command name resolved through `PATH`; paths, drive letters, spaces and options are refused) |
 | `node_min_major` | `20` |
 | `timeouts.validate_seconds` | `180` |
 | `timeouts.run_seconds` | `null` (no limit) |
@@ -138,9 +173,14 @@ the environment variable name is.
 | `panda session show <id>` | Show events and verification state. |
 | `panda session verify [id]` | Verify one session or all sessions. |
 | `panda session close <id>` | Append a terminal `session.end` event. |
+| `panda session recover <id>` | Adopt one unanchored event after a crash and record `session.recovered`. |
 | `panda policy check <action> <resource>` | Evaluate one action. |
 | `panda policy explain <action> <resource>` | Show the matching rules. |
 | `panda policy show` | Print the effective policy. |
+| `panda policy trust [--show] [--yes] [--revoke]` | List the allow rules a workspace policy adds over the built-in one; trust the file (typed confirmation, `--yes` for scripts) or withdraw trust. |
+| `panda auth set` | Store a provider key outside the workspace (prompted by default; an exported variable still wins). |
+| `panda auth status` | Show where the key would come from. Never prints it. |
+| `panda auth clear` | Remove the stored key. |
 | `panda study list` | List the study registry. |
 | `panda study show <id>` | Show one study card. |
 | `panda mcp serve` | Run the optional MCP server (stdio or loopback HTTP). |
@@ -164,15 +204,73 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
   the model call (exit `4` with a hint naming the environment variable).
 - A **turn** is one user message plus up to `--max-steps` model steps
   (default `24`) with tool calls in between.
-- `--auto` approves every `ask` decision for the process. Without a human at a
-  prompt, `ask` is denied.
+- `--auto` is an **allowlist of effects**, read from the resolved decision and never
+  from a rule id. It approves `write`/`edit` asks, `validate`, and shell commands whose
+  effect class is `exec_local` (`pytest`, `ruff`, `mypy`, `python -m pytest|ruff|mypy|
+  compileall|unittest`). Every other class needs a person: `publish` (`git push` in any
+  spelling or wrapper, `git send-email`, `git remote set-url --push`, `twine upload`,
+  `npm|pnpm|yarn|cargo|uv|poetry|flit|hatch publish`, `gem push`, `docker|podman push`,
+  any `gh` command except view/list/status/diff/checks), `network` (`curl`, `wget`,
+  `ssh`, `scp`, `rsync`, ...), `destructive` (already `hard_deny`) and `exec_unknown`
+  (anything Panda does not classify, `python -c`, `make`, `sh -c` strings that contain a
+  push). Without a human at a prompt, `ask` is denied.
+- Each `approval.request` carries `effect_class`; each `approval.decision` carries
+  `decided_by` (`human`, `auto` or `policy`) and `effect_class`; `session.start` and
+  `run.start` record `approval_mode`. A command typed by the operator (`!cmd`) is
+  recorded as `tool.call`/`tool.result` with `origin: operator`, and stops if the ledger
+  cannot record it. `session.end` records the last turn's status (`cancelled`, `error`,
+  `incomplete`), and a failed `session.end` is reported, not swallowed.
+- MCP `policy_check(approved=...)` is deprecated and ignored: an MCP client is not an
+  approver. The answer carries `approved: false` and a `deprecated` note.
+- **What is shown is what runs.** Text from the model, tools and the workspace is
+  printed literally in the REPL and in `panda run`: Rich markup is not interpreted,
+  terminal control sequences (OSC 52 clipboard, window title, `ESC[2J`, carriage
+  returns, C1 controls) are removed, and invisible bidirectional or zero-width
+  characters are shown as `<U+XXXX>`.
 - `--dry-run` records `run.plan`, prints model/provider/tools/session, closes the
   session as `planned`, and never calls the provider.
-- `--private` persists only the task hash and length; the text is not written.
+- `--private` keeps the task text and the assistant's prose out of the ledger: only their
+  SHA-256 and length are stored. Tool arguments (`tool.call`) and tool results are still
+  recorded because they are the provenance, and they can quote the task; `session.start`
+  still records the working directory and the git state.
 - `--json` suppresses streaming and prints one result object
   (`status`, `text`, `steps`, `tool_calls`, `usage`, `context_tokens`,
   `context_window`, `context_ratio`, `session_id`).
 - A timeout maps to exit code `4`.
+- **The ledger is on the critical path.** If an event cannot be recorded (disk full,
+  anchor mismatch, closed session), the turn stops before the next model step or
+  tool runs, with a session-integrity error (exit `4`). The turn ends with status
+  `ledger_failed` when the ledger still accepts that final event. There is no
+  degraded mode.
+- **A cut-off answer is not `completed`.** Only `stop`, `tool_calls`,
+  `function_call` and `end_turn` (after each protocol's own mapping) end a step
+  normally. Any other stop reason (`length`, `content_filter`, a context-window
+  overflow, one Panda does not know) makes the turn `incomplete`, and `turn.end`
+  carries `finish_reason`. Tool calls from such a step are dropped, not executed,
+  because their arguments may be truncated. `data: [DONE]` ends only an OpenAI chat
+  stream; on the Anthropic, Responses and Google protocols a stream without its own
+  terminal event is an error.
+- **A turn that runs out of steps still answers.** Before its last step the model
+  is told it is the last one that can run tools; when the steps are used up, the
+  harness asks once more for a summary (a `harness.note`) and runs none of the tool
+  calls in that reply. The status stays `max_steps`. `panda run --max-tokens N` and
+  `--max-cost USD` stop the turn before the next model call once it has used that many
+  tokens or that much provider-reported cost; the status is `budget_exceeded`, with the
+  budget in `finish_reason`, and the exit code is `7`.
+- **Nothing rewrites the conversation during a turn.** `/clear`, `Ctrl+L`, `/model`,
+  `/study ...` and `!command` are refused with a notice while a turn is running in the
+  cockpit, and the agent raises a usage error (exit `2`) if its model, active study or
+  history is changed mid-turn.
+- **Context trimming never drops the task.** When the conversation exceeds the
+  context budget, the system prompt, the current turn's user message and the last six
+  messages are kept; older messages are replaced by one marker message
+  (`[contexto resumido: N mensagens]`, with the tools used) and a `context.trim`
+  event records how many messages were removed and the SHA-256 of each.
+- An unexpected exception in a tool becomes a failed tool result; any other
+  unexpected exception, and any typed error such as a provider failure, still writes a
+  `turn.end` with status `error`. Tool calls
+  left without a result by a cancellation or an error are answered with a failed
+  result, so the conversation stays valid.
 
 ### 4.2 `panda models`
 
@@ -199,14 +297,36 @@ about the adapter, not a promise that a call will succeed.
 | `2` | Usage or configuration error (bad flags, missing workspace, unsupported JSONC, unsupported model protocol, invalid config). |
 | `3` | Required dependency missing (Node.js, MCP SDK). |
 | `4` | Provider error (auth, rate limit, transport, protocol), execution timeout, or session-integrity failure. |
-| `5` | Policy denied, including `ask` outside an interactive approval. |
+| `5` | Policy denied, including `ask` outside an interactive approval. For `panda run`: the turn completed but at least one action was blocked or denied. |
 | `6` | Unexpected internal error. |
+| `7` | `panda run` stopped at a limit before completing: `max_steps`, a budget, or an incomplete provider stream. |
 | `130` | Interrupted with Ctrl-C. |
+
+`panda run --json` always prints exactly one JSON object on stdout, also on failure:
+`{"ok": false, "exit_code": N, "session_id": ..., "error": {"code", "message", "hint"}}`.
+On success it carries `ok`, `exit_code`, `status`, `steps`, `tool_calls`, `blocked_calls`
+and `usage`; `ok` is true only for exit code `0`.
 
 `panda status --json` returns `0` even when the directory is not a workspace; the
 payload carries `ok: false` and a stable `code`.
 
 ## 6. Provider and model routing
+
+**A stream must end properly.** Each protocol has a terminal event: `[DONE]` or a
+`finish_reason` (OpenAI chat), `message_stop` or a `stop_reason` (Anthropic),
+`response.completed` or `response.incomplete` (Responses), a candidate `finishReason`
+(Google). A stream that ends without one is a protocol error (exit `4`), never a
+complete answer. Server-sent events are read per event: the `data:` lines of one
+event are joined with a newline, and comments and other fields are ignored. Tool-call
+ids that the provider does not supply are generated as `call_<stream>_<index>` and do
+not repeat across steps.
+
+**History is repaired before it is sent.** Anthropic gets a `tool_result` marked
+`is_error` for every `tool_use` that has none, Responses gets a `function_call_output`
+for every `function_call` (and loses outputs without a call), and a Gemini history never
+starts with a `model` turn (function responses whose call went with it are dropped).
+The synthetic text is `[no result was recorded for this tool call]`. Gemini
+`thoughtSignature` data stays on the Google path only.
 
 The provider is OpenCode Go, with four implemented adapters under one key:
 
@@ -266,10 +386,40 @@ REPL, headless `run`, and the MCP export.
 | Process | `run_shell` (argv array, no shell, bounded timeout, `cwd` inside root) |
 | Provenance | `session_note` |
 
+No single tool result sent to the model exceeds the result budget: 20% of the
+context window at about 4 characters per token, between 8 000 and 200 000
+characters. `read_file` stops early at that budget and names the `start_line` to
+continue from; any other result above it is cut with `result_truncated: true`.
+
 Every path is resolved inside the workspace before use. Reads outside the
 workspace, secret paths, and traversal are refused by policy or by path
 resolution, not by prompt text. `write_file`, `edit_file`, and `run_shell` are
 the non-read-only tools and require a policy `allow` (or an approved `ask`).
+
+**`grep` runs in a child process.** The regular expression is chosen by the model and
+can take exponential time while holding the interpreter lock, so the search runs in a
+separate process that is killed after 10 seconds; the tool then returns an error that
+suggests `fixed_strings`. Files are filtered by the `read` policy in the parent first.
+
+**Edits are byte-exact.** `edit_file` reads and writes bytes: the file's line ending
+(LF, CRLF or CR) is kept, a BOM and non-ASCII text are kept, and a file that is not
+valid UTF-8 or has mixed line endings is refused and left untouched, never rewritten
+with replacement characters. `write_file` writes exactly the content it is given.
+
+**Content hashes.** `write_file` and `edit_file` return `sha256_before` (null for a new
+file) and `sha256_after`, and the agent copies `path`, `sha256_before` and
+`sha256_after` into the `tool.result` event. `turn.end` carries `tree_sha256`,
+`tree_files` (and `tree_truncated`): the SHA-256 over the sorted
+`(path, file SHA-256)` of every regular file under `corpus/`. It is stable across
+copies of the same corpus and ignores the ledger and anything outside `corpus/`.
+
+**Process limits.** A command runs in its own process group with stdin closed. The
+timeout, a cancellation of the tool call (Ctrl+C, `--timeout`) and output beyond the
+per-stream cap (4 MB) each stop the whole group, so a child started by the command
+cannot outlive the call; children left behind by a command that exited are stopped
+too. A command stopped for exceeding the cap returns `output_truncated: true`. On
+Windows the process tree is stopped with `taskkill /T`; Job Objects are not used and
+that path is not verified on a Windows host.
 
 ## 8. Policy and approvals
 
@@ -283,14 +433,128 @@ Effects:
 - `deny` — blocked.
 - `hard_deny` — blocked even with `--approve`.
 
-Hard denies include secret paths (`.env`, `*.pem`, `*.key`, `.ssh/`, etc.),
+A rule whose `effect` is not one of these four is a configuration error (exit `2`);
+it is never downgraded to `ask`.
+
+Hard denies include secret paths (`.env`, `*.pem`, `*.key`, `.ssh/`, and credential
+files such as `.git/config`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`,
+`credentials.json`, `.aws/credentials`, `.docker/config.json`, `*.p12`, `*.pfx`,
+`*.kdbx`, `*.keystore` and `secrets.*`, at the root and nested),
 force-push, history rewrites, recursive deletion, and release publishing.
+
+**The approval prompt shows what will run, or the action is not approved.** In the
+cockpit the preview is scrollable, shows how many lines are still hidden below, and
+`y`/Allow does nothing until the whole preview has been seen. A preview the tool
+shortened (`[truncated N chars]`) is flagged as such. Approving is armed 0.4 s after
+the prompt opens, so a `y` typed ahead is ignored, and a `high` or `critical` risk
+needs `y` twice (any other key cancels the first). `n`, `Esc` and Deny are immediate.
+Text in the prompt is sanitized and never interpreted as markup.
 
 An `ask` becomes an approval request with a single decision:
 **allow once** in the cockpit modal or the REPL prompt. There is no "remember"
 and no global allow. In `panda run` without `--auto`, an `ask` is denied and the
 tool returns a blocked result, not an exception loop. Every request and decision
 is written to the ledger as `approval.request` / `approval.decision`.
+
+**Shell commands are classified by argv tokens, not by text.** After the rules,
+the engine reads the command's tokens and can only escalate the result
+(`allow` < `ask` < `deny` < `hard_deny`). Options are normalised first (`git -C`,
+`-c`, `--git-dir`, `--no-pager`, `env`/`sudo` wrappers, `./git`, `GIT.EXE`,
+abbreviated long options). `hard_deny`: `git push` with `--force`/`-f`/`--mirror`/
+`--delete`/`+refspec`/`:refspec`, `git reset --hard`, `git clean -f`,
+`git branch -D/-d/--delete`, `rm` with a recursive flag in any form, `find -delete`.
+`deny`: `--output`, `--no-index`, `--ext-diff`. `allow`: `git status/diff/log/show`
+and `git branch --list` with a closed set of flags and no `rev:path`, absolute or
+`..` token. A path given to a read-only git command must pass the `read` rules, so
+`git diff -- .env` is refused. Anything else on `git` needs an approval, and a plain
+`git push origin fix-foo` is `ask`, no longer `hard_deny`. `node
+corpus/validation/validate.mjs` is no longer pre-approved: use the `validate` tool.
+
+**What reaches the terminal, and what an approval shows.** CLI output goes through a sink
+that keeps only colour sequences, with markup off; the cockpit renders untrusted text only
+through `SafeText`, and model links are shown, never clickable; `--json` escapes invisible
+and C1 characters. An `approval.request` carries `argv`, `cwd`, `effect_class`,
+`rule_source` (`built-in`, `workspace`, `classifier`), `payload_sha256` and
+`preview_complete`. The card shows all of them, labels a workspace rule's reason as
+workspace text, and refuses to approve a preview that is not complete.
+
+**What reaches the provider.** Every tool result is redacted (`panda_core.redact`) before
+it joins the conversation, as it is before the ledger. The system prompt names only the
+workspace folder. Workspace instructions are corpus data: `config.instructions` must name a
+`.md` file in `.panda/` or `corpus/` that the `read` rules allow, and the text sits in a
+`<workspace_instructions untrusted="true">` block that never overrides the harness rules.
+Child processes (`run_shell`, the validator, grep) inherit an allowlist of environment
+variables; the user adds names with `PANDA_CHILD_ENV`, and credential-looking names are
+never passed. A file the `read` rules deny never appears in an approval preview, and
+`write_file`/`edit_file` refuse to write the `[redacted]` marker over a file that holds a
+secret.
+
+**Allowed git runs isolated (`panda_core.gitsafe`).** A git command that runs
+without an approval is rebuilt before it runs, because the repository's own config
+and attributes name programs that even `git status` executes (fsmonitor, clean
+filters, textconv, external diff, hooks, pager, gpg). Panda passes explicit
+`--git-dir`/`--work-tree` for the repository found between `cwd` and the workspace
+root (never above it), `--attr-source=<empty tree>`, `--no-optional-locks`,
+`--no-pager`, `-c` overrides for every program-naming key (and for each filter
+named in `.git/info/attributes`), `--no-ext-diff --no-textconv` for
+`diff`/`show`/`log`, system and global config off, and no inherited `GIT_*`
+variable. `git diff`, `git show` and `git log -p` get exclude pathspecs for every
+path the `read` rules deny, so a committed `.env` is not printed. The tool result
+keeps the requested `argv` and adds `effective_argv`. When Panda cannot isolate the
+command (a wrapper such as `env git`, `git -C`, a `.git` file or symlink, an
+unreadable `.git/info/attributes`, git older than 2.42) the command needs an
+approval. Writing to any `.git` directory (`.git/*`, `*/.git/*`, Windows spellings)
+is a floor `hard_deny`. Opening a workspace runs no git at all: branch and commit
+are read from `.git/HEAD`, and the worktree state is reported as unknown.
+
+**Enforced and planned actions.** Only `read`, `write`, `edit`, `shell` and `validate` are
+consulted by tools. The default policy still declares rules for `delete`, `network`,
+`webfetch`, `websearch`, `release`, `tool`, `question`, `external_read` and
+`external_write`; they are **planned**: `panda policy check` answers them with
+`enforced: false`, but nothing enforces them yet, so for example the `release-publish` hard
+deny protects no tool today (publishing commands are decided as shell commands). The
+`policy_check` tool offers only the enforced actions and names the tools that apply each
+one. The `git` and `spend` families were removed in 0.2.0a6; their old allow rules in a
+workspace file are recognised as legacy and never ask for trust.
+The sets are `ENFORCED_ACTIONS` and `PLANNED_ACTIONS` in `panda_core.policy`, and a test
+fails if a declared action is in neither or if a planned action starts being consulted.
+
+**Built-in floor.** `.panda/policy.json` is workspace data and may be hostile, so
+the engine always adds a floor of `hard_deny` rules after loading it: every
+`hard_deny` of the built-in policy (secret and credential reads, force-push and
+history rewrites, destructive shell, release publishing) plus writes and edits
+under `.panda/` and `corpus/validation/` (also nested, `*/.panda/*` and
+`*/corpus/validation/*`), the validator's module closure (`node_modules/`,
+`corpus/node_modules/`, `package.json`, `.npmrc`), the configured validator file and
+its directory, and any `.git` directory. `default: "allow"` is refused with exit `2`.
+
+**A workspace policy only tightens, unless the user trusts it.** Every surface builds
+its engine through `panda_core.policy.engine_for`. When `.panda/policy.json` is not
+trusted, each decision is the stricter of the workspace policy and the built-in
+policy (higher risk on a tie), so an `allow` in the file is a no-op and a workspace
+`risk`/`reason` cannot lower what the built-in policy says. Trust is user state
+(`PANDA_TRUST_FILE`, default next to the user workspace) bound to the file's SHA-256;
+editing the file withdraws it. `panda policy trust --show` lists the allow rules the file adds; trusting needs a typed confirmation (`trust`, or `trust <folder>` when a rule allows a whole action) or `--yes`, and `--auto` never grants it. The cockpit, the REPL and `panda run` say how many allow rules are ignored, and `session.start` records `workspace_policy` (`source`, `trusted`, `ignored_allow_rules`). Allow rules that `panda init` wrote up to 0.2.0a5 need no trust. A trusted file's rules apply, but never above the
+floor or the shell classifier. Rule files are validated strictly: `actions` and
+`resources` must be non-empty lists of strings, `risk` one of `low`, `medium`,
+`high`, `critical`, and unknown fields are refused (exit `2`).
+
+**Shell rules match tokens, and only the classifier grants `allow`.** The built-in
+policy no longer has `allow` globs for shell. A shell `allow` rule (from a trusted
+workspace) matches argv tokens with a plain program name, never joined text, so a
+directory called `git status` cannot turn `git status/../../usr/bin/touch` into
+`git status`. The classifier grants `allow` to plain `git` read-only forms when only
+the catch-all asked; `panda validate` through the shell asks (use the `validate`
+tool). When the rules and the classifier agree on the effect, the classifier's rule,
+risk and reason are kept (`env git push` reports `shell-git-push`, risk `high`).
+Wrappers are unwrapped with their option arity (`env -u/-C/-S`, `sudo -u/-g`,
+`timeout DUR`, `nice -n`, `stdbuf -oL`, `ionice`, `chrt`, `taskset`, `flock`,
+`xargs`, `setsid`, `busybox`), `sh -c`/`env -S` strings are split into commands,
+an unknown program followed by `git`/`rm`/`find` asks with risk `high`, long options
+match from three characters (`rm --r`), `git push --prune` and `-c remote.*.mirror`
+are `hard_deny`, an unknown git global option no longer hides the subcommand, and
+Windows spellings (`git.exe.`, `git.exe::$DATA`, `git.com`, `GIT~1.EXE`) name the
+same program. A string resource is always tokenized with POSIX rules.
 
 `panda policy check` exits `0` only for `allow`; every other effect exits `5`.
 Path resources are resolved before matching, so `corpus/../README.md` normalizes
@@ -311,14 +575,56 @@ canonical record without `hash`; `prev` is the previous record's hash. The ancho
 pins the tail `(seq, hash)`, so truncation is detectable. A missing anchor is a
 warning for legacy logs; a mismatched anchor is an error.
 
-A chat session records `session.start`, `user.message`, `assistant.message`,
+A chat session records `session.start`, `message.user`, `message.assistant`,
 `tool.call`, `tool.result`, `approval.*`, and a terminal `session.end` with the
 model and turn count. Redaction runs before hashing and persistence. `--private`
-keeps task text out of every record.
+keeps the task text and the assistant's prose out of the ledger (see §4.1).
+
+**Event reference.** These are all the event types the code writes:
+
+| Event | Written by | Meaning |
+|---|---|---|
+| `session.start` / `session.end` | session | Opens and closes a ledger. |
+| `session.recovered` | `panda session recover` | One unanchored event was adopted. |
+| `turn.start` / `turn.end` | agent | A turn; `turn.end` carries `status`, usage and `tree_sha256`. |
+| `message.user` / `message.assistant` | agent | The user message and each model step. |
+| `harness.note` | agent | A fixed note the harness sent the model (`kind`: `last_step`, `summary`). |
+| `tool.call` / `tool.result` | agent | A tool call and its result, with file hashes for writes. |
+| `approval.request` / `approval.decision` | agent | An `ask` and its answer. |
+| `context.trim` | agent | Messages removed from the model context, with their hashes. |
+| `error` | agent | A typed error that ended the turn. |
+| `run.start` / `run.plan` / `run.end` / `run.error` | `panda run` | The headless run (`run.plan` for `--dry-run`). |
+| `validate.start` / `validate.result` / `validate.error` | `panda validate`, MCP | A validator run. |
+| `mcp.connect` / `policy.decision` / `note` | MCP service | An MCP connection, a denied or checked policy decision, a note. |
 
 `panda session verify` exits `1` if any session fails verification.
 
+**Appending is strict.** A new event is written only when the anchor names exactly
+the current tail. An anchor behind the tail (a crash between the write and the
+anchor, or an event forged into the file) stops the writer with a session-integrity
+error (exit `4`) instead of being absorbed by the next append. `panda session
+recover <id>` is the explicit repair: it adopts **one** unanchored event after
+checking the whole hash chain, and records a `session.recovered` event
+(`adopted_seq`, `adopted_hash`, `adopted_type`, `adopted_ts`, `anchor_seq`) so the
+adopted event stays visible. It does nothing on a healthy session (exit `0`) and
+refuses with exit `4` when more than one event is unanchored, the log is shorter
+than the anchor, or the chain is not intact.
+
+**Limit of the guarantee.** The chain and the anchor detect edits that are not
+coordinated. Someone who can write both the log and the anchor can rebuild the whole
+chain and `verify` will pass. Closing that needs a signature or MAC whose key lives
+outside the workspace; it is on the roadmap, not promised here.
+
 ## 10. MCP export (optional)
+
+**Policy on MCP tools.** `validate` and `study_show` run through the same tool
+registry and policy as the agent: `validate` is authorized under the `validate`
+action (allowed by default, restrictable by a workspace rule) and records the
+validator's SHA-256 (`validator_sha256`) in its result and in the `validate.result`
+ledger event; `study_show` is authorized under `read` for the card path. The MCP
+server has no approver, so an `ask` is denied, as in `panda run` without `--auto`.
+The `tool` policy rules list the plain names FastMCP registers (`validate`, ...)
+and the `panda_` spellings.
 
 MCP is not part of the Panda agent loop. It exists so other clients can reuse the
 read-only surface.

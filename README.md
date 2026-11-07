@@ -4,8 +4,11 @@
 
 > A fail-closed terminal harness for evidence-heavy research corpora.
 
-**Status:** alpha. `0.2.0a3` is the last tagged release; the line in `main` is
-the unreleased `0.2.0a4`, described in [`docs/CONTRACT.md`](docs/CONTRACT.md).
+**Status:** alpha. `0.2.0a3` is the last published release. `0.2.0a4` was tagged but
+must not be published: a security audit found defects that `0.2.0a5` fixes. The line in
+`main` is the unreleased `0.2.0a5` (hardening), described in
+[`docs/CONTRACT.md`](docs/CONTRACT.md). Read the *Changed* section of the
+[changelog](CHANGELOG.md) before upgrading: several behaviors are stricter on purpose.
 
 Panda is a terminal agent and optional MCP server that keeps an AI model inside
 an evidence discipline: approved write scopes, canonical validation, a verifiable
@@ -110,7 +113,9 @@ key is not exported in this shell.
 
 The provider is OpenCode Go: `provider.name = "opencode-go"`,
 `provider.base_url = "https://opencode.ai/inference/go"`, key in
-`OPENCODE_API_KEY`. The default model is
+`OPENCODE_API_KEY`. A workspace file cannot point Panda at another host or
+another key variable (it is rejected with exit `2`), because the config travels
+with the corpus. The default model is
 `opencode-go/deepseek-v4.1-flash`. Every catalogue model is callable: OpenAI-chat
 models use `/openai/v1/chat/completions`, Claude uses the Anthropic Messages
 adapter (`/anthropic/v1/messages`), GPT/Grok/Muse use the Responses API

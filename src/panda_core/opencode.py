@@ -9,7 +9,6 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +19,7 @@ from panda_core.process import (
     command_version,
     resolve_command_prefix,
     resolve_executable,
+    scrubbed_env,
     split_command,
 )
 from panda_core.workspace import Workspace
@@ -89,7 +89,8 @@ def default_panda_command() -> list[str]:
         return split_command(override)
     if shutil.which("panda"):
         return ["panda"]
-    return [sys.executable, "-m", "panda_cli"]
+    # -P: do not put the current directory (a corpus) on sys.path (R2-313).
+    return [sys.executable, "-P", "-m", "panda_cli"]
 
 
 def build_permissions() -> list[dict[str, str]]:
@@ -120,12 +121,9 @@ def build_permissions() -> list[dict[str, str]]:
         {"action": "edit", "resource": "colaboracao/*", "effect": "ask"},
         # Shell: ask by default, allow read-only commands, deny destructive ones.
         {"action": "shell", "resource": "*", "effect": "ask"},
+        # Only `git status` is pre-approved: diff, log, show and branch can write with
+        # --output or read other files with rev:path, and a prefix rule cannot tell (LEG-001).
         {"action": "shell", "resource": "git status *", "effect": "allow"},
-        {"action": "shell", "resource": "git diff *", "effect": "allow"},
-        {"action": "shell", "resource": "git log *", "effect": "allow"},
-        {"action": "shell", "resource": "git show *", "effect": "allow"},
-        {"action": "shell", "resource": "git branch *", "effect": "allow"},
-        {"action": "shell", "resource": "node corpus/validation/validate.mjs *", "effect": "allow"},
         {"action": "shell", "resource": "panda validate *", "effect": "allow"},
         {"action": "shell", "resource": "git push *", "effect": "ask"},
         {"action": "shell", "resource": "git push *--force*", "effect": "deny"},
@@ -242,13 +240,11 @@ def resolve_config_target(workspace: Workspace) -> Path:
 
 
 def _backup(path: Path, backups_dir: Path) -> Path | None:
-    if not path.is_file():
-        return None
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    destination = backups_dir / stamp / path.name
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(path, destination)
-    return destination
+    """The same counted backup as `panda init` (R2-309: two runs in a second collided)."""
+
+    from panda_core.init import _backup as counted_backup
+
+    return counted_backup(path, backups_dir)
 
 
 def _unique_rules(rules: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -324,10 +320,21 @@ def merge_opencode_config(
     generated_rules = generated.get("permissions", [])
     combined = _unique_rules([*existing_rules, *generated_rules])
     # Never weaken a user's explicit restriction: re-append deny/ask rules last.
+    generated_denies = {
+        (rule.get("action"), rule.get("resource"))
+        for rule in generated_rules
+        if isinstance(rule, dict) and rule.get("effect") == "deny"
+    }
     restrictive = [
         rule
         for rule in existing_rules
-        if isinstance(rule, dict) and rule.get("effect") in {"deny", "ask"}
+        if isinstance(rule, dict)
+        and rule.get("effect") in {"deny", "ask"}
+        # An `ask` placed last would override a generated `deny` for the same pattern.
+        and not (
+            rule.get("effect") == "ask"
+            and (rule.get("action"), rule.get("resource")) in generated_denies
+        )
     ]
     merged["permissions"] = _unique_rules([*combined, *restrictive])
     if generated_rules:
@@ -466,7 +473,7 @@ def launch_opencode(
     resolved_command = list(command)
     if resolved_command[: len(binary)] == binary:
         resolved_command = [*prefix, *resolved_command[len(binary) :]]
-    env = os.environ.copy()
+    env = scrubbed_env(keep_prefixes=("PANDA_",))  # no provider or cloud credentials
     env.update(
         {
             "PANDA_ROOT": str(workspace.root),
@@ -520,7 +527,7 @@ def config_status(workspace: Workspace) -> dict[str, Any]:
 
 def environment_status() -> dict[str, bool]:
     return {
-        "OPENROUTER_API_KEY": bool(os.environ.get("OPENROUTER_API_KEY")),
+        "OPENCODE_API_KEY": bool(os.environ.get("OPENCODE_API_KEY")),
         "NO_COLOR": bool(os.environ.get("NO_COLOR")),
     }
 

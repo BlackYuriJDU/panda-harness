@@ -6,12 +6,14 @@ fail closed: the harness will not invent a study to satisfy a request.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from panda_core.errors import ConfigError
+from panda_core.safe_read import ensure_plain_path, read_workspace_file
 
 STUDY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,63}$")
 _ID_CELL_RE = re.compile(r"\[`?([^`\]]+)`?\]")
@@ -81,6 +83,27 @@ def _cell(row: list[str], mapping: dict[str, int], key: str, fallback: int | Non
     return row[index]
 
 
+def _checked_link(relative: str, study_id: str) -> str:
+    """Refuse an INDEX link that is absolute or climbs out of the studies directory.
+
+    The agent can rewrite INDEX.md, so its links are untrusted (SEC-010).
+    """
+
+    text = relative.replace("\\", "/")
+    parts = PurePosixPath(text).parts
+    if (
+        "\x00" in text
+        or text.startswith(("/", "//"))
+        or (len(text) > 1 and text[1] == ":")
+        or ".." in parts
+    ):
+        raise ConfigError(
+            f"study {study_id} links outside the studies directory: {relative!r}",
+            hint="registry links must be relative paths inside corpus/studies",
+        )
+    return relative
+
+
 def parse_index(text: str, *, source: Path | None = None) -> list[Study]:
     lines = text.splitlines()
     header_index = None
@@ -130,9 +153,10 @@ def parse_index(text: str, *, source: Path | None = None) -> list[Study]:
         if status not in STATUSES:
             raise ConfigError(f"study {study_id} has invalid status: {status!r}")
         link = _LINK_RE.search(id_cell)
-        relative = link.group(1).strip() if link else ""
+        relative = _checked_link(link.group(1).strip(), study_id) if link else ""
         if relative and source is not None:
-            path = str((source.parent / relative).resolve())
+            # normpath, not resolve: a symlink must stay visible to the card loader.
+            path = os.path.normpath(source.parent / relative)
         elif relative:
             path = relative
         else:
@@ -164,7 +188,8 @@ def load_registry(root: Path) -> list[Study]:
             hint="the corpus root must contain corpus/studies/INDEX.md",
         )
     try:
-        text = path.read_text(encoding="utf-8")
+        # R2-109: the registry is corpus data; a linked INDEX.md is refused.
+        text = read_workspace_file(root, path)
     except OSError as exc:
         raise ConfigError(f"cannot read study registry: {path}") from exc
     return parse_index(text, source=path)
@@ -221,10 +246,13 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     return data, body
 
 
-def load_study_card(study: Study) -> dict[str, Any]:
+def load_study_card(study: Study, root: Path | None = None) -> dict[str, Any]:
     if not study.path:
         return {"frontmatter": {}, "body": ""}
     path = Path(study.path)
+    # Containment and symlink check (SEC-010). Without a root, at least the card
+    # file itself may not be a link.
+    ensure_plain_path(root if root is not None else path.parent, path)
     if not path.is_file():
         raise ConfigError(f"study card not found: {path}")
     frontmatter, body = parse_frontmatter(path.read_text(encoding="utf-8"))

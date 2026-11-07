@@ -44,7 +44,7 @@ from panda_core.config import (
     split_model,
 )
 from panda_core.credentials import get_api_key
-from panda_core.errors import ConfigError, ProviderError
+from panda_core.errors import ConfigError, ProtocolError, ProviderError
 from panda_core.protocols import (
     PROTOCOL_ANTHROPIC,
     PROTOCOL_GOOGLE,
@@ -56,7 +56,7 @@ from panda_core.protocols import (
     is_supported_model,
     model_protocol,
 )
-from panda_core.redact import redact_text
+from panda_core.redact import redact_text, register_secret
 from panda_core.version import __version__
 
 ANTHROPIC_VERSION = "2023-06-01"
@@ -265,6 +265,86 @@ def parse_google_usage(raw: Any) -> Usage | None:
 _OPENAI_MESSAGE_KEYS = frozenset({"role", "content", "name", "tool_call_id"})
 
 
+def unique_tool_call_ids(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Give every assistant tool call a distinct id across the history (R2-123).
+
+    A provider may reuse an id in a later step (or send none); Anthropic and the
+    Responses API reject or mis-pair repeated ids. A repeat is renamed
+    `<id>_<n>`, and the tool results right after that assistant message follow it.
+    """
+
+    seen: set[str] = set()
+    pending: dict[str, list[str]] = {}
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        calls = message.get("tool_calls") if role == "assistant" else None
+        if isinstance(calls, list) and calls:
+            pending = {}
+            renamed: list[Any] = []
+            for call in calls:
+                if not isinstance(call, dict):
+                    renamed.append(call)
+                    continue
+                old = str(call.get("id") or "")
+                new = old
+                if not old or old in seen:
+                    base, n = old or "call", 2
+                    while f"{base}_{n}" in seen:
+                        n += 1
+                    new = f"{base}_{n}"
+                seen.add(new)
+                pending.setdefault(old, []).append(new)
+                renamed.append(call if new == old else {**call, "id": new})
+            out.append({**message, "tool_calls": renamed})
+            continue
+        if role == "tool":
+            old = str(message.get("tool_call_id") or "")
+            queue = pending.get(old)
+            if queue:
+                new = queue.pop(0)
+                out.append(message if new == old else {**message, "tool_call_id": new})
+                continue
+        out.append(message)
+    return out
+
+
+def _pair_chat(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every chat tool call is answered right after it, and no result is orphaned (R2-124).
+
+    The same repair the other protocols get (ADP-001): a missing result becomes
+    NO_TOOL_RESULT, and a tool message with no call before it is dropped.
+    """
+
+    out: list[dict[str, Any]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        index += 1
+        if message.get("role") == "tool":
+            continue  # not directly after its call: orphaned (by trimming, for instance)
+        out.append(message)
+        calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        if not calls:
+            continue
+        ids = [str(call.get("id") or "") for call in calls if isinstance(call, dict)]
+        results: dict[str, dict[str, Any]] = {}
+        while index < len(messages) and messages[index].get("role") == "tool":
+            result = messages[index]
+            index += 1
+            call_id = str(result.get("tool_call_id") or "")
+            if call_id in ids and call_id not in results:
+                results[call_id] = result
+        for call_id in ids:
+            out.append(
+                results.get(call_id)
+                or {"role": "tool", "tool_call_id": call_id, "content": NO_TOOL_RESULT}
+            )
+    return out
+
+
 def sanitize_messages_for_openai(
     messages: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -275,9 +355,7 @@ def sanitize_messages_for_openai(
     """
 
     cleaned: list[dict[str, Any]] = []
-    for message in messages:
-        if not isinstance(message, dict):
-            continue
+    for message in unique_tool_call_ids(messages):
         item = {key: message[key] for key in _OPENAI_MESSAGE_KEYS if key in message}
         raw_calls = message.get("tool_calls")
         if isinstance(raw_calls, list):
@@ -303,7 +381,7 @@ def sanitize_messages_for_openai(
             if calls:
                 item["tool_calls"] = calls
         cleaned.append(item)
-    return cleaned
+    return _pair_chat(cleaned)
 
 
 def _text_content(value: Any) -> str:
@@ -335,6 +413,9 @@ def _tool_input(arguments: Any) -> dict[str, Any]:
         # The tool result already reports the parse failure to the model.
         return {}
     return value if isinstance(value, dict) else {}
+
+
+NO_TOOL_RESULT = "[no result was recorded for this tool call]"
 
 
 def _append_blocks(
@@ -386,11 +467,49 @@ def _normalize_anthropic_turns(
                 filtered.append({"role": role, "content": kept})
         return filtered
 
+    def close_dangling(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Answer every `tool_use` that has no `tool_result` (ADP-001).
+
+        Anthropic rejects the request when a tool_use is not followed by its
+        result. A cancelled or failed turn can leave that shape in the history.
+        """
+
+        closed: list[dict[str, Any]] = []
+        for position, turn in enumerate(items):
+            closed.append(turn)
+            if turn["role"] != "assistant":
+                continue
+            ids = [
+                str(block["id"])
+                for block in turn["content"]
+                if block.get("type") == "tool_use" and block.get("id")
+            ]
+            following = items[position + 1] if position + 1 < len(items) else None
+            blocks = following["content"] if following and following["role"] == "user" else []
+            answered = {str(b.get("tool_use_id")) for b in blocks if b.get("type") == "tool_result"}
+            synthetic = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": NO_TOOL_RESULT,
+                    "is_error": True,
+                }
+                for call_id in ids
+                if call_id not in answered
+            ]
+            if not synthetic:
+                continue
+            if following is not None and following["role"] == "user":
+                following["content"] = synthetic + list(following["content"])
+            else:
+                closed.append({"role": "user", "content": synthetic})
+        return closed
+
     normalized = filter_orphans(turns)
     while normalized and normalized[0]["role"] == "assistant":
         normalized.pop(0)
     # Dropping an assistant can orphan the tool results of the next user turn.
-    normalized = filter_orphans(normalized)
+    normalized = close_dangling(filter_orphans(normalized))
     merged: list[dict[str, Any]] = []
     for turn in normalized:
         if merged and merged[-1]["role"] == turn["role"]:
@@ -411,6 +530,7 @@ def convert_messages_for_anthropic(
     the result always alternates user/assistant.
     """
 
+    messages = unique_tool_call_ids(messages)
     system_parts: list[str] = []
     converted: list[dict[str, Any]] = []
     for message in messages:
@@ -537,6 +657,7 @@ def convert_messages_for_responses(
     which is the stateless shape the Responses API expects.
     """
 
+    messages = unique_tool_call_ids(messages)
     system_parts: list[str] = []
     items: list[dict[str, Any]] = []
     for message in messages:
@@ -596,7 +717,28 @@ def convert_messages_for_responses(
                     "content": [{"type": "input_text", "text": content}],
                 }
             )
-    return "\n\n".join(system_parts), items
+    return "\n\n".join(system_parts), _pair_responses_items(items)
+
+
+def _pair_responses_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every `function_call` gets an output, and an output needs a call (ADP-001)."""
+
+    called = {i["call_id"] for i in items if i.get("type") == "function_call"}
+    answered = {i["call_id"] for i in items if i.get("type") == "function_call_output"}
+    paired: list[dict[str, Any]] = []
+    for item in items:
+        if item.get("type") == "function_call_output" and item["call_id"] not in called:
+            continue  # orphaned by trimming
+        paired.append(item)
+        if item.get("type") == "function_call" and item["call_id"] not in answered:
+            paired.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": item["call_id"],
+                    "output": NO_TOOL_RESULT,
+                }
+            )
+    return paired
 
 
 _GOOGLE_SCHEMA_DROP = frozenset(
@@ -677,6 +819,7 @@ def convert_messages_for_google(
     requires for multi-turn tool use.
     """
 
+    messages = unique_tool_call_ids(messages)
     system_parts: list[str] = []
     contents: list[dict[str, Any]] = []
     pending_names: dict[str, str] = {}
@@ -754,7 +897,42 @@ def convert_messages_for_google(
         content = _text_content(message.get("content"))
         if content:
             append("user", [{"text": content}])
-    return system_parts, contents
+    return system_parts, _google_valid_start(contents)
+
+
+def _google_valid_start(contents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Gemini rejects a history that starts with `model` (ADP-002).
+
+    Context trimming can leave a leading model turn. Drop it, and drop the
+    function responses whose call went with it (or that do not answer the
+    function calls of the turn right before them).
+    """
+
+    start = 0
+    while start < len(contents) and contents[start]["role"] == "model":
+        start += 1
+    cleaned: list[dict[str, Any]] = []
+    called: set[str] = set()
+    for turn in contents[start:]:
+        if turn["role"] == "model":
+            called = {
+                part["functionCall"]["name"] for part in turn["parts"] if "functionCall" in part
+            }
+            parts = list(turn["parts"])
+        else:
+            parts = [
+                part
+                for part in turn["parts"]
+                if "functionResponse" not in part or part["functionResponse"]["name"] in called
+            ]
+            called = set()
+        if not parts:
+            continue
+        if cleaned and cleaned[-1]["role"] == turn["role"]:
+            cleaned[-1]["parts"].extend(parts)
+        else:
+            cleaned.append({"role": turn["role"], "parts": parts})
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -787,11 +965,14 @@ class ToolCall:
             return {}
         try:
             value = json.loads(self.arguments)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
+            # R2-121: nesting deep enough to exhaust the parser's recursion is a bad
+            # argument like any other, not a crash of the turn.
+            message = exc.msg if isinstance(exc, json.JSONDecodeError) else type(exc).__name__
             raise ProviderError(
                 f"model returned invalid JSON arguments for tool {self.name}",
                 hint="the tool call was not executed; retry the turn",
-                details={"tool": self.name, "error": exc.msg},
+                details={"tool": self.name, "error": message},
             ) from exc
         if not isinstance(value, dict):
             raise ProviderError(
@@ -878,6 +1059,29 @@ def _error_for_status(
     )
 
 
+async def _sse_data(response: httpx.Response) -> AsyncIterator[str]:
+    """Yield the `data` of each server-sent event, per the SSE format (PROV-003).
+
+    An event ends at a blank line; its `data:` lines are joined with a newline;
+    comments and other fields are ignored. A partial last event is still delivered.
+    """
+
+    lines: list[str] = []
+    async for line in response.aiter_lines():
+        if line == "":
+            if lines:
+                yield "\n".join(lines).strip()
+                lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if field == "data":
+            lines.append(value[1:] if value.startswith(" ") else value)
+    if lines:
+        yield "\n".join(lines).strip()
+
+
 class OpenCodeProvider:
     """Streaming client for OpenCode Go (OpenAI chat + Anthropic Messages)."""
 
@@ -960,6 +1164,8 @@ class OpenCodeProvider:
 
     def _require_api_key(self) -> str:
         key = self.api_key()
+        if key:
+            register_secret(key)
         if not key:
             raise ProviderError(
                 f"{self.settings.api_key_env} is not set and no stored key exists "
@@ -1123,6 +1329,14 @@ class OpenCodeProvider:
                     raise
                 await self._sleep_before_retry(attempt, exc)
 
+    _stream_serial = 0
+
+    def _generated_id(self, index: int) -> str:
+        # Ids the provider did not supply must stay unique across steps, or a
+        # later step collides with an earlier one when the history is replayed
+        # to a stricter protocol (PROV-004).
+        return f"call_{self._stream_serial}_{index}"
+
     async def _stream_once(
         self,
         messages: Sequence[dict[str, Any]],
@@ -1132,6 +1346,7 @@ class OpenCodeProvider:
         key: str,
         session_id: str,
     ) -> AsyncIterator[ProviderEvent]:
+        self._stream_serial += 1
         protocol = classify_protocol(model_id)
         if protocol == PROTOCOL_ANTHROPIC:
             async for event in self._stream_anthropic(
@@ -1197,6 +1412,7 @@ class OpenCodeProvider:
         finish_reason: str | None = None
         response_model: str | None = None
 
+        terminal = False
         try:
             async with self.client.stream(
                 "POST", self.chat_url, json=payload, headers=headers
@@ -1206,15 +1422,9 @@ class OpenCodeProvider:
                     raise _error_for_status(
                         response.status_code, body, retry_after=_retry_after(response)
                     )
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                async for data in _sse_data(response):
                     if data == "[DONE]":
+                        terminal = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -1246,6 +1456,7 @@ class OpenCodeProvider:
                     choice = choices[0] if isinstance(choices[0], dict) else {}
                     if choice.get("finish_reason"):
                         finish_reason = str(choice["finish_reason"])
+                        terminal = True
                     delta = choice.get("delta")
                     if not isinstance(delta, dict):
                         continue
@@ -1294,9 +1505,15 @@ class OpenCodeProvider:
                 details={"error": type(exc).__name__, "retryable": True},
             ) from exc
 
+        if not terminal:
+            raise ProtocolError(
+                "provider stream ended without a terminal event",
+                hint="the response was cut off; retry the turn",
+                details={"protocol": "openai-chat"},
+            )
         calls = tuple(
             ToolCall(
-                id=slot["id"] or f"call_{index}",
+                id=slot["id"] or self._generated_id(index),
                 name=slot["name"],
                 arguments=slot["arguments"],
             )
@@ -1341,6 +1558,7 @@ class OpenCodeProvider:
         finish_reason: str | None = None
         response_model: str | None = model_id
 
+        terminal = False
         try:
             async with self.client.stream(
                 "POST", self.anthropic_url, json=payload, headers=headers
@@ -1350,15 +1568,11 @@ class OpenCodeProvider:
                     raise _error_for_status(
                         response.status_code, body, retry_after=_retry_after(response)
                     )
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                async for data in _sse_data(response):
                     if data == "[DONE]":
+                        # R2-120: `[DONE]` ends an OpenAI chat stream only. Here the end
+                        # is the protocol's own terminal event; without it the stream was
+                        # cut off, whatever sentinel follows.
                         break
                     try:
                         chunk = json.loads(data)
@@ -1370,6 +1584,8 @@ class OpenCodeProvider:
                     if not isinstance(chunk, dict):
                         continue
                     kind = chunk.get("type")
+                    if kind == "message_stop":
+                        terminal = True
                     if kind == "error":
                         raw_error = chunk.get("error")
                         message = (
@@ -1435,6 +1651,7 @@ class OpenCodeProvider:
                     if kind == "message_delta":
                         delta = chunk.get("delta")
                         if isinstance(delta, dict) and delta.get("stop_reason"):
+                            terminal = True
                             raw_reason = str(delta["stop_reason"])
                             finish_reason = ANTHROPIC_STOP_REASONS.get(raw_reason, raw_reason)
                         merge_usage(usage_raw, chunk.get("usage"))
@@ -1457,9 +1674,15 @@ class OpenCodeProvider:
         usage = parse_anthropic_usage(usage_raw)
         if usage is not None:
             yield UsageEvent(usage)
+        if not terminal:
+            raise ProtocolError(
+                "provider stream ended without a terminal event",
+                hint="the response was cut off; retry the turn",
+                details={"protocol": "anthropic"},
+            )
         calls = tuple(
             ToolCall(
-                id=slot["id"] or f"call_{index}",
+                id=slot["id"] or self._generated_id(index),
                 name=slot["name"],
                 arguments=slot["arguments"],
             )
@@ -1503,6 +1726,7 @@ class OpenCodeProvider:
         finish_reason: str | None = None
         response_model: str | None = None
 
+        terminal = False
         try:
             async with self.client.stream(
                 "POST", self.responses_url, json=payload, headers=headers
@@ -1512,15 +1736,11 @@ class OpenCodeProvider:
                     raise _error_for_status(
                         response.status_code, body, retry_after=_retry_after(response)
                     )
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                async for data in _sse_data(response):
                     if data == "[DONE]":
+                        # R2-120: `[DONE]` ends an OpenAI chat stream only. Here the end
+                        # is the protocol's own terminal event; without it the stream was
+                        # cut off, whatever sentinel follows.
                         break
                     try:
                         chunk = json.loads(data)
@@ -1610,6 +1830,7 @@ class OpenCodeProvider:
                             yield TextDelta(delta)
                         continue
                     if kind in {"response.completed", "response.incomplete"}:
+                        terminal = True
                         frame = chunk.get("response")
                         if not isinstance(frame, dict):
                             continue
@@ -1646,9 +1867,15 @@ class OpenCodeProvider:
         usage = parse_responses_usage(usage_raw)
         if usage is not None:
             yield UsageEvent(usage)
+        if not terminal:
+            raise ProtocolError(
+                "provider stream ended without a terminal event",
+                hint="the response was cut off; retry the turn",
+                details={"protocol": "responses"},
+            )
         calls = tuple(
             ToolCall(
-                id=slot["id"] or f"call_{index}",
+                id=slot["id"] or self._generated_id(index),
                 name=slot["name"],
                 arguments=slot["arguments"],
             )
@@ -1693,6 +1920,7 @@ class OpenCodeProvider:
         response_model: str | None = None
         next_index = 0
 
+        terminal = False
         try:
             async with self.client.stream(
                 "POST", self.google_url(model_id), json=payload, headers=headers
@@ -1702,15 +1930,11 @@ class OpenCodeProvider:
                     raise _error_for_status(
                         response.status_code, body, retry_after=_retry_after(response)
                     )
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
+                async for data in _sse_data(response):
                     if data == "[DONE]":
+                        # R2-120: `[DONE]` ends an OpenAI chat stream only. Here the end
+                        # is the protocol's own terminal event; without it the stream was
+                        # cut off, whatever sentinel follows.
                         break
                     try:
                         chunk = json.loads(data)
@@ -1761,7 +1985,7 @@ class OpenCodeProvider:
                             if not name:
                                 continue
                             call_id = str(call.get("id") or "").strip() or (
-                                f"call_{next_index}"
+                                self._generated_id(next_index)
                             )
                             if any(slot["id"] == call_id for slot in slots.values()):
                                 continue
@@ -1790,6 +2014,7 @@ class OpenCodeProvider:
                             )
                         reason = candidate.get("finishReason")
                         if reason:
+                            terminal = True
                             raw_reason = str(reason)
                             if raw_reason == "MALFORMED_FUNCTION_CALL":
                                 raise ProviderError(
@@ -1818,9 +2043,15 @@ class OpenCodeProvider:
         usage = parse_google_usage(usage_raw)
         if usage is not None:
             yield UsageEvent(usage)
+        if not terminal:
+            raise ProtocolError(
+                "provider stream ended without a terminal event",
+                hint="the response was cut off; retry the turn",
+                details={"protocol": "google"},
+            )
         calls = tuple(
             ToolCall(
-                id=slot["id"] or f"call_{index}",
+                id=slot["id"] or self._generated_id(index),
                 name=slot["name"],
                 arguments=slot["arguments"],
                 metadata=(

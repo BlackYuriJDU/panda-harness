@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import secrets
+import stat
 import sys
 import time
 from collections.abc import Iterator
@@ -27,7 +28,13 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
     """
 
     ensure_dir(path.parent)
-    handle = open(path, "a+b")  # noqa: SIM115 - explicit lifecycle below
+    # R2-308: never follow a link planted as the lock file (it would get a NUL byte).
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"lock file is not a regular file: {path}")
+    handle = os.fdopen(fd, "a+b")  # noqa: SIM115 - explicit lifecycle below
     try:
         if handle.tell() == 0:
             handle.write(b"\0")
@@ -48,7 +55,18 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # type: ignore[attr-defined]
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(  # type: ignore[attr-defined]
+                        handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+                    )
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"could not acquire lock: {path}") from exc
+                    time.sleep(0.05)
         try:
             yield
         finally:
@@ -67,14 +85,50 @@ def file_lock(path: Path, *, timeout: float = 10.0) -> Iterator[None]:
         handle.close()
 
 
+def _create_private(tmp: Path, mode: int) -> int:
+    """Create the temporary file with its final mode from the start (R2-301).
+
+    `open()` created it with the umask (0644) and chmod came after the content was
+    written, so a credential was briefly world-readable. O_EXCL and O_NOFOLLOW also
+    refuse a file or link planted under the temporary name.
+    """
+
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    return os.open(tmp, flags, mode)
+
+
 def atomic_write_text(path: Path, text: str, *, mode: int = 0o600) -> None:
     """Write text atomically, never leaving a partially written destination."""
 
     ensure_dir(path.parent)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(_create_private(tmp, mode), "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def atomic_write_bytes(path: Path, data: bytes, *, mode: int = 0o600) -> None:
+    """Write bytes atomically, exactly as given (no newline or encoding changes)."""
+
+    ensure_dir(path.parent)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        with os.fdopen(_create_private(tmp, mode), "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         with contextlib.suppress(OSError):

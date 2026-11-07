@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
+import locale
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
+import sys
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 _SHIM_SUFFIXES = {".cmd", ".bat", ".ps1"}
@@ -23,6 +30,8 @@ class CommandResult:
     stderr: str
     duration_ms: int
     timed_out: bool = False
+    output_truncated: bool = False
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
@@ -106,65 +115,262 @@ def resolve_executable(value: str | Sequence[str]) -> str | None:
     return prefix[0] if prefix else None
 
 
+_SECRET_ENV_NAMES = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GEMINI_API_KEY",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GOOGLE_API_KEY",
+        "OPENAI_API_KEY",
+    }
+)
+_SECRET_ENV_PREFIXES = ("PANDA_", "OPENCODE_", "OPENROUTER_")
+_SECRET_ENV_SUFFIXES = (
+    "_KEY",
+    "_TOKEN",
+    "_SECRET",
+    "_PASSWORD",
+    "_PASSWD",
+    "_CREDENTIALS",
+)
+
+
+# Children inherit only what a toolchain needs, never "everything but known secrets":
+# a denylist kept PGPASSWORD, MYSQL_PWD, DATABASE_URL and SSH_AUTH_SOCK (R2-114).
+_ENV_ALLOW = frozenset(
+    {
+        "PATH", "HOME", "USER", "USERNAME", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM",
+        "COLORTERM", "TZ", "TMPDIR", "TMP", "TEMP", "PWD", "NO_COLOR", "FORCE_COLOR",
+        # Windows
+        "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA",
+        "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+        "COMMONPROGRAMFILES", "NUMBER_OF_PROCESSORS", "OS", "HOMEDRIVE", "HOMEPATH",
+        "PROCESSOR_ARCHITECTURE", "PSMODULEPATH",
+        # toolchains
+        "VIRTUAL_ENV", "PYTHONPATH", "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONHASHSEED",
+        "JAVA_HOME", "R_HOME", "NODE_PATH", "GOPATH", "GOROOT", "CARGO_HOME", "RUSTUP_HOME",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy",
+        "https_proxy", "no_proxy",
+    }
+)
+_ENV_ALLOW_PREFIXES = ("LC_", "XDG_", "CONDA_", "R_LIBS", "PIXI_", "MAMBA_")
+USER_ENV_ALLOW = "PANDA_CHILD_ENV"  # user-scoped extension: comma-separated names
+
+
+def scrubbed_env(*, keep_prefixes: tuple[str, ...] = ()) -> dict[str, str]:
+    """The environment a child process may inherit: an allowlist, minus credentials.
+
+    Names come from `_ENV_ALLOW`, its prefixes, `keep_prefixes`, or the user's own
+    `PANDA_CHILD_ENV` (never from workspace config). Names that look like
+    credentials are removed even if listed, and a proxy URL that carries a
+    password is dropped.
+    """
+
+    extra = {
+        name.strip().upper()
+        for name in os.environ.get(USER_ENV_ALLOW, "").split(",")
+        if name.strip()
+    }
+    env: dict[str, str] = {}
+    for name, value in os.environ.items():
+        upper = name.upper()
+        allowed = (
+            name in _ENV_ALLOW
+            or upper in _ENV_ALLOW
+            or upper.startswith(_ENV_ALLOW_PREFIXES)
+            or upper in extra
+            or (keep_prefixes and upper.startswith(keep_prefixes))
+        )
+        if not allowed:
+            continue
+        if upper in _SECRET_ENV_NAMES or upper.endswith(_SECRET_ENV_SUFFIXES):
+            continue
+        if upper.startswith(_SECRET_ENV_PREFIXES) and not upper.startswith(keep_prefixes):
+            continue
+        if "PROXY" in upper and "@" in value:
+            continue
+        env[name] = value
+    return env
+
+
+def dropped_env_names() -> list[str]:
+    """Names of variables children do not get (for `doctor`; never values)."""
+
+    kept = set(scrubbed_env())
+    return sorted(name for name in os.environ if name not in kept)
+
+
+DEFAULT_MAX_OUTPUT_BYTES = 4_000_000
+_POLL_SECONDS = 0.05
+
+
+def _pump(stream: Any, sink: bytearray, limit: int, over: threading.Event) -> None:
+    """Copy a pipe into `sink`, keeping at most `limit` bytes (SEC-008)."""
+
+    try:
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                return
+            room = limit - len(sink)
+            if room > 0:
+                sink += chunk[:room]
+            if len(chunk) > room:
+                over.set()
+    except (OSError, ValueError):
+        return
+
+
+def _kill_tree(process: subprocess.Popen[bytes]) -> None:
+    """Kill the command and everything it started.
+
+    POSIX: the command leads its own session, so the whole group is signalled.
+    Windows: `taskkill /T` walks the tree; Job Objects are not used and this path
+    is not verified on a Windows host (WIN-001).
+    """
+
+    if sys.platform == "win32":
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(  # noqa: S603
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],  # noqa: S607
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        with contextlib.suppress(OSError):
+            process.kill()
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    with contextlib.suppress(OSError):
+        process.kill()
+
+
+def decode_output(data: bytes, *, fallback: str | None = None) -> str:
+    """Decode a child's output: UTF-8 if it is UTF-8, else the system code page.
+
+    On Windows a child writing to a pipe uses the ANSI code page (cp1252), so
+    `olá` arrived as `ol\ufffd` (first run of the Windows CI on this branch).
+    A UTF-8 sequence cut by the output cap only loses its tail.
+    """
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.start >= len(data) - 3 and exc.reason == "unexpected end of data":
+            return data[: exc.start].decode("utf-8") + "\ufffd"
+        encoding = fallback or (locale.getpreferredencoding(False) if os.name == "nt" else None)
+        if encoding and encoding.lower().replace("-", "") not in {"utf8"}:
+            return data.decode(encoding, errors="replace")
+        return data.decode("utf-8", errors="replace")
+
+
 def run_command(
     command: Sequence[str],
     *,
     cwd: Path | None = None,
     timeout: float | None = None,
     env: dict[str, str] | None = None,
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+    cancel: threading.Event | None = None,
+    input_text: str | None = None,
 ) -> CommandResult:
-    import time
+    """Run a command with a hard timeout, an output cap and cancellation.
+
+    The command runs in its own process group. A timeout, a set `cancel` event, or
+    output beyond `max_output_bytes` per stream stops the whole group, so a
+    grandchild cannot outlive the call. Children left behind by a command that
+    exited normally are stopped too.
+    """
 
     started = time.monotonic()
+    group: dict[str, Any] = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}  # type: ignore[attr-defined,unused-ignore]
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(  # noqa: S603
             list(command),
             cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
-            check=False,
-        )
-        elapsed = int((time.monotonic() - started) * 1000)
-        return CommandResult(
-            command=list(command),
-            returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            duration_ms=elapsed,
-        )
-    except subprocess.TimeoutExpired as exc:
-        elapsed = int((time.monotonic() - started) * 1000)
-        stdout = (
-            exc.stdout.decode("utf-8", "replace")
-            if isinstance(exc.stdout, bytes)
-            else (exc.stdout or "")
-        )
-        stderr = (
-            exc.stderr.decode("utf-8", "replace")
-            if isinstance(exc.stderr, bytes)
-            else (exc.stderr or "")
-        )
-        return CommandResult(
-            command=list(command),
-            returncode=124,
-            stdout=stdout,
-            stderr=stderr,
-            duration_ms=elapsed,
-            timed_out=True,
+            **group,
         )
     except OSError as exc:
-        elapsed = int((time.monotonic() - started) * 1000)
         return CommandResult(
             command=list(command),
             returncode=127,
             stdout="",
             stderr=str(exc),
-            duration_ms=elapsed,
+            duration_ms=int((time.monotonic() - started) * 1000),
         )
+
+    over = threading.Event()
+    out, err = bytearray(), bytearray()
+    threads = [
+        threading.Thread(target=_pump, args=(process.stdout, out, max_output_bytes, over)),
+        threading.Thread(target=_pump, args=(process.stderr, err, max_output_bytes, over)),
+    ]
+    if input_text is not None:
+        threads.append(threading.Thread(target=_feed, args=(process, input_text)))
+    for thread in threads:
+        thread.daemon = True
+        thread.start()
+
+    deadline = started + timeout if timeout else None
+    timed_out = cancelled = False
+    while True:
+        try:
+            process.wait(timeout=_POLL_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            pass
+        if cancel is not None and cancel.is_set():
+            cancelled = True
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        if over.is_set():
+            break
+    _kill_tree(process)  # also reaps children left behind by a command that exited
+    process.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
+
+    def text(buffer: bytearray) -> str:
+        return decode_output(bytes(buffer)).replace("\r\n", "\n")
+
+    returncode = 124 if timed_out else 130 if cancelled else process.returncode
+    return CommandResult(
+        command=list(command),
+        returncode=returncode,
+        stdout=text(out),
+        stderr=text(err),
+        duration_ms=int((time.monotonic() - started) * 1000),
+        timed_out=timed_out,
+        output_truncated=over.is_set(),
+        cancelled=cancelled,
+    )
+
+
+def _feed(process: subprocess.Popen[bytes], text: str) -> None:
+    with contextlib.suppress(OSError, ValueError):
+        if process.stdin is not None:
+            process.stdin.write(text.encode("utf-8"))
+            process.stdin.close()
 
 
 def parse_version(text: str) -> tuple[int, int, int] | None:

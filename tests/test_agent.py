@@ -260,7 +260,9 @@ def test_provider_error_is_logged_and_reraised(workspace) -> None:
         asyncio.run(agent.run_turn("fail"))
     types = event_types(session)
     assert "error" in types
-    assert "turn.end" not in types
+    # Every turn is closed in the ledger, also when the provider fails (AGT-001).
+    assert types[-1] == "turn.end"
+    assert [e for e in session.events() if e.type == "turn.end"][-1].data["status"] == "error"
 def test_cancellation_is_logged_and_bounded(workspace) -> None:
     class HangingProvider:
         async def stream(self, messages, tools=None, model=None, session_id=None):
@@ -312,5 +314,7 @@ def test_system_prompt_carries_the_rules(workspace) -> None:
     assert "fail-closed" in prompt
     assert "clinical advice" in prompt
     assert "gse160208" in prompt
-    assert str(workspace.root.as_posix()) in prompt
+    # Owner-approved change (R2-415): only the folder name reaches the provider.
+    assert workspace.root.name in prompt
+    assert str(workspace.root.as_posix()) not in prompt
     assert "validate" in prompt

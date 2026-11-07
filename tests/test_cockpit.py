@@ -72,7 +72,7 @@ def test_approval_modal_allow_and_deny(workspace) -> None:
             decisions: list[bool] = []
             for key in ("y", "n"):
                 app.push_screen(ApprovalScreen(request()), callback=decisions.append)
-                await pilot.pause()
+                await pilot.pause(0.5)  # the modal arms after 0.4 s (UI-001)
                 await pilot.press(key)
                 await pilot.pause()
             assert decisions == [True, False]

@@ -72,6 +72,7 @@ def isolated_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
 
     path = tmp_path / "credentials.json"
     monkeypatch.setenv("PANDA_CREDENTIALS_FILE", str(path))
+    monkeypatch.setenv("PANDA_TRUST_FILE", str(tmp_path / "trust.json"))
     monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
     return path
 

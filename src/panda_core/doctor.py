@@ -131,6 +131,7 @@ def run_doctor(workspace: Workspace, *, run_validation: bool = False) -> DoctorR
             node=workspace.config.node,
             min_major=workspace.config.node_min_major,
         ).node_version()
+        workspace.record_node_version(node_version)
         _check(
             checks,
             "node",
@@ -280,7 +281,9 @@ def run_doctor(workspace: Workspace, *, run_validation: bool = False) -> DoctorR
             "git",
             "Git provenance",
             "ok",
-            f"{str(git.get('commit') or '')[:12]} dirty={git.get('dirty')}",
+            f"{str(git.get('commit') or 'no commit')[:12]}"
+            f" on {git.get('branch') or 'detached/unknown'}"
+            " (worktree state not probed: git is not run on a corpus)",
         )
     else:
         _check(

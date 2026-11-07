@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from panda_core.errors import ConfigError
+from panda_core.safe_read import read_workspace_file
 from panda_core.version import __version__
 
 DEFAULT_MODEL = "opencode-go/deepseek-v4.1-flash"
@@ -26,6 +27,8 @@ DEFAULT_BASE_URL = "https://opencode.ai/inference/go"
 LEGACY_PROVIDER = "opencode"
 GO_BASE_SUFFIX = "/inference/go"
 DEFAULT_API_KEY_ENV = "OPENCODE_API_KEY"
+TRUSTED_PROVIDER_HOST = "opencode.ai"
+_NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 DEFAULT_CONTEXT_WINDOW = 131_072
 DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 DEFAULT_VALIDATOR = "corpus/validation/validate.mjs"
@@ -215,13 +218,86 @@ class PandaConfig(BaseModel):
     def _relative_inside_workspace(cls, value: str) -> str:
         return _relative_posix_path(value)
 
+    @field_validator("node")
+    @classmethod
+    def _node_is_a_plain_command_name(cls, value: str) -> str:
+        # A path would let the corpus pick the binary Panda executes (TRUST-002).
+        if not _NODE_NAME_RE.match(value):
+            raise ValueError(
+                "node must be a plain command name resolved through PATH "
+                "(no path separators, drive letters, spaces or options)"
+            )
+        return value
+
     def to_jsonable(self) -> dict:
         return self.model_dump(mode="json")
 
 
+def _enforce_provider_boundary(settings: ProviderSettings, path: Path) -> None:
+    """Refuse a workspace file that redirects the provider key or endpoint.
+
+    `.panda/config.json` is meant to be committed, so a corpus received from a
+    third party controls it. Letting it choose `base_url` or `api_key_env` would
+    let that corpus collect any environment variable. The model itself stays
+    permissive (tests and library callers build it directly); the restriction is
+    applied where workspace data enters the process.
+    """
+
+    parts = urlsplit(settings.base_url)
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    official = (
+        parts.scheme == "https"
+        and parts.hostname == TRUSTED_PROVIDER_HOST
+        and port in {None, 443}
+        and parts.username is None
+        and parts.password is None
+    )
+    if not official:
+        raise ConfigError(
+            f"provider.base_url in {path} is not the official endpoint: {settings.base_url}",
+            hint=(
+                f"a workspace file may only use https://{TRUSTED_PROVIDER_HOST}/...; "
+                "remove provider.base_url or set it back to the default"
+            ),
+        )
+    if settings.api_key_env != DEFAULT_API_KEY_ENV:
+        raise ConfigError(
+            f"provider.api_key_env in {path} must be {DEFAULT_API_KEY_ENV}, "
+            f"got {settings.api_key_env}",
+            hint=f"a workspace file cannot choose the key variable; use {DEFAULT_API_KEY_ENV}",
+        )
+    if settings.name != DEFAULT_PROVIDER:
+        # R2-110: the provider name picks which key of the user's store is sent.
+        raise ConfigError(
+            f"provider.name in {path} must be {DEFAULT_PROVIDER}, got {settings.name}",
+            hint="a workspace file cannot choose which stored key is used",
+        )
+    for field, ceiling in _WORKSPACE_CEILINGS.items():
+        value = getattr(settings, field)
+        if value > ceiling:
+            # R2-304: a corpus could set context_window=10M (no trim ever), 1M output
+            # tokens or an hour of timeout; a workspace may only lower the budgets.
+            raise ConfigError(
+                f"provider.{field} in {path} is {value}; a workspace file may set at most "
+                f"{ceiling}",
+                hint=f"lower provider.{field} or remove it to use the default",
+            )
+
+
+_WORKSPACE_CEILINGS: dict[str, float] = {
+    "context_window": 1_048_576,
+    "max_output_tokens": 65_536,
+    "max_retries": 3,
+    "timeout_seconds": 600.0,
+}
+
+
 def load_config(path: Path) -> PandaConfig:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_workspace_file(path.parent.parent, path))
     except OSError as exc:
         raise ConfigError(f"cannot read config: {path}", hint="run `panda init`") from exc
     except json.JSONDecodeError as exc:
@@ -232,6 +308,7 @@ def load_config(path: Path) -> PandaConfig:
         config = PandaConfig.model_validate(raw)
     except Exception as exc:  # pydantic ValidationError
         raise ConfigError(f"invalid Panda config in {path}: {exc}") from exc
+    _enforce_provider_boundary(config.provider, path)
     if config.schema_version == 1:
         # v1 files stay loadable; the next `panda init` rewrites them as v2.
         config = config.model_copy(update={"schema_version": 2})

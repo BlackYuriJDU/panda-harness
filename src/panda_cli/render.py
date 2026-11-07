@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import Iterable
 from typing import Any
 
@@ -12,6 +13,7 @@ from rich.table import Table
 from rich.text import Text
 
 from panda_cli.brand import PALETTE, brand_lines, color_enabled
+from panda_core.display import SafeWriter, json_safe
 
 GREEN = PALETTE["green"]
 GREEN_DIM = PALETTE["green.dim"]
@@ -22,8 +24,21 @@ WHITE_SHADOW = PALETTE["white.shadow"]
 INK = PALETTE["ink"]
 
 
-def console() -> Console:
-    return Console(highlight=False, emoji=False, soft_wrap=False)
+def console(*, stderr: bool = False) -> Console:
+    """Every CLI console: no markup from strings, and a sanitizing sink (R2-306, R2-223).
+
+    `markup=False` keeps corpus text such as `[link=...]` or `[/]` literal; the
+    SafeWriter strips any terminal sequence except colour from what reaches the tty.
+    """
+
+    stream = sys.stderr if stderr else sys.stdout
+    return Console(
+        file=SafeWriter(stream),
+        highlight=False,
+        emoji=False,
+        soft_wrap=False,
+        markup=False,
+    )
 
 
 def banner(version: str) -> None:
@@ -51,7 +66,7 @@ def status_text(status: str) -> Text:
 
 
 def print_error(exc: Any) -> None:
-    output = Console(stderr=True, highlight=False, emoji=False, soft_wrap=False)
+    output = console(stderr=True)
     output.print(Text("error", style=f"bold {AMBER}"), Text(str(getattr(exc, "message", exc))))
     hint = getattr(exc, "hint", None)
     if hint:
@@ -62,7 +77,8 @@ def print_error(exc: Any) -> None:
 
 
 def print_json(payload: Any) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    # Valid JSON, with C1, bidi and invisible characters escaped (R2-223).
+    print(json_safe(json.dumps(payload, ensure_ascii=False, indent=2)))
 
 
 def validation_report(report: Any) -> None:
@@ -209,6 +225,41 @@ def session_detail(summary: Any, verification: Any, events: Iterable[Any]) -> No
     output.print(table)
 
 
+def trust_listing(path: Any, rules: list[dict[str, Any]], *, trusted: bool) -> None:
+    """What trusting a workspace policy would allow, in words a person can check."""
+
+    from panda_core.display import sanitize_display
+
+    output = console()
+    state = Text.assemble(
+        ("policy ", WHITE_SHADOW),
+        (sanitize_display(str(path)), WHITE),
+        ("  ", ""),
+        ("trusted", GREEN) if trusted else ("not trusted: only tightens", AMBER),
+    )
+    output.print(state)
+    if not rules:
+        output.print(Text("no allow rule beyond the built-in policy", style=WHITE_SHADOW))
+        return
+    output.print(Text("trusting turns these into allow, without approval:", style=WHITE))
+    for rule in rules:
+        line = Text("  ")
+        line.append("! " if rule["wildcard"] else "- ", style=AMBER if rule["wildcard"] else WHITE)
+        line.append(sanitize_display(", ".join(rule["actions"])), style=WHITE)
+        line.append("  ")
+        line.append(sanitize_display(" | ".join(rule["resources"])), style=WHITE)
+        line.append(f"  ({sanitize_display(rule['id'])})", style=WHITE_SHADOW)
+        if rule["wildcard"]:
+            line.append("  everything for this action", style=AMBER)
+        output.print(line)
+    output.print(
+        Text(
+            "the floor (secrets, control plane, .git, destructive commands) still applies",
+            style=WHITE_SHADOW,
+        )
+    )
+
+
 def rules_table(rules: Iterable[Any], decision: Any | None = None) -> None:
     output = console()
     table = Table(show_header=True, header_style=f"bold {WHITE_SHADOW}", box=None, pad_edge=False)
@@ -342,6 +393,14 @@ def init_panel(result: Any) -> None:
     )
 
 
+def _dirty_label(dirty: object) -> tuple[str, str]:
+    """`None` means Panda did not run git to find out (R2-106): never say "clean"."""
+
+    if dirty is None:
+        return ("worktree state unknown", WHITE_SHADOW)
+    return ("dirty", AMBER) if dirty else ("clean", GREEN)
+
+
 def status_panel(info: dict[str, Any], last_session: Any = None) -> None:
     output = console()
     root = info.get("root", "")
@@ -379,10 +438,7 @@ def status_panel(info: dict[str, Any], last_session: Any = None) -> None:
             ("git    ", WHITE_SHADOW),
             (str(branch), WHITE),
             ("  ", ""),
-            (
-                "dirty" if git.get("dirty") else "clean",
-                AMBER if git.get("dirty") else GREEN,
-            ),
+            _dirty_label(git.get("dirty")),
         ),
     ]
     tools = info.get("tools", {})

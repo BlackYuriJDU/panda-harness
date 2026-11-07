@@ -10,24 +10,34 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
 import json
 import os
 import re
+import shlex
+import stat
+import sys
+import threading
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from panda_core.atomic import atomic_write_text
-from panda_core.errors import PandaError
-from panda_core.policy import Decision, PolicyEngine
-from panda_core.process import run_command
+from panda_core import gitsafe
+from panda_core.atomic import atomic_write_bytes, atomic_write_text
+from panda_core.errors import ConfigError, PandaError
+from panda_core.policy import ENFORCED_ACTIONS, Decision, PolicyEngine
+from panda_core.process import run_command, scrubbed_env
 from panda_core.provider import status_snapshot
+from panda_core.redact import REDACTED, redact_text
 from panda_core.registry import find_study, load_registry, load_study_card, parse_frontmatter
+from panda_core.safe_read import ensure_plain_path
 from panda_core.session import SessionLog
-from panda_core.validator import Validator
+from panda_core.treehash import file_sha256
+from panda_core.validator import Validator, validator_sha256
 from panda_core.workspace import Workspace
 
+GREP_TIMEOUT_SECONDS = 10.0
 IGNORED_DIRS = {
     ".git",
     ".hg",
@@ -44,8 +54,16 @@ IGNORED_DIRS = {
 }
 MAX_READ_BYTES = 1_048_576
 MAX_WRITE_BYTES = 2_097_152
-PREVIEW_LIMIT = 6_000
+# A diff is shown whole up to this size; past it the action cannot be approved (R2-125).
+PREVIEW_LIMIT = 200_000
 DEFAULT_OUTPUT_LIMIT = 30_000
+# R2-408: one result may use at most this share of the context window (at ~4
+# characters per token, the estimate the agent trims against), and never more
+# than RESULT_LIMIT_MAX characters. Longer lines are cut so one line cannot.
+RESULT_WINDOW_SHARE = 0.2
+RESULT_LIMIT_MAX = 200_000
+RESULT_LIMIT_MIN = 8_000
+LINE_LIMIT = 2_000
 
 
 class ToolInputError(Exception):
@@ -102,9 +120,23 @@ class ApprovalRequest:
     reason: str
     preview: str = ""
     preview_kind: str = "none"
+    # From the resolved decision, never from a rule id (R2-500): what --auto reads.
+    effect_class: str = ""
+    # The consent card (R2-229, R2-117): exactly what runs, where, under which rule.
+    argv: tuple[str, ...] = ()
+    cwd: str = ""
+    rule_source: str = ""
+    payload_sha256: str = ""
+    preview_complete: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "effect_class": self.effect_class or self.action,
+            "argv": list(self.argv),
+            "cwd": self.cwd,
+            "rule_source": self.rule_source,
+            "payload_sha256": self.payload_sha256,
+            "preview_complete": self.preview_complete,
             "tool": self.tool,
             "action": self.action,
             "resource": self.resource,
@@ -127,6 +159,18 @@ class ToolContext:
     active_study: str | None = None
     approve: Approver | None = None
     output_limit: int = DEFAULT_OUTPUT_LIMIT
+    result_limit: int | None = None
+    # Who answered the last approval request: human, auto or policy (set by the agent).
+    decided_by: str | None = None
+
+    def max_result_chars(self) -> int:
+        """Characters one tool result may carry to the model (R2-408)."""
+
+        if self.result_limit is not None:
+            return max(1, self.result_limit)
+        window = self.workspace.config.provider.context_window
+        share = int(window * 4 * RESULT_WINDOW_SHARE)
+        return max(RESULT_LIMIT_MIN, min(RESULT_LIMIT_MAX, share))
 
 
 def _json(payload: Any) -> str:
@@ -139,44 +183,25 @@ def _cap(text: str, limit: int) -> str:
     return text[:limit] + f"\n[truncated {len(text) - limit} chars]"
 
 
-_SECRET_ENV_NAMES = frozenset(
-    {
-        "ANTHROPIC_API_KEY",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "GEMINI_API_KEY",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GOOGLE_API_KEY",
-        "OPENAI_API_KEY",
-    }
-)
-_SECRET_ENV_PREFIXES = ("PANDA_", "OPENCODE_", "OPENROUTER_")
-_SECRET_ENV_SUFFIXES = (
-    "_KEY",
-    "_TOKEN",
-    "_SECRET",
-    "_PASSWORD",
-    "_PASSWD",
-    "_CREDENTIALS",
-)
-
-
 def _scrubbed_env() -> dict[str, str]:
     """Child processes never inherit harness or provider credentials."""
 
-    env: dict[str, str] = {}
-    for name, value in os.environ.items():
-        upper = name.upper()
-        if upper in _SECRET_ENV_NAMES:
-            continue
-        if upper.startswith(_SECRET_ENV_PREFIXES):
-            continue
-        if upper.endswith(_SECRET_ENV_SUFFIXES):
-            continue
-        env[name] = value
-    return env
+    return scrubbed_env()
+
+
+def _line_ending(text: str) -> str:
+    """The single line ending of `text`; mixed endings are refused (EDIT-001)."""
+
+    crlf = text.count("\r\n")
+    lone_lf = text.count("\n") - crlf
+    lone_cr = text.count("\r") - crlf
+    kinds = [kind for kind, n in (("\r\n", crlf), ("\n", lone_lf), ("\r", lone_cr)) if n]
+    if len(kinds) > 1:
+        raise ToolInputError(
+            "file has mixed line endings; edit_file will not guess which to keep "
+            "(use write_file with the full content)"
+        )
+    return kinds[0] if kinds else "\n"
 
 
 def _read_exact(path: Path) -> str:
@@ -215,7 +240,9 @@ def _diff_preview(relative: str, before: str, after: str) -> str:
     return _cap("\n".join(diff) or "(no textual change)", PREVIEW_LIMIT)
 
 
-def _blocked(tool: str, decision: Decision, detail: str) -> ToolResult:
+def _blocked(
+    tool: str, decision: Decision, detail: str, *, next_step: str | None = None
+) -> ToolResult:
     payload = {
         "ok": False,
         "blocked": True,
@@ -227,8 +254,52 @@ def _blocked(tool: str, decision: Decision, detail: str) -> ToolResult:
         "rule": decision.rule_id,
         "reason": decision.reason or detail,
         "detail": detail,
+        "next_step": next_step or _denied_next_step(decision, "built-in"),
     }
     return ToolResult(ok=False, blocked=True, content=_json(payload), data=payload)
+
+
+def _denied_next_step(decision: Decision, source: str) -> str:
+    """What the model should do after a policy denial (R2-412)."""
+
+    where = {
+        "workspace": "the workspace policy (.panda/policy.json)",
+        "classifier": "Panda's command classifier",
+    }.get(source, "Panda's built-in policy")
+    return (
+        f"Do not retry this by any other route (another tool, a wrapper, a different path). "
+        f"Tell the user that rule {decision.rule_id or 'default'} in {where} blocks it, and "
+        "ask how they want to proceed."
+    )
+
+
+# R2-412: a blocked approval tells the model what kind of stop it is.
+# Which tools apply each enforced action (R2-410).
+ENFORCING_TOOLS: dict[str, list[str]] = {
+    "read": ["read_file", "list_files", "grep", "study_*", "evidence_*", "claim_*", "number_*"],
+    "write": ["write_file"],
+    "edit": ["edit_file"],
+    "shell": ["run_shell"],
+    "validate": ["validate"],
+}
+
+_APPROVAL_NEXT_STEP = {
+    "policy": (
+        "approval is required and no interactive approver is available",
+        "Do not try another route. Tell the user this action needs their approval: they can "
+        "run it in an interactive session (panda chat) or do it themselves.",
+    ),
+    "auto": (
+        "--auto does not approve this kind of action",
+        "Do not try another route. --auto only approves workspace edits and local checks; "
+        "tell the user this action needs a person's approval.",
+    ),
+    "human": (
+        "approval denied by the operator",
+        "The user said no. Do not retry the same action; ask the user why before trying "
+        "an alternative.",
+    ),
+}
 
 
 async def _authorize(
@@ -239,16 +310,55 @@ async def _authorize(
     resource: str,
     preview: str = "",
     preview_kind: str = "none",
+    argv: Sequence[str] | None = None,
+    cwd: str = "",
+    payload_sha256: str = "",
 ) -> tuple[Decision | None, ToolResult | None]:
-    decision = ctx.policy.decide(action, resource)
+    decision = (
+        ctx.policy.decide_shell(argv) if argv is not None else ctx.policy.decide(action, resource)
+    )
     if decision.effect == "allow":
         return decision, None
     if decision.effect in {"deny", "hard_deny"}:
-        return decision, _blocked(tool, decision, "policy denies this action")
-    if ctx.approve is None:
+        source = ctx.policy.rule_source(decision.rule_id)
         return decision, _blocked(
-            tool, decision, "approval is required and no interactive approver is available"
+            tool,
+            decision,
+            "policy denies this action",
+            next_step=_denied_next_step(decision, source),
         )
+    return decision, await _ask(
+        ctx,
+        decision,
+        tool=tool,
+        action=action,
+        resource=resource,
+        preview=preview,
+        preview_kind=preview_kind,
+        argv=tuple(argv or ()),
+        cwd=cwd,
+        payload_sha256=payload_sha256,
+    )
+
+
+async def _ask(
+    ctx: ToolContext,
+    decision: Decision,
+    *,
+    tool: str,
+    action: str,
+    resource: str,
+    preview: str,
+    preview_kind: str,
+    argv: tuple[str, ...] = (),
+    cwd: str = "",
+    payload_sha256: str = "",
+) -> ToolResult | None:
+    """Ask the approver; `None` means approved, a result means blocked."""
+
+    if ctx.approve is None:
+        detail, step = _APPROVAL_NEXT_STEP["policy"]
+        return _blocked(tool, decision, detail, next_step=step)
     request = ApprovalRequest(
         tool=tool,
         action=action,
@@ -258,14 +368,57 @@ async def _authorize(
         reason=decision.reason,
         preview=preview,
         preview_kind=preview_kind,
+        effect_class=decision.effect_class or action,
+        argv=argv,
+        cwd=cwd,
+        rule_source=ctx.policy.rule_source(decision.rule_id),
+        payload_sha256=payload_sha256,
+        preview_complete="\n[truncated " not in preview[-120:],
     )
+    ctx.decided_by = None
     try:
         approved = bool(await ctx.approve(request))
     except Exception:  # noqa: BLE001 - approval failure must deny, never allow
         approved = False
     if not approved:
-        return decision, _blocked(tool, decision, "approval denied by the operator")
-    return decision, None
+        detail, step = _APPROVAL_NEXT_STEP.get(ctx.decided_by or "human",
+                                               _APPROVAL_NEXT_STEP["human"])
+        return _blocked(tool, decision, detail, next_step=step)
+    return None
+
+
+_MARKER_MESSAGE = (
+    "the text contains the `[redacted]` marker that Panda puts where a secret is; writing "
+    "it would replace the real value. Leave secret lines untouched or ask the user"
+)
+
+
+def _schema_problem(schema: dict[str, Any], args: dict[str, Any]) -> str | None:
+    """The first way `args` breaks the tool's JSON Schema, as one actionable sentence."""
+
+    from jsonschema import Draft202012Validator
+
+    strict = dict(schema)
+    strict.setdefault("type", "object")
+    if "properties" in strict:
+        strict.setdefault("additionalProperties", False)
+    errors = sorted(Draft202012Validator(strict).iter_errors(args), key=lambda e: list(e.path))
+    if not errors:
+        return None
+    error = errors[0]
+    where = ".".join(str(part) for part in error.path) or "arguments"
+    if error.validator == "additionalProperties":
+        unknown = sorted(set(args) - set(strict.get("properties", {})))
+        allowed = ", ".join(strict["properties"])
+        return f"unknown argument(s) {', '.join(unknown)}; allowed: {allowed}"
+    if error.validator == "required":
+        return f"missing required argument: {error.message.split(chr(39))[1]}"
+    expected = error.schema.get("type") or error.schema.get("enum") or error.validator
+    return f"{where}: {error.message} (expected {expected})"
+
+
+def _is_git(argv: Sequence[str]) -> bool:
+    return bool(argv) and Path(argv[0].replace("\\", "/")).name.lower() in {"git", "git.exe"}
 
 
 def _fail(tool: str, message: str, *, data: dict[str, Any] | None = None) -> ToolResult:
@@ -276,6 +429,26 @@ def _fail(tool: str, message: str, *, data: dict[str, Any] | None = None) -> Too
 def _ok(tool: str, payload: dict[str, Any], *, text: str | None = None) -> ToolResult:
     body = {"ok": True, "tool": tool, **payload}
     return ToolResult(ok=True, content=text if text is not None else _json(body), data=body)
+
+def _bounded(result: ToolResult, limit: int) -> ToolResult:
+    """Cut any result above the per-result budget, saying so (R2-408).
+
+    Tools with a natural continuation (read_file) stop early with their own hint;
+    this net covers the rest, so no single result can fill the context window.
+    """
+
+    size = len(result.content)
+    if size <= limit:
+        return result
+    note = (
+        f"\n[result truncated: {size - limit} of {size} characters omitted; "
+        "narrow the request (a smaller range, a tighter pattern or a lower limit)]"
+    )
+    data = {**result.data, "result_truncated": True, "result_chars": size}
+    return ToolResult(
+        ok=result.ok, content=result.content[:limit] + note, data=data, blocked=result.blocked
+    )
+
 
 def _string_arg(args: dict[str, Any], key: str, *, default: str | None = None) -> str:
     value = args.get(key, default)
@@ -316,11 +489,27 @@ def _id_list(value: Any) -> list[str]:
     return []
 
 
+# Data registries (evidence, numbers) may be larger than an ordinary file, never unbounded.
+MAX_DATA_BYTES = 16_000_000
+
+
+def _bounded_text(path: Path, limit: int | None = None) -> str:
+    """Read a corpus file only if it is no larger than `limit` (R2-302)."""
+
+    limit = MAX_DATA_BYTES if limit is None else limit
+    size = path.stat().st_size
+    if size > limit:
+        raise ToolInputError(
+            f"{path.name} is {size} bytes, more than {limit}; split it or use grep"
+        )
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise ToolInputError(f"file not found: {path.name}")
     records: list[dict[str, Any]] = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for number, line in enumerate(_bounded_text(path).splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -336,7 +525,7 @@ def _numbers_records(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise ToolInputError(f"file not found: {path.name}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_bounded_text(path))
     except json.JSONDecodeError as exc:
         raise ToolInputError(f"invalid JSON in {path.name}: {exc.msg}") from exc
     if isinstance(payload, list):
@@ -356,7 +545,14 @@ def _numbers_records(path: Path) -> list[dict[str, Any]]:
     raise ToolInputError(f"{path.name} must contain a list or object of numbers")
 
 
-def _iter_files(root: Path, pattern: str, limit: int) -> list[Path]:
+def _iter_files(
+    root: Path, pattern: str, limit: int, *, files_only: bool = False
+) -> tuple[list[Path], bool]:
+    """Up to `limit` matches in sorted order, and whether more exist (R2-402, R2-413).
+
+    `files_only` counts only regular files, so directories do not use the cap.
+    """
+
     if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
         raise ToolInputError("pattern must be relative and stay inside the workspace")
     found: list[Path] = []
@@ -367,10 +563,45 @@ def _iter_files(root: Path, pattern: str, limit: int) -> list[Path]:
             continue
         if any(part in IGNORED_DIRS for part in relative.parts):
             continue
-        found.append(candidate)
+        if files_only and (candidate.is_symlink() or not candidate.is_file()):
+            continue
         if len(found) >= limit:
-            break
-    return found
+            return found, True
+        found.append(candidate)
+    return found, False
+
+
+GREP_FILE_CAP = 5_000
+
+
+def _grep_next_step(capped: bool, too_large: int) -> dict[str, str]:
+    if capped:
+        return {
+            "next_step": f"more than {GREP_FILE_CAP} files match the glob and the rest were "
+            "not searched; narrow glob (for example corpus/claims/**/*.md)"
+        }
+    if too_large:
+        return {
+            "next_step": f"{too_large} file(s) over {MAX_READ_BYTES} bytes were not "
+            "searched; a missing match there is not evidence of absence"
+        }
+    return {}
+
+
+def _readable_by_policy(ctx: ToolContext, root: Path, candidate: Path) -> bool:
+    """True when `read` is plainly allowed for this file, under both its names.
+
+    Search tools authorize the workspace once, so each hit is checked here with
+    the same rule `read_file` uses. A symlink is judged by its target as well as
+    its own name. `ask` counts as not readable: a search never prompts per file.
+    """
+
+    names = {candidate.relative_to(root).as_posix()}
+    try:
+        names.add(candidate.resolve().relative_to(root.resolve()).as_posix())
+    except (OSError, ValueError):
+        return False
+    return all(ctx.policy.decide("read", name).effect == "allow" for name in names)
 
 
 class ToolRegistry:
@@ -433,13 +664,14 @@ class ToolRegistry:
         else:
             return _fail(name, "arguments must be an object or JSON object string")
 
-        required = spec.parameters.get("required", [])
-        missing = [key for key in required if key not in args]
-        if missing:
-            return _fail(name, f"missing required argument(s): {', '.join(missing)}")
+        problem = _schema_problem(spec.parameters, args)
+        if problem:
+            # R2-401: the schema the model sees is the one enforced; "false" is not a
+            # boolean, an unknown key is not ignored, and a bound is not clipped quietly.
+            return _fail(name, f"invalid arguments: {problem}")
         handler = self._handlers[name]
         try:
-            return await handler(args)
+            return _bounded(await handler(args), self.ctx.max_result_chars())
         except ToolInputError as exc:
             return _fail(name, str(exc))
         except PandaError as exc:
@@ -485,24 +717,46 @@ class ToolRegistry:
         text = path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         total = len(lines)
-        end = min(total, start - 1 + limit)
-        numbered = "\n".join(
-            f"{number:>5}  {lines[number - 1]}" for number in range(start, end + 1)
-        )
+        if start > max(total, 1):
+            raise ToolInputError(f"start_line {start} is past the end ({total} lines)")
+        last = min(total, start - 1 + limit)
+        budget = self.ctx.max_result_chars() - 200  # header and hint
+        rendered: list[str] = []
+        used = 0
+        cut_lines = 0
+        end = start - 1
+        for number in range(start, last + 1):
+            line = lines[number - 1]
+            if len(line) > LINE_LIMIT:
+                line = f"{line[:LINE_LIMIT]} [line cut: {len(line) - LINE_LIMIT} more chars]"
+                cut_lines += 1
+            entry = f"{number:>5}  {line}"
+            if rendered and used + len(entry) + 1 > budget:
+                break
+            rendered.append(entry)
+            used += len(entry) + 1
+            end = number
         header = f"{relative}:{start}-{end} of {total} lines"
-        body = f"{header}\n{numbered}" if numbered else f"{header}\n(empty)"
-        return _ok(
-            "read_file",
-            {
-                "path": relative,
-                "total_lines": total,
-                "start_line": start,
-                "end_line": end,
-                "truncated": end < total,
-                "rule": decision.rule_id if decision else None,
-            },
-            text=body,
-        )
+        body = f"{header}\n" + ("\n".join(rendered) if rendered else "(empty)")
+        truncated = end < total
+        payload: dict[str, Any] = {
+            "path": relative,
+            "total_lines": total,
+            "start_line": start,
+            "end_line": end,
+            "truncated": truncated,
+            "rule": decision.rule_id if decision else None,
+        }
+        if truncated:
+            payload["next_start_line"] = end + 1
+            reason = "the result budget" if end < last else "max_lines"
+            body += (
+                f"\n[truncated at line {end} by {reason}; "
+                f"call read_file with start_line={end + 1} to continue]"
+            )
+        if cut_lines:
+            payload["lines_cut"] = cut_lines
+        return _ok("read_file", payload, text=body)
     async def _list_files(self, args: dict[str, Any]) -> ToolResult:
         pattern = _string_arg(args, "pattern", default="*") or "*"
         limit = _int_arg(args, "limit", default=200, minimum=1, maximum=2_000)
@@ -511,18 +765,34 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        found = _iter_files(self.ctx.workspace.root, pattern, limit)
-        entries: list[str] = []
-        for candidate in found:
-            relative = candidate.relative_to(self.ctx.workspace.root.resolve()).as_posix()
-            entries.append(relative + ("/" if candidate.is_dir() else ""))
+        root = self.ctx.workspace.root
+
+        def enumerate_entries() -> tuple[list[str], int, bool]:
+            found, more = _iter_files(root, pattern, limit)
+            entries: list[str] = []
+            omitted = 0
+            for candidate in found:
+                if not _readable_by_policy(self.ctx, root, candidate):
+                    omitted += 1
+                    continue
+                relative = candidate.relative_to(root.resolve()).as_posix()
+                entries.append(relative + ("/" if candidate.is_dir() else ""))
+            return entries, omitted, more
+
+        # R2-216: walking a large tree and checking each path must not stall the
+        # event loop (the cockpit, other MCP clients).
+        entries, omitted, more = await asyncio.to_thread(enumerate_entries)
         return _ok(
             "list_files",
             {
                 "pattern": pattern,
                 "count": len(entries),
+                "omitted_by_policy": omitted,
+                "truncated": more,
                 "entries": entries,
                 "rule": decision.rule_id if decision else None,
+                **({"next_step": f"more than {limit} entries match; raise limit "
+                    "(max 2000) or narrow the pattern"} if more else {}),
             },
         )
 
@@ -536,51 +806,90 @@ class ToolRegistry:
             raise ToolInputError("pattern must not be empty")
         flags = 0 if case_sensitive else re.IGNORECASE
         try:
-            regex = re.compile(re.escape(pattern) if fixed else pattern, flags)
+            re.compile(re.escape(pattern) if fixed else pattern, flags)
         except re.error as exc:
             raise ToolInputError(f"invalid regular expression: {exc}") from exc
         _, blocked = await _authorize(self.ctx, tool="grep", action="read", resource=".")
         if blocked:
             return blocked
-        matches: list[str] = []
-        files_scanned = 0
-        truncated = False
         root = self.ctx.workspace.root.resolve()
-        for candidate in _iter_files(self.ctx.workspace.root, glob, 5_000):
-            if not candidate.is_file() or candidate.stat().st_size > MAX_READ_BYTES:
-                continue
-            files_scanned += 1
-            try:
-                raw = candidate.read_bytes()
-            except OSError:
-                continue
-            if b"\x00" in raw[:2048]:
-                continue
-            text = raw.decode("utf-8", "replace")
-            relative = candidate.relative_to(root).as_posix()
-            for number, line in enumerate(text.splitlines(), start=1):
-                if regex.search(line):
-                    matches.append(f"{relative}:{number}: {line[:300]}")
-                    if len(matches) >= limit:
-                        truncated = True
-                        break
-            if truncated:
-                break
+
+        def select_files() -> tuple[list[list[object]], int, int, bool]:
+            selected: list[list[object]] = []
+            files, capped = _iter_files(
+                self.ctx.workspace.root, glob, GREP_FILE_CAP, files_only=True
+            )
+            omitted = too_large = 0
+            for candidate in files:
+                if candidate.stat().st_size > MAX_READ_BYTES:
+                    too_large += 1
+                    continue
+                if not _readable_by_policy(self.ctx, root, candidate):
+                    omitted += 1
+                    continue
+                info = os.lstat(candidate)
+                selected.append(
+                    [candidate.relative_to(root).as_posix(), info.st_dev, info.st_ino]
+                )
+            return selected, omitted, too_large, capped
+
+        # R2-216: enumeration and per-file policy checks run off the event loop.
+        candidates, omitted, too_large, capped = await asyncio.to_thread(select_files)
+        request = {
+            "pattern": pattern,
+            "flags": flags,
+            "fixed": fixed,
+            "limit": limit,
+            "max_bytes": MAX_READ_BYTES,
+            "files": candidates,
+        }
+        worker = Path(__file__).with_name("grep_worker.py")
+        result = await asyncio.to_thread(
+            run_command,
+            [sys.executable, "-I", str(worker)],
+            cwd=root,
+            timeout=GREP_TIMEOUT_SECONDS,
+            env=_scrubbed_env(),
+            input_text=json.dumps(request),
+        )
+        if result.timed_out:
+            return _fail(
+                "grep",
+                f"the pattern took longer than {GREP_TIMEOUT_SECONDS:g}s and was stopped; "
+                "use fixed_strings or a simpler pattern",
+            )
+        try:
+            found = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            detail = result.stderr.strip()[-300:] or "no output"
+            return _fail("grep", f"the search worker failed: {detail}")
         return _ok(
             "grep",
             {
                 "pattern": pattern,
                 "glob": glob,
-                "files_scanned": files_scanned,
-                "count": len(matches),
-                "matches": matches,
-                "truncated": truncated,
+                "files_scanned": found["scanned"],
+                "omitted_by_policy": omitted,
+                "count": len(found["matches"]),
+                "matches": found["matches"],
+                "truncated": found["truncated"],
+                # R2-402: a count of 0 means "not found" only when the search was complete.
+                "search_complete": not (capped or too_large),
+                "files_skipped_too_large": too_large,
+                "file_cap_reached": capped,
+                **_grep_next_step(capped, too_large),
             },
         )
 
     async def _study_list(self, args: dict[str, Any]) -> ToolResult:
         track = args.get("track")
         status = args.get("status")
+        # R2-118: the registry is a file like any other; a read deny on it applies.
+        _, blocked = await _authorize(
+            self.ctx, tool="study_list", action="read", resource="corpus/studies/INDEX.md"
+        )
+        if blocked:
+            return blocked
         studies = [study.to_dict() for study in load_registry(self.ctx.workspace.root)]
         if isinstance(track, str) and track:
             studies = [study for study in studies if study["track"] == track]
@@ -590,8 +899,19 @@ class ToolRegistry:
 
     async def _study_show(self, args: dict[str, Any]) -> ToolResult:
         study_id = _string_arg(args, "study_id")
-        study = find_study(self.ctx.workspace.root, study_id)
-        card = load_study_card(study)
+        root = self.ctx.workspace.root
+        study = find_study(root, study_id)
+        if study.path:
+            try:
+                relative = Path(study.path).relative_to(root).as_posix()
+            except ValueError:
+                raise ToolInputError("study card is outside the workspace") from None
+            _, blocked = await _authorize(
+                self.ctx, tool="study_show", action="read", resource=relative
+            )
+            if blocked:
+                return blocked
+        card = load_study_card(study, root)
         payload = study.to_dict()
         payload["frontmatter"] = card["frontmatter"]
         payload["body"] = _cap(card["body"], 8_000)
@@ -600,6 +920,12 @@ class ToolRegistry:
     async def _validate(self, args: dict[str, Any]) -> ToolResult:
         release = bool(args.get("release", False))
         workspace = self.ctx.workspace
+        _, blocked = await _authorize(
+            self.ctx, tool="validate", action="validate", resource=workspace.config.validator
+        )
+        if blocked:
+            return blocked
+        validator_hash = validator_sha256(workspace.root, workspace.validator_path)
         report = await asyncio.to_thread(
             lambda: Validator(
                 workspace.root,
@@ -610,6 +936,7 @@ class ToolRegistry:
             ).run(release=release)
         )
         payload = report.to_dict()
+        payload["validator_sha256"] = validator_hash
         return ToolResult(
             ok=report.ok,
             content=_json({"ok": report.ok, "tool": "validate", **payload}),
@@ -620,13 +947,16 @@ class ToolRegistry:
         action = _string_arg(args, "action")
         resource = _string_arg(args, "resource")
         normalized = resource
-        if action in {"read", "write", "edit", "delete"} and resource:
+        if action in {"read", "write", "edit"} and resource:
             try:
                 _, normalized = resolve_inside(self.ctx.workspace.root, resource)
             except ToolInputError:
                 normalized = resource
         decision = self.ctx.policy.decide(action, normalized)
-        return _ok("policy_check", decision.to_dict())
+        return _ok(
+            "policy_check",
+            {**decision.to_dict(), "enforced": True, "enforced_by": ENFORCING_TOOLS[action]},
+        )
 
     async def _session_note(self, args: dict[str, Any]) -> ToolResult:
         message = _string_arg(args, "message").strip()
@@ -650,12 +980,33 @@ class ToolRegistry:
         if path.is_dir():
             raise ToolInputError(f"path is a directory: {relative}")
         before = ""
+        hash_before: str | None = None
+        file_mode = 0o644
         if path.is_file():
+            file_mode = stat.S_IMODE(path.stat().st_mode)
             try:
-                before = path.read_text(encoding="utf-8", errors="replace")
+                raw_before = path.read_bytes()
             except OSError as exc:
                 raise ToolInputError(f"cannot read existing file: {exc}") from exc
-        preview = _diff_preview(relative, before, content)
+            before = raw_before.decode("utf-8", errors="replace")
+            hash_before = hashlib.sha256(raw_before).hexdigest()
+        protected = self.ctx.policy.decide("read", relative).effect != "allow"
+        if protected:
+            # N-01: the read policy denies this file, so its current content must not
+            # reach the approval card, the ledger or the model through a diff.
+            preview = (
+                f"--- {relative} (existing content protected by the read policy; "
+                f"sha256 {hash_before or 'none'})\n+++ {relative}\n"
+                + "".join(f"+{line}\n" for line in content.splitlines())
+            )
+            if REDACTED in content:
+                return _fail("write_file", _MARKER_MESSAGE)
+        else:
+            if REDACTED in content and redact_text(before) != before:
+                # N-02: the model saw `[redacted]` where a secret is; writing the
+                # marker back would destroy the real value.
+                return _fail("write_file", _MARKER_MESSAGE)
+            preview = _diff_preview(relative, before, content)
         _, blocked = await _authorize(
             self.ctx,
             tool="write_file",
@@ -663,12 +1014,19 @@ class ToolRegistry:
             resource=relative,
             preview=preview,
             preview_kind="diff",
+            payload_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
         )
         if blocked:
             return blocked
+        current = file_sha256(path) if path.is_file() else None
+        if current != hash_before:
+            return _fail(
+                "write_file",
+                "the file changed while waiting for approval; read it again and retry",
+            )
         changed = before != content
         if changed:
-            atomic_write_text(path, content, mode=0o644)
+            atomic_write_text(path, content, mode=file_mode)
             try:
                 written = _read_exact(path)
             except OSError as exc:
@@ -687,6 +1045,8 @@ class ToolRegistry:
                 "bytes": len(content.encode("utf-8")),
                 "changed": changed,
                 "created": not before and changed,
+                "sha256_before": hash_before,
+                "sha256_after": file_sha256(path) if path.is_file() else None,
             },
         )
 
@@ -702,7 +1062,31 @@ class ToolRegistry:
             raise ToolInputError(f"file not found: {relative}")
         if path.stat().st_size > MAX_WRITE_BYTES:
             raise ToolInputError(f"file exceeds {MAX_WRITE_BYTES} bytes")
-        before = path.read_text(encoding="utf-8", errors="replace")
+        if self.ctx.policy.decide("read", relative).effect != "allow":
+            # N-01: editing needs the content in a diff; a read-denied file stays unread.
+            return _fail(
+                "edit_file",
+                f"{relative} is protected by the read policy; ask the user to edit it",
+            )
+        raw = path.read_bytes()
+        file_mode = stat.S_IMODE(path.stat().st_mode)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ToolInputError(
+                "file is not valid UTF-8; edit_file refuses to rewrite it because "
+                "bytes would be lost (use write_file with the full content)"
+            ) from None
+        ending = _line_ending(text)
+        before = text.replace(ending, "\n") if ending != "\n" else text
+        old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
+        if "\r" in new or "\r" in old:
+            # R2-119: a bare CR would give the file mixed line endings, and the next
+            # edit would be refused.
+            raise ToolInputError(
+                "old_string/new_string contain a bare carriage return (\\r); use \\n for "
+                "line breaks (the file's own line ending is kept)"
+            )
         count = before.count(old)
         if count == 0:
             raise ToolInputError("old_string was not found; read the file before editing")
@@ -710,6 +1094,8 @@ class ToolRegistry:
             raise ToolInputError(
                 f"old_string appears {count} times; provide more context or set replace_all"
             )
+        if REDACTED in new and redact_text(before) != before:
+            return _fail("edit_file", _MARKER_MESSAGE)
         after = before.replace(old, new) if replace_all else before.replace(old, new, 1)
         preview = _diff_preview(relative, before, after)
         _, blocked = await _authorize(
@@ -719,15 +1105,22 @@ class ToolRegistry:
             resource=relative,
             preview=preview,
             preview_kind="diff",
+            payload_sha256=hashlib.sha256(after.encode("utf-8")).hexdigest(),
         )
         if blocked:
             return blocked
-        atomic_write_text(path, after, mode=0o644)
+        data = (after.replace("\n", ending) if ending != "\n" else after).encode("utf-8")
+        if not path.is_file() or path.read_bytes() != raw:
+            return _fail(
+                "edit_file",
+                "the file changed while waiting for approval; read it again and retry",
+            )
+        atomic_write_bytes(path, data, mode=file_mode)
         try:
-            written = _read_exact(path)
+            written = _read_exact(path)  # no newline translation, so CRLF is compared as is
         except OSError as exc:
             return _fail("edit_file", f"post-write verification failed: {exc}")
-        if written != after:
+        if written != data.decode("utf-8"):
             return _fail(
                 "edit_file",
                 "post-write verification failed: content differs after edit",
@@ -737,7 +1130,9 @@ class ToolRegistry:
             {
                 "path": relative,
                 "replacements": count if replace_all else 1,
-                "bytes": len(after.encode("utf-8")),
+                "bytes": len(data),
+                "sha256_before": hashlib.sha256(raw).hexdigest(),
+                "sha256_after": hashlib.sha256(data).hexdigest(),
             },
         )
 
@@ -755,24 +1150,76 @@ class ToolRegistry:
         if not cwd.is_dir():
             raise ToolInputError(f"cwd is not a directory: {cwd_relative}")
         command_text = " ".join(argv)
-        _, blocked = await _authorize(
+        # The preview keeps token boundaries (R2-117): `['a b']` and `['a', 'b']`
+        # must not look the same to the person approving.
+        shown = shlex.join(argv)
+        payload_hash = hashlib.sha256(
+            json.dumps({"argv": argv, "cwd": cwd_relative}).encode("utf-8")
+        ).hexdigest()
+        decision, blocked = await _authorize(
             self.ctx,
             tool="run_shell",
             action="shell",
             resource=command_text,
-            preview=command_text,
+            preview=shown,
             preview_kind="command",
+            argv=argv,
+            cwd=cwd_relative,
+            payload_sha256=payload_hash,
         )
         if blocked:
             return blocked
-        result = await asyncio.to_thread(
-            run_command, argv, cwd=cwd, timeout=timeout, env=_scrubbed_env()
-        )
+        effective, env = list(argv), _scrubbed_env()
+        if decision is not None and decision.effect == "allow" and _is_git(argv):
+            # Allowed git runs with nobody watching: the repository must not choose
+            # a program, and content commands must not print denied files.
+            hardened = gitsafe.harden(
+                argv,
+                root=self.ctx.workspace.root,
+                cwd=cwd,
+                base_env=env,
+                denied_reads=self.ctx.policy.denied_read_patterns(),
+            )
+            if hardened.hazard is not None:
+                escalated = replace(
+                    decision,
+                    effect="ask",
+                    risk="high",
+                    rule_id="shell-git-hazard",
+                    reason=f"git cannot be isolated here: {hardened.hazard}",
+                    effect_class="exec_unknown",
+                )
+                blocked = await _ask(
+                    self.ctx,
+                    escalated,
+                    tool="run_shell",
+                    action="shell",
+                    resource=command_text,
+                    preview=shown,
+                    preview_kind="command",
+                    argv=tuple(argv),
+                    cwd=cwd_relative,
+                    payload_sha256=payload_hash,
+                )
+                if blocked:
+                    return blocked
+            else:
+                effective, env = list(hardened.argv), dict(hardened.env)
+        cancel = threading.Event()
+        try:
+            result = await asyncio.to_thread(
+                run_command, effective, cwd=cwd, timeout=timeout, env=env, cancel=cancel
+            )
+        except asyncio.CancelledError:
+            cancel.set()  # the thread kills the process group; do not wait for it
+            raise
         payload = {
             "argv": argv,
+            **({"effective_argv": effective} if effective != list(argv) else {}),
             "cwd": cwd_relative,
             "returncode": result.returncode,
             "timed_out": result.timed_out,
+            "output_truncated": result.output_truncated,
             "duration_ms": result.duration_ms,
             "stdout": _cap(result.stdout, self.ctx.output_limit // 2),
             "stderr": _cap(result.stderr, self.ctx.output_limit // 2),
@@ -819,7 +1266,10 @@ class ToolRegistry:
             {
                 "path": relative,
                 "count": len(summaries[:limit]),
-                "total": len(records),
+                # R2-413: `total` counts the matches, like claim_list; the file total is
+                # separate so a filter never reads as "more to page through".
+                "total": len(summaries),
+                "records_in_file": len(records),
                 "truncated": len(summaries) > limit,
                 "evidence": summaries[:limit],
             },
@@ -838,12 +1288,31 @@ class ToolRegistry:
                 return _ok("evidence_show", {"path": relative, "evidence": record})
         raise ToolInputError(f"evidence not found: {evidence_id}")
 
-    def _claim_records(self) -> list[dict[str, Any]]:
+    def _claim_records(self) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Readable claim cards, and the cards left out keyed by file stem (R2-403).
+
+        The reason is `policy`, `link` or `too_large`; the caller reports them so a
+        missing claim is never mistaken for an absent one.
+        """
+
         directory = self.ctx.workspace.root / "corpus/claims"
         if not directory.is_dir():
             raise ToolInputError("claims directory not found: corpus/claims")
         records: list[dict[str, Any]] = []
+        omitted: dict[str, str] = {}
+        root = self.ctx.workspace.root
         for path in sorted(directory.glob("*.md")):
+            try:
+                ensure_plain_path(root, path)
+            except ConfigError:
+                omitted[path.stem] = "link"  # SEC-011
+                continue
+            if not _readable_by_policy(self.ctx, root, path):
+                omitted[path.stem] = "policy"
+                continue
+            if path.stat().st_size > MAX_READ_BYTES:
+                omitted[path.stem] = "too_large"  # R2-302
+                continue
             text = path.read_text(encoding="utf-8", errors="replace")
             try:
                 frontmatter, body = parse_frontmatter(text)
@@ -854,7 +1323,7 @@ class ToolRegistry:
             record["file"] = path.name
             record["body"] = body
             records.append(record)
-        return records
+        return records, omitted
 
     async def _claim_list(self, args: dict[str, Any]) -> ToolResult:
         _, blocked = await _authorize(
@@ -862,7 +1331,7 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        records = self._claim_records()
+        records, omitted = self._claim_records()
         limit = _int_arg(args, "limit", default=100, minimum=1, maximum=1_000)
         summaries = [
             {
@@ -882,6 +1351,9 @@ class ToolRegistry:
                 "count": len(summaries[:limit]),
                 "total": len(summaries),
                 "truncated": len(summaries) > limit,
+                "omitted_by_policy": sum(1 for why in omitted.values() if why == "policy"),
+                "omitted_links": sum(1 for why in omitted.values() if why == "link"),
+                "omitted_too_large": sum(1 for why in omitted.values() if why == "too_large"),
                 "claims": summaries[:limit],
             },
         )
@@ -893,11 +1365,32 @@ class ToolRegistry:
         )
         if blocked:
             return blocked
-        for record in self._claim_records():
+        records, omitted = self._claim_records()
+        for record in records:
             if _record_id(record, ("claim_id", "id")) == claim_id:
                 payload = dict(record)
                 payload["body"] = _cap(str(payload.get("body", "")), 8_000)
                 return _ok("claim_show", {"claim": payload})
+        why = omitted.get(claim_id)
+        if why == "policy":
+            decision = self.ctx.policy.decide("read", f"corpus/claims/{claim_id}.md")
+            return _blocked(
+                "claim_show",
+                decision,
+                "policy denies reading this claim card",
+                next_step=_denied_next_step(
+                    decision, self.ctx.policy.rule_source(decision.rule_id)
+                ),
+            )
+        if why == "link":
+            raise ToolInputError(f"claim card {claim_id}.md is a link and is not read")
+        if why == "too_large":
+            raise ToolInputError(f"claim card {claim_id}.md is larger than {MAX_READ_BYTES} bytes")
+        if omitted:
+            raise ToolInputError(
+                f"claim not found: {claim_id} ({len(omitted)} card(s) were not readable; "
+                "their ids are taken from the file name only)"
+            )
         raise ToolInputError(f"claim not found: {claim_id}")
 
     def _numbers_path(self) -> tuple[Path, str]:
@@ -950,26 +1443,61 @@ class ToolRegistry:
         raise ToolInputError(f"number not found: {number_id}")
     # ---- specs ----
     def _build_specs(self) -> list[ToolSpec]:
+        """Tool descriptions, written for a capable colleague new to Panda (R2-411).
+
+        Each says when to use the tool, its limits and the common mistake; every
+        parameter has a description. tests/golden/tools.json pins the result.
+        """
+
         obj: dict[str, Any] = {"type": "object"}
+
+        def limit(default: int, maximum: int, what: str) -> dict[str, Any]:
+            return {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": maximum,
+                "default": default,
+                "description": f"Return at most this many {what} (1-{maximum}).",
+            }
+
+        def ident(what: str) -> dict[str, Any]:
+            return {"type": "string", "description": f"The {what}, exactly as listed."}
+
         return [
             ToolSpec(
                 "workspace_info",
-                "Workspace root, provider, model, validator, policy, studies, session state.",
+                "Describe the workspace: root, provider and model, validator, policy source, "
+                "registered studies, active study and session id. Call it first when you "
+                "need to know what this corpus is; it reads no file contents.",
                 {**obj, "properties": {}, "additionalProperties": False},
             ),
             ToolSpec(
                 "read_file",
-                "Read a UTF-8 text file inside the workspace, with line numbers for citation.",
+                "Read a UTF-8 text file inside the workspace. Each line comes back as "
+                "'<number>  <text>'; the number and the two spaces are not part of the "
+                "file, so never copy them into edit_file. Long results stop early and end "
+                "with the start_line to continue from; lines over 2000 characters are cut. "
+                "Files over 1 MiB are refused (use grep). Secret files are denied by policy.",
                 {
                     **obj,
                     "properties": {
-                        "path": {"type": "string", "description": "Workspace-relative path."},
-                        "start_line": {"type": "integer", "minimum": 1, "default": 1},
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative path, e.g. corpus/claims/c1.md.",
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "default": 1,
+                            "description": "First line to return (1-based). Use the "
+                            "next_start_line of a truncated read to continue.",
+                        },
                         "max_lines": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 2000,
                             "default": 400,
+                            "description": "Maximum number of lines to return (1-2000).",
                         },
                     },
                     "required": ["path"],
@@ -978,32 +1506,55 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "list_files",
-                "List workspace files matching a glob, skipping VCS and dependency directories.",
+                "List workspace paths matching a glob (directories end with '/'). '*' "
+                "matches the top level only; use '**/*' or 'corpus/**/*.md' to recurse. "
+                "VCS, virtualenv, cache and dependency directories are skipped, and paths "
+                "the read policy denies are counted in omitted_by_policy, not listed. "
+                "truncated: true means more paths match than limit.",
                 {
                     **obj,
                     "properties": {
-                        "pattern": {"type": "string", "default": "*"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 200},
+                        "pattern": {
+                            "type": "string",
+                            "default": "*",
+                            "description": "Glob relative to the workspace root.",
+                        },
+                        "limit": limit(200, 2000, "paths"),
                     },
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "grep",
-                "Search text files with a regular expression; returns path:line: text.",
+                "Search text files with a Python regular expression; each match is "
+                "'path:line: text' (text cut at 300 characters). Case-insensitive unless "
+                "case_sensitive is true. Searches at most 5000 files and skips files over "
+                "1 MiB: when search_complete is false, count 0 is not evidence of absence; "
+                "narrow the glob. Stops after 10 s; use fixed_strings for literal text.",
                 {
                     **obj,
                     "properties": {
-                        "pattern": {"type": "string"},
-                        "glob": {"type": "string", "default": "**/*"},
-                        "max_matches": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "default": 100,
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regular expression (or literal text with "
+                            "fixed_strings).",
                         },
-                        "case_sensitive": {"type": "boolean", "default": False},
-                        "fixed_strings": {"type": "boolean", "default": False},
+                        "glob": {
+                            "type": "string",
+                            "default": "**/*",
+                            "description": "Which files to search, relative to the root.",
+                        },
+                        "max_matches": limit(100, 1000, "matching lines"),
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Match case exactly.",
+                        },
+                        "fixed_strings": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Treat pattern as literal text, not a regex.",
+                        },
                     },
                     "required": ["pattern"],
                     "additionalProperties": False,
@@ -1011,57 +1562,75 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "study_list",
-                "List registered studies from corpus/studies/INDEX.md.",
+                "List the studies registered in corpus/studies/INDEX.md, optionally "
+                "filtered by track or status. Use study_show for one study's card.",
                 {
                     **obj,
                     "properties": {
-                        "track": {"type": "string", "enum": ["public", "simulated", "real"]},
-                        "status": {"type": "string", "enum": ["planned", "active", "done"]},
+                        "track": {
+                            "type": "string",
+                            "enum": ["public", "simulated", "real"],
+                            "description": "Only studies on this track.",
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["planned", "active", "done"],
+                            "description": "Only studies with this status.",
+                        },
                     },
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "study_show",
-                "Show one registered study card, its frontmatter, and its body.",
+                "Show one registered study card: its frontmatter and body.",
                 {
                     **obj,
-                    "properties": {"study_id": {"type": "string"}},
+                    "properties": {"study_id": ident("study id from study_list")},
                     "required": ["study_id"],
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "validate",
-                "Run the canonical corpus validator and return its JSON report.",
+                "Run the corpus's own validator (Node) and return its JSON report. Run it "
+                "after edits and before claiming the corpus is consistent; a failing report "
+                "lists each error with its file.",
                 {
                     **obj,
-                    "properties": {"release": {"type": "boolean", "default": False}},
+                    "properties": {
+                        "release": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Pass --release to the validator, which runs "
+                            "the release checks the corpus defines.",
+                        }
+                    },
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "policy_check",
-                "Evaluate the fail-closed policy for one action/resource pair.",
+                "Ask what the policy would decide for an action before trying it: allow, "
+                "ask (needs the user's approval), deny or hard_deny, with the rule. It "
+                "changes nothing and grants nothing. Use it to explain a block, not to "
+                "look for another route around one.",
                 {
                     **obj,
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": [
-                                "read",
-                                "write",
-                                "edit",
-                                "delete",
-                                "shell",
-                                "network",
-                                "git",
-                                "release",
-                                "spend",
-                                "tool",
-                            ],
+                            # R2-410: only actions a tool enforces; an answer about
+                            # anything else would describe a control that does not exist.
+                            "enum": sorted(ENFORCED_ACTIONS),
+                            "description": "read, write or edit a path; shell a command; "
+                            "validate the corpus.",
                         },
-                        "resource": {"type": "string"},
+                        "resource": {
+                            "type": "string",
+                            "description": "Workspace-relative path, or the command line "
+                            "for shell.",
+                        },
                     },
                     "required": ["action", "resource"],
                     "additionalProperties": False,
@@ -1069,22 +1638,33 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "session_note",
-                "Append a durable observation to the hash-chained session ledger.",
+                "Append a short observation to the session ledger (hash-chained, kept "
+                "after the session). Use it for decisions and findings worth auditing "
+                "later, not for chat. At most 4000 characters are kept.",
                 {
                     **obj,
-                    "properties": {"message": {"type": "string"}},
+                    "properties": {
+                        "message": {"type": "string", "description": "The note to record."}
+                    },
                     "required": ["message"],
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "write_file",
-                "Write a workspace file (create or replace) after policy approval.",
+                "Create a file or replace it with the full new content (up to 2 MiB). "
+                "Prefer edit_file for changes to an existing file. Writes are checked "
+                "against the policy: some paths ask the user (they see a diff), some are "
+                "always denied (.git, .panda, the validator). Content must not contain the "
+                "[redacted] marker that stands for a hidden secret.",
                 {
                     **obj,
                     "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
+                        "path": {"type": "string", "description": "Workspace-relative path."},
+                        "content": {
+                            "type": "string",
+                            "description": "The complete file content (UTF-8).",
+                        },
                     },
                     "required": ["path", "content"],
                     "additionalProperties": False,
@@ -1093,14 +1673,24 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "edit_file",
-                "Replace one exact string (or every occurrence) in a workspace file.",
+                "Replace an exact string in an existing UTF-8 file. old_string must match "
+                "the file text exactly (without read_file's line-number prefix) and occur "
+                "once, unless replace_all is true; include surrounding lines to make it "
+                "unique. Line endings are kept. Checked against the policy like write_file.",
                 {
                     **obj,
                     "properties": {
-                        "path": {"type": "string"},
-                        "old_string": {"type": "string"},
-                        "new_string": {"type": "string"},
-                        "replace_all": {"type": "boolean", "default": False},
+                        "path": {"type": "string", "description": "Workspace-relative path."},
+                        "old_string": {
+                            "type": "string",
+                            "description": "Exact text to replace; must not be empty.",
+                        },
+                        "new_string": {"type": "string", "description": "Replacement text."},
+                        "replace_all": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Replace every occurrence instead of exactly one.",
+                        },
                     },
                     "required": ["path", "old_string", "new_string"],
                     "additionalProperties": False,
@@ -1109,17 +1699,32 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "run_shell",
-                "Run a bounded argv command without a shell, from a workspace directory.",
+                "Run one program with an argv array. There is no shell: pipes, globs, "
+                "redirection, '&&' and variables are not interpreted (pass each argument "
+                "as its own string). The environment is cleaned of credentials. Most "
+                "commands ask the user first; destructive ones (force-push, rm -rf, "
+                "git reset --hard) are always denied. stdout and stderr are each cut at "
+                "about 15000 characters.",
                 {
                     **obj,
                     "properties": {
-                        "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                        "cwd": {"type": "string", "default": "."},
+                        "argv": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": 'Program and arguments, e.g. ["pytest", "-q"].',
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "default": ".",
+                            "description": "Working directory, relative to the root.",
+                        },
                         "timeout_seconds": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 600,
                             "default": 60,
+                            "description": "Stop the command after this many seconds.",
                         },
                     },
                     "required": ["argv"],
@@ -1129,85 +1734,74 @@ class ToolRegistry:
             ),
             ToolSpec(
                 "evidence_list",
-                "List evidence records from corpus/evidence/evidence.jsonl.",
+                "List evidence records from corpus/evidence/evidence.jsonl (id, study, "
+                "track, source path and line, license). total counts the records that "
+                "match the filter.",
                 {
                     **obj,
                     "properties": {
-                        "study_id": {"type": "string"},
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "default": 100,
+                        "study_id": {
+                            "type": "string",
+                            "description": "Only evidence for this study.",
                         },
+                        "limit": limit(100, 1000, "records"),
                     },
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "evidence_show",
-                "Show one evidence record by evidence_id.",
+                "Show one full evidence record from corpus/evidence/evidence.jsonl.",
                 {
                     **obj,
-                    "properties": {"evidence_id": {"type": "string"}},
+                    "properties": {"evidence_id": ident("evidence id from evidence_list")},
                     "required": ["evidence_id"],
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "claim_list",
-                "List claims from corpus/claims/*.md frontmatter.",
+                "List claims from the frontmatter of corpus/claims/*.md, with their "
+                "evidence and number ids. Cards the policy hides, links and oversized cards "
+                "are counted (omitted_by_policy, omitted_links, omitted_too_large), not "
+                "listed.",
                 {
                     **obj,
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "default": 100,
-                        }
-                    },
+                    "properties": {"limit": limit(100, 1000, "claims")},
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "claim_show",
-                "Show one claim and its body by claim_id.",
+                "Show one claim card: frontmatter and body (body cut at 8000 characters).",
                 {
                     **obj,
-                    "properties": {"claim_id": {"type": "string"}},
+                    "properties": {"claim_id": ident("claim id from claim_list")},
                     "required": ["claim_id"],
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "number_list",
-                "List numbers from corpus/numbers.json with their evidence link.",
+                "List the numbers in corpus/numbers.json with their value and evidence "
+                "link. Cite a number by its number_id.",
                 {
                     **obj,
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 1000,
-                            "default": 100,
-                        }
-                    },
+                    "properties": {"limit": limit(100, 1000, "numbers")},
                     "additionalProperties": False,
                 },
             ),
             ToolSpec(
                 "number_show",
-                "Show one number record by number_id.",
+                "Show one full number record from corpus/numbers.json.",
                 {
                     **obj,
-                    "properties": {"number_id": {"type": "string"}},
+                    "properties": {"number_id": ident("number id from number_list")},
                     "required": ["number_id"],
                     "additionalProperties": False,
                 },
             ),
         ]
-
 
 __all__ = [
     "ApprovalRequest",

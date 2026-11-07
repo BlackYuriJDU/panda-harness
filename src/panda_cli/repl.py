@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import asyncio
 
+from rich.text import Text
+
 from panda_cli import render
-from panda_cli.runtime import ChatRuntime
+from panda_cli.runtime import ChatRuntime, policy_notice
 from panda_core.agent import DEFAULT_MAX_STEPS, AgentEvent
+from panda_core.display import sanitize_display
 from panda_core.errors import PandaError
 from panda_core.registry import find_study, load_registry
 from panda_core.session import SessionLog
@@ -33,46 +36,71 @@ HELP = """commands
 """
 
 
+def _say(message: str, *, style: str | None = None) -> None:
+    """Print text literally: no Rich markup and no terminal control sequences.
+
+    Model, tool and workspace text reaches this function, and `[conceal]`,
+    `[link=...]` or `ESC` sequences in it must not change what the operator sees.
+    """
+
+    render.console().print(Text(sanitize_display(message), style=style or ""), markup=False)
+
+
 def _print_approval(request: ApprovalRequest) -> None:
-    render.console().print(
-        f"[approval] {request.tool}: {request.action} {request.resource}\n"
-        f"  rule: {request.rule_id or '-'}  risk: {request.risk}\n"
-        f"  reason: {request.reason}"
+    import shlex
+
+    where = ""
+    if request.argv:
+        where = f"\n  runs: {shlex.join(request.argv)}\n  in: {request.cwd or '.'}"
+    source = request.rule_source or "built-in"
+    reason = ("[text from the workspace policy] " if source == "workspace" else "") + request.reason
+    _say(
+        f"[approval] {request.tool}: {request.action} {request.resource}{where}\n"
+        f"  effect: {request.effect_class or request.action}  rule: {request.rule_id or '-'}"
+        f" ({source})  risk: {request.risk}\n"
+        f"  reason: {reason}"
+        + (f"\n  sha256: {request.payload_sha256[:16]}" if request.payload_sha256 else "")
     )
     if request.preview:
         label = "diff" if request.preview_kind == "diff" else "command"
-        render.console().print(f"  {label}:\n{request.preview}")
+        _say(f"  {label}:\n{request.preview}")
 
 
 async def _ask_approval(request: ApprovalRequest) -> bool:
     _print_approval(request)
+    if not request.preview_complete or "\n[truncated " in (request.preview or "")[-120:]:
+        _say("  the preview is too large to show in full; denied (R2-125)", style="yellow")
+        return False
     answer = await asyncio.to_thread(input, "approve? [y/N] ")
     return answer.strip().lower() in {"y", "yes"}
 def _banner(runtime: ChatRuntime) -> None:
     status = runtime.status()
     key = "set" if status["api_key_present"] else "not set"
-    render.console().print(
+    _say(
         f"panda · {status['provider']} · {status['model']} · key {key} · "
         f"{len(runtime.tools.names())} tools"
     )
-    render.console().print(f"session {status['session_id']} · /help for commands", style="dim")
+    _say(f"session {status['session_id']} · /help for commands", style="dim")
+    notice = policy_notice(status.get("workspace_policy") or {})
+    if notice:
+        _say(notice, style="yellow")
 
 
 def _on_event(event: AgentEvent) -> None:
     import sys
 
     if event.kind == "text_delta":
-        sys.stdout.write(event.data.get("text", ""))
+        sys.stdout.write(sanitize_display(str(event.data.get("text", ""))))
         sys.stdout.flush()
     elif event.kind == "tool_call":
-        sys.stderr.write(f"\n[tool] {event.data.get('name')}\n")
+        sys.stderr.write(f"\n[tool] {sanitize_display(str(event.data.get('name')))}\n")
         sys.stderr.flush()
     elif event.kind == "tool_result":
         state = "blocked" if event.data.get("blocked") else "ok"
-        sys.stderr.write(f"[tool] {event.data.get('name')}: {state}\n")
+        sys.stderr.write(f"[tool] {sanitize_display(str(event.data.get('name')))}: {state}\n")
         sys.stderr.flush()
     elif event.kind == "error":
-        sys.stderr.write(f"\n[error] {event.data.get('message')}\n")
+        sys.stderr.write(f"\n[error] {sanitize_display(str(event.data.get('message')))}\n")
         sys.stderr.flush()
     elif event.kind == "turn_end":
         sys.stdout.write("\n")
@@ -84,10 +112,10 @@ async def _run_shell_line(runtime: ChatRuntime, text: str) -> None:
 
     argv = split_command(text)
     if not argv:
-        render.console().print("empty command", style="yellow")
+        _say("empty command", style="yellow")
         return
-    result = await runtime.tools.call("run_shell", {"argv": argv})
-    render.console().print(result.content)
+    result = await runtime.agent.operator_tool("run_shell", {"argv": argv})
+    _say(result.content)
 
 
 async def _command(runtime: ChatRuntime, line: str) -> bool:
@@ -97,18 +125,18 @@ async def _command(runtime: ChatRuntime, line: str) -> bool:
     if command in {"/quit", "/exit"}:
         return True
     if command == "/help":
-        render.console().print(HELP)
+        _say(HELP)
         return False
     if command == "/model":
         if not argument:
-            render.console().print(runtime.model)
+            _say(runtime.model)
             return False
         try:
             runtime.set_model(argument)
         except PandaError as exc:
             render.print_error(exc)
             return False
-        render.console().print(f"model: {runtime.model}")
+        _say(f"model: {runtime.model}")
         return False
     if command == "/models":
         models = await runtime.models()
@@ -137,7 +165,7 @@ async def _command(runtime: ChatRuntime, line: str) -> bool:
                 render.print_error(exc)
                 return False
             runtime.set_active_study(study_id)
-            render.console().print(f"active study: {study_id}")
+            _say(f"active study: {study_id}")
             return False
         try:
             studies = load_registry(runtime.workspace.root)
@@ -152,30 +180,30 @@ async def _command(runtime: ChatRuntime, line: str) -> bool:
     if command == "/validate":
         result = await runtime.validate()
         summary = result.data.get("summary", {})
-        render.console().print(
+        _say(
             f"validation {'ok' if result.ok else 'failed'} · "
             f"{summary.get('passed', 0)} passed · {summary.get('failed', 0)} failed · "
             f"{summary.get('skipped', 0)} skipped"
         )
         for check in result.data.get("checks", []):
             if not check.get("ok") and not check.get("skipped"):
-                render.console().print(f"  failed: {check.get('name')}")
+                _say(f"  failed: {check.get('name')}")
         return False
     if command == "/policy":
         for row in runtime.policy_rows():
-            render.console().print(
+            _say(
                 f"{row['id']:<26} {row['effect']:<10} {row['risk']:<9} {row['actions']}"
             )
         return False
     if command == "/session":
         for event in runtime.session_rows()[-15:]:
-            render.console().print(f"{event['seq']:>4}  {event['type']:<20} {event['ts']}")
+            _say(f"{event['seq']:>4}  {event['type']:<20} {event['ts']}")
         return False
     if command == "/clear":
         runtime.reset()
-        render.console().print("conversation cleared")
+        _say("conversation cleared")
         return False
-    render.console().print("unknown command; try /help", style="yellow")
+    _say("unknown command; try /help", style="yellow")
     return False
 
 
@@ -226,7 +254,9 @@ def run_plain_chat(
                     render.print_error(exc)
         finally:
             await runtime.provider.aclose()
-            runtime.close("interrupted" if interrupted else "completed")
+            runtime.close("interrupted" if interrupted else None)
+            if runtime.close_error:
+                _say(runtime.close_error, style="yellow")
 
     try:
         asyncio.run(_loop())

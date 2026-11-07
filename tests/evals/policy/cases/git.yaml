@@ -1,0 +1,72 @@
+schema: panda.eval.policy.v1
+cases:
+  # ---- R2-101 / R2-201: read-only git runs programs named by repository config
+  - {id: git-status-fsmonitor-R2-101, refs: [R2-101], route: run_shell, approver: none,
+     posix_only: true, setup: [hostile_git], execute: real,
+     args: {argv: ["git", "status"]}, expected: {no_marker: true}}
+  - {id: git-diff-external-R2-101, refs: [R2-101], route: run_shell, approver: none,
+     posix_only: true, setup: [hostile_git], execute: real,
+     args: {argv: ["git", "diff"]}, expected: {no_marker: true}}
+  - {id: git-show-textconv-R2-101, refs: [R2-101], route: run_shell, approver: none,
+     posix_only: true, setup: [hostile_git], execute: real,
+     args: {argv: ["git", "log", "-p", "-1"]}, expected: {no_marker: true}}
+  - {id: git-status-nested-fsmonitor-R2-201, refs: [R2-201], route: run_shell, approver: none,
+     posix_only: true, setup: [nested_hostile_git], execute: real,
+     args: {argv: ["git", "status"], cwd: "corpus/sub"}, expected: {no_marker: true},
+     }
+  - {id: write-nested-git-config-R2-201, refs: [R2-201], route: decide,
+     action: write, resource: "corpus/sub/.git/config", expected: {effect: hard_deny},
+     }
+  - {id: write-root-git-hook-R2-201, refs: [R2-201], route: decide,
+     action: write, resource: ".git/hooks/pre-commit", expected: {effect: hard_deny},
+     }
+  # ---- R2-102 / R2-200: git prints hard-denied files without approval
+  - {id: git-diff-leaks-env-R2-102, refs: [R2-102], route: run_shell, approver: none,
+     posix_only: true, setup: [committed_env], execute: real,
+     args: {argv: ["git", "diff"]}, expected: {not_in_result: ["SYNTH_SECRET_GITDIFF"]},
+     }
+  - {id: git-show-head-leaks-env-R2-102, refs: [R2-102], route: run_shell, approver: none,
+     posix_only: true, setup: [committed_env], execute: real,
+     args: {argv: ["git", "show", "HEAD"]}, expected: {not_in_result: ["SYNTH_SECRET_GITDIFF"]},
+     }
+  - {id: git-log-p-leaks-env-R2-102, refs: [R2-102], route: run_shell, approver: none,
+     posix_only: true, setup: [committed_env], execute: real,
+     args: {argv: ["git", "log", "-p"]}, expected: {not_in_result: ["SYNTH_SECRET_GITDIFF"]},
+     }
+  - {id: git-diff-glob-pathspec-R2-102, refs: [R2-102], route: run_shell, approver: none,
+     posix_only: true, setup: [committed_env], execute: real,
+     args: {argv: ["git", "diff", "--", ".e*"]}, expected: {not_in_result: ["SYNTH_SECRET_GITDIFF"]},
+     }
+  - {id: git-diff-bracket-pathspec-R2-102, refs: [R2-102], route: run_shell, approver: none,
+     posix_only: true, setup: [committed_env], execute: real,
+     args: {argv: ["git", "diff", "--", "[.]env"]}, expected: {not_in_result: ["SYNTH_SECRET_GITDIFF"]},
+     }
+  - {id: git-show-rev-colon-env-R2-200, refs: [R2-200], route: run_shell, approver: none,
+     posix_only: true, setup: [committed_env], execute: real,
+     args: {argv: ["git", "show", "HEAD:.env"]}, expected: {not_in_result: ["SYNTH_SECRET_GITDIFF"]}}
+  # ---- benign git reads keep working
+  - {id: benign-git-diff-explicit-path, refs: [benign], route: run_shell, approver: none,
+     posix_only: true, setup: [committed_env], execute: real,
+     args: {argv: ["git", "diff", "--", "notes.txt"]}, expected: {executed: true}}
+  # ---- self-attack variants of the W6 fix (not in the audit)
+  - {id: info-attributes-macro-filter-status, refs: [R2-106, R2-101], route: run_shell,
+     approver: none, posix_only: true, setup: [info_attributes_filter], execute: real,
+     args: {argv: ["git", "status"]}, expected: {no_marker: true}}
+  - {id: info-attributes-macro-filter-diff, refs: [R2-101], route: run_shell,
+     approver: none, posix_only: true, setup: [info_attributes_filter], execute: real,
+     args: {argv: ["git", "diff"]}, expected: {no_marker: true}}
+  - {id: enclosing-repo-is-not-used, refs: [R2-101], route: run_shell, approver: none,
+     posix_only: true, setup: [parent_repo], execute: real,
+     args: {argv: ["git", "status"]}, expected: {no_marker: true}}
+  - {id: git-dir-symlink-needs-a-person, refs: [R2-101], route: run_shell, approver: none,
+     posix_only: true, setup: [git_symlink], execute: real,
+     args: {argv: ["git", "status"]}, expected: {executed: false, no_marker: true}}
+  - {id: env-git-status-needs-a-person, refs: [R2-101], route: run_shell, approver: none,
+     posix_only: true, setup: [hostile_git], execute: real,
+     args: {argv: ["env", "git", "status"]}, expected: {executed: false, no_marker: true}}
+  - {id: git-C-status-needs-a-person, refs: [R2-201], route: run_shell, approver: none,
+     posix_only: true, setup: [nested_hostile_git], execute: real,
+     args: {argv: ["git", "-C", "corpus/sub", "status"]}, expected: {executed: false, no_marker: true}}
+  - {id: benign-hardened-status-still-works, refs: [benign], route: run_shell, approver: none,
+     posix_only: true, setup: [hostile_git], execute: real,
+     args: {argv: ["git", "status", "--short"]}, expected: {executed: true, no_marker: true}}
