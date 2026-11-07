@@ -41,6 +41,11 @@ jobs:
       - name: Test
         run: pytest -q
 
+      - name: Audit dependencies
+        run: |
+          python -m pip install pip-audit
+          pip-audit --desc
+
   build:
     name: Build artifacts
     runs-on: ubuntu-latest

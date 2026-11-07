@@ -321,12 +321,16 @@ def test_f04_decisions_by_effect(command: str, expected: str) -> None:
         ("git push --for origin main", "hard_deny"),
         ("git push origin :main", "hard_deny"),
         ("git push --delete origin topic", "hard_deny"),
+        ("git push -d origin topic", "hard_deny"),
         ("git push --mirror", "hard_deny"),
+        ("git push --mir", "hard_deny"),
         ("GIT.EXE push --force origin main", "hard_deny"),
         ("./git push --force", "hard_deny"),
         ("/usr/bin/git reset --hard", "hard_deny"),
         ("git reset --ha HEAD~1", "hard_deny"),
+        ("git clean -f", "hard_deny"),
         ("git clean -fd", "hard_deny"),
+        ("git clean -fx", "hard_deny"),
         ("git clean --force -d", "hard_deny"),
         ("git branch --delete topic", "hard_deny"),
         ("git branch -d topic", "hard_deny"),
@@ -345,6 +349,19 @@ def test_f04_decisions_by_effect(command: str, expected: str) -> None:
 )
 def test_destructive_and_exfiltrating_variants_fail_closed(command: str, expected: str) -> None:
     assert decide_shell(command) == expected
+
+
+# R2-503 / M22: shlex posix=True must strip quotes so the classifier sees the token.
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git "push" --force',
+        '"git" push --force',
+        'git push origin "+main"',
+    ],
+)
+def test_quoted_tokens_are_stripped_by_posix_shlex(command: str) -> None:
+    assert decide_shell(command) == "hard_deny"
 
 
 @pytest.mark.parametrize(

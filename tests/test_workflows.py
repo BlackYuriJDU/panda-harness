@@ -59,6 +59,16 @@ def test_ci_audits_the_dependencies() -> None:
     assert "pip-audit" in jobs("ci.yml")["audit"]
 
 
+def test_release_workflow_runs_audit() -> None:
+    assert "pip-audit" in jobs("release.yml")["test"]
+
+
+def test_release_workflow_rejects_unknown_tags() -> None:
+    publish = jobs("release.yml")["publish"]
+    assert "startsWith(github.ref, 'refs/tags/v')" in publish
+    assert "refs/tags/" in publish
+
+
 def test_ci_keeps_read_only_permissions() -> None:
     assert re.search(r"(?m)^permissions:\n  contents: read$", head("ci.yml"))
     assert "contents: write" not in text("workflows/ci.yml")

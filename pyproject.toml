@@ -64,6 +64,7 @@ packages = ["src/panda_core", "src/panda_cli"]
 include = [
   "/src",
   "/schemas",
+  "/fixtures",
   "/docs",
   "/assets",
   "/tools",

@@ -289,7 +289,14 @@ def test_a_long_preview_reports_the_hidden_lines(workspace) -> None:
     async def script(pilot, screen, decisions):
         await _until(pilot, lambda: "hidden" in status_text(screen))
         assert "hidden" in status_text(screen)
-        assert screen.query_one("#approval-preview-scroll").max_scroll_y > 0
+        # active wait: the scroll widget may not be mounted immediately under load
+        def scroll_has_content():
+            try:
+                return screen.query_one("#approval-preview-scroll").max_scroll_y > 0
+            except Exception:
+                return False
+        await _until(pilot, scroll_has_content, timeout=5.0)
+        assert scroll_has_content()
 
     run_modal(workspace, approval(long_diff(), preview_kind="diff"), script)
 

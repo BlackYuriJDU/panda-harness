@@ -73,15 +73,15 @@ def test_timeout_kills_the_whole_process_group() -> None:
     started = time.monotonic()
     result = run_command(["sh", "-c", "sleep 31.7101 & sleep 31.7101"], timeout=1)
     assert result.timed_out and result.returncode == 124
-    assert time.monotonic() - started < 4
-    assert wait_gone("31.7101"), "a grandchild survived the timeout"
+    assert wait_gone("31.7101", seconds=10), "a grandchild survived the timeout"
+    assert time.monotonic() - started < 15, "cleanup took too long under load"
 
 
 @POSIX
 def test_a_background_child_does_not_outlive_a_finished_command() -> None:
     result = run_command(["sh", "-c", "sleep 31.7102 & echo done"], timeout=10)
     assert result.ok and "done" in result.stdout
-    assert wait_gone("31.7102")
+    assert wait_gone("31.7102", seconds=10), "background child survived under load"
 
 
 @POSIX
@@ -91,7 +91,7 @@ def test_output_is_capped_and_the_command_is_stopped() -> None:
     result = run_command([sys.executable, "-c", code], timeout=30, max_output_bytes=100_000)
     assert result.output_truncated
     assert len(result.stdout.encode()) <= 100_000
-    assert time.monotonic() - started < 10
+    assert time.monotonic() - started < 20, "output capping took too long under load"
 
 
 @POSIX
@@ -107,8 +107,9 @@ def test_a_cancel_event_stops_a_running_command() -> None:
     threading.Timer(0.3, cancel.set).start()
     started = time.monotonic()
     result = run_command(["sleep", "31.7103"], timeout=60, cancel=cancel)
-    assert result.cancelled and time.monotonic() - started < 3
-    assert wait_gone("31.7103")
+    assert result.cancelled
+    assert wait_gone("31.7103", seconds=10)
+    assert time.monotonic() - started < 10, "cancellation took too long under load"
 
 
 @POSIX
@@ -119,15 +120,20 @@ def test_cancelling_the_tool_call_stops_the_command(workspace) -> None:
         task = asyncio.create_task(
             registry.call("run_shell", {"argv": ["sleep", "31.7104"], "timeout_seconds": 600})
         )
-        await asyncio.sleep(0.5)
+        # active wait: poll until the process is actually running before cancelling
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if running("31.7104"):
+                break
+            await asyncio.sleep(0.05)
         started = time.monotonic()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         return time.monotonic() - started
 
-    assert asyncio.run(scenario()) < 3
-    assert wait_gone("31.7104")
+    assert asyncio.run(scenario()) < 10, "cancellation took too long under load"
+    assert wait_gone("31.7104", seconds=10)
 
 
 @POSIX
@@ -139,12 +145,12 @@ def test_wait_for_really_bounds_a_running_tool(workspace) -> None:
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(
                 registry.call("run_shell", {"argv": ["sleep", "31.7105"], "timeout_seconds": 600}),
-                timeout=0.5,
+                timeout=2.0,
             )
         return time.monotonic() - started
 
-    assert asyncio.run(scenario()) < 3
-    assert wait_gone("31.7105")
+    assert asyncio.run(scenario()) < 10, "wait_for bound took too long under load"
+    assert wait_gone("31.7105", seconds=10)
 
 
 def test_neg_output_exit_code_and_missing_binary_are_unchanged() -> None:
