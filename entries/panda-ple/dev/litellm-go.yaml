@@ -1,0 +1,30 @@
+# LiteLLM proxy for local dev runs on OpenCode Go. Not part of the harness.
+# The key comes from the environment (OPENCODE_API_KEY); never write it here.
+# Go requires a panda-harness User-Agent and a session header on every request.
+
+model_list:
+  - model_name: glm-5.2
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://opencode.ai/inference/go/openai/v1
+      api_key: os.environ/OPENCODE_API_KEY
+      extra_headers:
+        User-Agent: panda-harness/0.2.0a4
+        x-opencode-session: panda-ple-dev
+  - model_name: deepseek-v4.1-flash
+    litellm_params:
+      model: openai/deepseek-v4.1-flash
+      api_base: https://opencode.ai/inference/go/openai/v1
+      api_key: os.environ/OPENCODE_API_KEY
+      extra_headers:
+        User-Agent: panda-harness/0.2.0a4
+        x-opencode-session: panda-ple-dev
+  # The fixed local judge: the same model, its own name, standard reasoning.
+  - model_name: glm-5.2-judge
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://opencode.ai/inference/go/openai/v1
+      api_key: os.environ/OPENCODE_API_KEY
+      extra_headers:
+        User-Agent: panda-harness/0.2.0a4
+        x-opencode-session: panda-ple-judge

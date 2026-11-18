@@ -1,0 +1,12 @@
+name: panda-ple
+# The model the Stage 2 evaluation calls. For local dev runs on your own model,
+# switch to openai-compatible/<id> (see dev/README.md); generate the final
+# artifacts/ and run `kit check` with this line as written.
+model_api: google-cloud/claude-opus-5-5
+install: >-
+  uv venv --python 3.12 /opt/harness/venv
+  && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements.txt
+serve: /opt/harness/venv/bin/python {src}/serve.py
+env:
+  PANDA_PLE_LOG: "metadata"
+  PANDA_PLE_VISION: "0"

@@ -1,0 +1,10 @@
+panda-ple
+Copyright 2026 Arthur Araújo da Silva
+
+This product includes software developed by Google LLC:
+  taskbridge.py, copied unmodified from https://github.com/google-research/ple
+  (sample_submissions/taskbridge.py at commit 8320f04), licensed under the
+  Apache License, Version 2.0.
+
+It depends on panda-harness (https://github.com/BlackYuriJDU/panda-harness),
+licensed under the MIT License.
