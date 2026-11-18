@@ -171,6 +171,13 @@ instead of appending to it (context trimming, eliding a tool result,
 `set_model`, `set_active_study`), it first drops every stored thinking block;
 dropping all of them is always accepted.
 
+Because any change to `tools` also breaks that prefix, `Agent(freeze_tools=True)`
+captures the tool list on the first model call. Loop hooks (`AgentHooks`) follow
+the same rule: their text is appended as a new user message at the end of the
+history, never written into earlier messages. `after_tool` notes from one step
+become a single message after all of that step's tool results, which keeps the
+results contiguous for OpenAI chat.
+
 With `prompt_cache`, the system prompt and the newest non-thinking block get a
 `cache_control: ephemeral` breakpoint (two of the four allowed), so an
 append-only loop re-reads its prefix from cache.
@@ -183,7 +190,19 @@ errors, with exponential backoff from `retry_base_seconds` capped at
 an event has been yielded. With `retry_partial` (headless runs), each attempt is
 buffered and released only when it completes, so a cut stream is discarded and
 repeated and the model never sees an incomplete turn. `stream(deadline=...)`
-refuses any retry wait that would cross the deadline.
+refuses any retry wait that would cross the deadline; with `retry_partial`, the
+deadline replaces `max_retries` as the bound, so a rate limit or an endpoint
+outage never ends a headless task early.
+
+### Images
+
+`view_image` (opt-in through `ToolContext(vision=True)`) checks the file's
+magic bytes and size, and returns `ToolResult.images`. The agent stores them in
+the tool message as OpenAI-style `image_url` data-URL parts; adapters convert
+them to Anthropic `image` blocks (also inside `tool_result`), Gemini
+`inlineData` parts, or, for OpenAI chat, a user turn right after the tool
+results (chat tool messages are text-only). The Responses adapter appends a
+note that the image was not sent. The ledger logs the text content only.
 
 ## Agent loop
 

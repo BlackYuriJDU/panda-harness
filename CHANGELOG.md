@@ -28,8 +28,30 @@ gateway (the PLE competition). Every change is opt-in; defaults are unchanged.
 - `Agent(deadline_seconds=...)`: wall-clock bound per turn, status `deadline`.
 - `panda_core.profiles.ple_provider_settings()` builds settings from the PLE
   evaluator's environment.
+- `AgentHooks` (`before_model`, `after_tool`, `before_finish`): opt-in loop
+  hooks whose text is always appended as a new user message at the end of the
+  history; `before_finish` can reopen a turn a bounded number of times.
+- `Agent(freeze_tools=True)` captures the tool list on the first model call, so
+  a registry change cannot invalidate signed Claude thinking mid-session.
+- Per-request effort: `stream(effort=...)` and `Agent.effort` override
+  `provider.effort` for one call (per-phase effort); unknown levels fail before
+  any request.
+- Opt-in vision: `ToolContext(vision=True)` registers `view_image` (PNG, JPEG,
+  GIF, WebP, up to 3.75 MB). Image parts are sent as Anthropic `image` blocks,
+  Gemini `inlineData`, and OpenAI chat `image_url` parts (tool images follow the
+  tool results as a user turn); the Responses adapter reports them as not sent.
+  The ledger never stores image bytes, and the context budget counts each image
+  as a fixed estimate.
 
 ### Changed
+
+- The `generic` endpoint profile accepts plain `http` base URLs outside
+  loopback (the PLE kit's egress proxy is `http://host.docker.internal:4000/v1`);
+  every other profile still requires https outside loopback.
+- With `retry_partial` and a `deadline`, rate limits, 5xx, and transport
+  failures are retried until the deadline instead of stopping at
+  `max_retries`. A `400` is still never retried.
+- The PLE profile uses a 1800 s read timeout (silent thinking at max effort).
 
 - `claude*` models never receive `temperature`, on any protocol.
 - Context trimming keeps the first user message (the task instruction), elides

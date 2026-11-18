@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from panda_core.errors import ConfigError
 from panda_core.version import __version__
@@ -72,17 +72,22 @@ def _relative_posix_path(value: str) -> str:
 
 
 def _validate_base_url(value: str, field: str) -> str:
+    """Normalize a base URL; plain-http hosts are checked per profile later."""
+
     text = value.strip().rstrip("/")
     parts = urlsplit(text)
     if not parts.scheme or not parts.hostname:
         raise ValueError(f"{field} must be an absolute URL")
     if parts.scheme not in {"https", "http"}:
         raise ValueError(f"{field} must use http or https")
-    if parts.scheme == "http" and parts.hostname not in _LOOPBACK_HOSTS:
-        raise ValueError(f"{field} must use https outside loopback")
     if parts.query or parts.fragment:
         raise ValueError(f"{field} must not have a query or fragment")
     return text
+
+
+def _is_remote_http(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme == "http" and parts.hostname not in _LOOPBACK_HOSTS
 
 
 class ProviderSettings(BaseModel):
@@ -136,6 +141,18 @@ class ProviderSettings(BaseModel):
         if not _ENV_NAME_RE.match(value):
             raise ValueError("provider.api_key_env must be an environment variable name")
         return value
+
+    @model_validator(mode="after")
+    def _remote_http_only_for_generic(self) -> ProviderSettings:
+        # A generic gateway may sit behind a local egress proxy that speaks
+        # plain http (the PLE kit uses http://host.docker.internal:4000/v1).
+        # Every other profile keeps https outside loopback.
+        if self.endpoint_profile == ENDPOINT_GENERIC:
+            return self
+        for url in (self.base_url, self.anthropic_base_url, self.google_base_url):
+            if url is not None and _is_remote_http(url):
+                raise ValueError("provider base URLs must use https outside loopback")
+        return self
 
 
 def is_go_base_url(base_url: str) -> bool:

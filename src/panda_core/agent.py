@@ -40,6 +40,8 @@ LOG_LIST_LIMIT = 200
 TRIM_KEEP_RECENT = 6
 ELIDE_MIN_CHARS = 200
 ELIDED_MARKER = "[tool result elided"
+# Context estimate for one image part (~1,600 tokens), instead of its base64.
+IMAGE_CHARS = 6_400
 
 SYSTEM_PROMPT = """You are Panda, a fail-closed biomedical evidence harness.
 
@@ -75,6 +77,32 @@ your habits, the corpus wins. Cite concrete locations as `path:line`.
 Workspace instructions:
 {instructions}
 """
+
+
+HookText = Awaitable[str | None]
+
+
+@dataclass
+class AgentHooks:
+    """Optional loop hooks; each may return text to add to the conversation.
+
+    Returned text is always appended as a new `user` message at the end of
+    the history, never written into earlier messages: editing history would
+    invalidate signed Claude thinking blocks.
+
+    - `before_model(agent)`: before each model call (clock warnings, phase
+      notes).
+    - `after_tool(agent, call, result)`: after each tool result; notes from one
+      step are joined into a single message after all of its tool results.
+    - `before_finish(agent, text)`: when the model answers without tool calls;
+      returned text reopens the turn (gates that failed), at most
+      `max_finish_reopens` times per turn.
+    """
+
+    before_model: Callable[[Agent], HookText] | None = None
+    after_tool: Callable[[Agent, Any, ToolResult], HookText] | None = None
+    before_finish: Callable[[Agent, str], HookText] | None = None
+    max_finish_reopens: int = 3
 
 
 @dataclass(frozen=True)
@@ -143,14 +171,43 @@ def _usage_sum(left: Usage, right: Usage) -> Usage:
     )
 
 
+def _content_chars(content: list[Any]) -> int:
+    total = 0
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            total += IMAGE_CHARS
+        elif isinstance(part, dict):
+            total += len(str(part.get("text") or "")) + 32
+    return total
+
+
 def _messages_chars(messages: list[dict[str, Any]]) -> int:
     total = 0
     for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            # Count image parts by a fixed estimate, not their base64 size.
+            rest = {key: value for key, value in message.items() if key != "content"}
+            total += _content_chars(content) + len(json.dumps(rest, default=str))
+            continue
         try:
             total += len(json.dumps(message, ensure_ascii=False, default=str))
         except (TypeError, ValueError):
             total += len(str(message))
     return total
+
+
+def _tool_content(result: ToolResult) -> str | list[dict[str, Any]]:
+    """Tool message content; images travel as OpenAI-style data-URL parts."""
+
+    images = getattr(result, "images", None)
+    if not images:
+        return result.content
+    parts: list[dict[str, Any]] = [{"type": "text", "text": result.content}]
+    for media_type, data in images:
+        url = f"data:{media_type};base64,{data}"
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
 
 
 def _read_instructions(workspace: Workspace, limit: int = DEFAULT_SYSTEM_CHARS) -> str:
@@ -200,6 +257,9 @@ class Agent:
         private: bool = False,
         context_window: int | None = None,
         deadline_seconds: float | None = None,
+        hooks: AgentHooks | None = None,
+        freeze_tools: bool = False,
+        effort: str | None = None,
     ) -> None:
         self.workspace = workspace
         self.provider = provider
@@ -210,6 +270,14 @@ class Agent:
         # Optional wall-clock budget per turn; the loop stops at whichever of
         # max_steps or the deadline comes first.
         self.deadline_seconds = deadline_seconds
+        self.hooks = hooks or AgentHooks()
+        # Changing the tool list mid-session invalidates signed Claude
+        # thinking; a frozen list is captured on the first model call.
+        self.freeze_tools = freeze_tools
+        self._frozen_tools: list[dict[str, Any]] | None = None
+        # Per-request effort override (per-phase effort); None keeps the
+        # provider setting.
+        self.effort = effort
         self.active_study = active_study
         self.private = private
         self._approver = approver
@@ -304,17 +372,20 @@ class Agent:
                 break
             message = self.messages[index]
             content = message.get("content")
-            if (
-                message.get("role") != "tool"
-                or not isinstance(content, str)
-                or len(content) < ELIDE_MIN_CHARS
-                or content.startswith(ELIDED_MARKER)
-            ):
+            if message.get("role") != "tool":
+                continue
+            if isinstance(content, list):
+                size = _content_chars(content)
+            elif isinstance(content, str) and not content.startswith(ELIDED_MARKER):
+                size = len(content)
+            else:
+                continue
+            if size < ELIDE_MIN_CHARS:
                 continue
             self.messages[index] = {
                 **message,
                 "content": (
-                    f"{ELIDED_MARKER}: {len(content)} chars to save context; "
+                    f"{ELIDED_MARKER}: {size} chars to save context; "
                     "re-run the tool if it is still needed]"
                 ),
             }
@@ -337,6 +408,27 @@ class Agent:
                     message["provider_meta"] = rest
                 else:
                     message.pop("provider_meta", None)
+
+    def _tool_specs(self) -> list[dict[str, Any]]:
+        if not self.freeze_tools:
+            return self.tools.to_openai()
+        if self._frozen_tools is None:
+            self._frozen_tools = self.tools.to_openai()
+        return self._frozen_tools
+
+    def _append_hook_message(self, hook: str, text: str | None) -> bool:
+        """Append hook text as a new user message at the end of the history."""
+
+        if not text or not text.strip():
+            return False
+        self.messages.append({"role": "user", "content": text})
+        if self.private:
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            self._log("hook.message", {"hook": hook, "sha256": digest, "chars": len(text)})
+        else:
+            self._log("hook.message", {"hook": hook, "content": text, "chars": len(text)})
+        self._emit("hook_message", hook=hook, chars=len(text))
+        return True
 
     def _trim(self) -> None:
         budget = self._context_budget_chars()
@@ -393,12 +485,17 @@ class Agent:
             if self.deadline_seconds is not None
             else None
         )
+        reopens = 0
         try:
             while steps < self.max_steps:
                 if deadline is not None and time.monotonic() >= deadline:
                     status = "deadline"
                     break
                 steps += 1
+                if self.hooks.before_model is not None:
+                    self._append_hook_message(
+                        "before_model", await self.hooks.before_model(self)
+                    )
                 self._trim()
                 step_parts: list[str] = []
                 calls: list[Any] = []
@@ -449,7 +546,18 @@ class Agent:
                     self.last_context_tokens = self.estimate_context_tokens()
                 self.usage_total = _usage_sum(self.usage_total, step_usage)
                 if not calls:
+                    if (
+                        self.hooks.before_finish is not None
+                        and reopens < self.hooks.max_finish_reopens
+                        and steps < self.max_steps
+                        and self._append_hook_message(
+                            "before_finish", await self.hooks.before_finish(self, step_text)
+                        )
+                    ):
+                        reopens += 1
+                        continue
                     break
+                notes: list[str] = []
                 for call in calls:
                     tool_calls += 1
                     self._log(
@@ -485,9 +593,15 @@ class Agent:
                         {
                             "role": "tool",
                             "tool_call_id": call.id,
-                            "content": result.content,
+                            "content": _tool_content(result),
                         }
                     )
+                    if self.hooks.after_tool is not None:
+                        note = await self.hooks.after_tool(self, call, result)
+                        if note and note.strip():
+                            notes.append(note)
+                # One message after all results keeps tool results contiguous.
+                self._append_hook_message("after_tool", "\n\n".join(notes))
                 if steps >= self.max_steps:
                     status = "max_steps"
         except asyncio.CancelledError:
@@ -536,19 +650,18 @@ class Agent:
         """Run one provider call; False when the turn deadline cut it short."""
 
         kwargs: dict[str, Any] = {"model": self.model, "session_id": self.session_id}
+        if self.effort is not None:
+            kwargs["effort"] = self.effort
+        tools = self._tool_specs()
         if deadline is None:
-            async for event in self.provider.stream(
-                self.messages, self.tools.to_openai(), **kwargs
-            ):
+            async for event in self.provider.stream(self.messages, tools, **kwargs):
                 self._handle_provider_event(event, step_parts, usage_box, calls, meta_box)
             return True
         kwargs["deadline"] = deadline
         remaining = max(0.0, deadline - time.monotonic())
         try:
             async with asyncio.timeout(remaining) as scope:
-                async for event in self.provider.stream(
-                    self.messages, self.tools.to_openai(), **kwargs
-                ):
+                async for event in self.provider.stream(self.messages, tools, **kwargs):
                     self._handle_provider_event(
                         event, step_parts, usage_box, calls, meta_box
                     )
@@ -626,6 +739,7 @@ __all__ = [
     "DEFAULT_MAX_STEPS",
     "Agent",
     "AgentEvent",
+    "AgentHooks",
     "SYSTEM_PROMPT",
     "TurnResult",
     "build_system_prompt",

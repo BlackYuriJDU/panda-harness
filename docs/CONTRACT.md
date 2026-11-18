@@ -144,7 +144,18 @@ generic gateway has no Responses route for them. `effort` is sent as
 system prompt and the newest block with `cache_control` for `claude*` models
 only. `retry_partial` buffers each attempt and retries a retryable failure even
 after output started, discarding the partial turn; a stream that ends without a
-finish reason counts as such a failure. A `400` is never retried.
+finish reason counts as such a failure. A `400` is never retried. With both
+`retry_partial` and `stream(deadline=...)`, transient failures are retried until
+the deadline rather than `max_retries` times.
+
+Only the `generic` profile accepts a plain-`http` base URL outside loopback
+(a local egress proxy); every other profile requires https outside loopback.
+
+Library options (no CLI flag): `Agent(hooks=AgentHooks(...))` adds loop hooks
+whose text is appended as a new user message; `Agent(freeze_tools=True)` keeps
+the first tool list for the session; `Agent.effort` or `stream(effort=...)`
+overrides `provider.effort` per request; `ToolContext(vision=True)` registers the
+`view_image` tool. All are off by default.
 
 `panda_core.profiles.ple_provider_settings()` builds generic settings from the
 PLE evaluator's environment (`MODEL_BASE_URL`, `MODEL_NAME`, `MODEL_API_KEY`,

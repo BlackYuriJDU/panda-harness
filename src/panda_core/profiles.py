@@ -66,7 +66,9 @@ def ple_provider_settings(
             endpoint_profile=ENDPOINT_GENERIC,
             anthropic_base_url=env.get("ANTHROPIC_BASE_URL", "").strip() or root,
             google_base_url=env.get("GOOGLE_GEMINI_BASE_URL", "").strip() or root,
-            timeout_seconds=600.0,
+            # Max effort can think silently for minutes; the egress proxy closes
+            # idle connections at 1800 s.
+            timeout_seconds=1800.0,
             context_window=_context_window(model_name),
             max_output_tokens=32_000,
             max_retries=5,

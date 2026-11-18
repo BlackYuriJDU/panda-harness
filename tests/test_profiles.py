@@ -29,6 +29,7 @@ def test_ple_settings_for_opus() -> None:
     assert settings.max_output_tokens == 32_000
     assert settings.max_retries == 5
     assert settings.max_retry_delay_seconds == 120
+    assert settings.timeout_seconds == 1800
     assert settings.prompt_cache and settings.retry_partial
     assert settings.effort == "high"
     # The key is read from the environment by the provider, never copied.
@@ -70,6 +71,16 @@ def test_missing_variables_fail_closed() -> None:
     assert info.value.details["missing"] == ["MODEL_NAME", "MODEL_API_KEY"]
 
 
+def test_kit_http_proxy_url_is_accepted() -> None:
+    # The local kit hands the harness a plain-http egress proxy.
+    env = {**ENV, "MODEL_BASE_URL": "http://host.docker.internal:4000/v1"}
+    env.pop("ANTHROPIC_BASE_URL")
+    env.pop("GOOGLE_GEMINI_BASE_URL")
+    settings, _ = ple_provider_settings(env)
+    assert settings.base_url == "http://host.docker.internal:4000/v1"
+    assert settings.anthropic_base_url == "http://host.docker.internal:4000"
+
+
 def test_invalid_url_fails_closed() -> None:
     with pytest.raises(ConfigError):
-        ple_provider_settings({**ENV, "MODEL_BASE_URL": "http://gateway.example/v1"})
+        ple_provider_settings({**ENV, "MODEL_BASE_URL": "ftp://gateway.example/v1"})

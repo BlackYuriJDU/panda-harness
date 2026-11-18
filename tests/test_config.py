@@ -213,3 +213,13 @@ def test_generic_profile_fields_roundtrip(tmp_path: Path) -> None:
 def test_generic_profile_fields_are_validated(field: dict) -> None:
     with pytest.raises(ValidationError):
         ProviderSettings(**field)
+
+
+def test_remote_http_is_allowed_only_for_the_generic_profile() -> None:
+    url = "http://host.docker.internal:4000/v1"
+    generic = ProviderSettings(endpoint_profile="generic", base_url=url, anthropic_base_url=url)
+    assert generic.base_url == url
+    for field in ("base_url", "anthropic_base_url", "google_base_url"):
+        with pytest.raises(ValidationError):
+            ProviderSettings(**{field: url})
+    assert ProviderSettings(base_url="http://localhost:4000/v1").base_url.startswith("http://")

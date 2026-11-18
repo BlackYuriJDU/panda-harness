@@ -289,10 +289,17 @@ def sanitize_messages_for_openai(
     """
 
     cleaned: list[dict[str, Any]] = []
+    pending_images: list[tuple[str, str]] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
+        if pending_images and message.get("role") != "tool":
+            cleaned.append(_tool_images_message(pending_images))
+            pending_images = []
         item = {key: message[key] for key in _OPENAI_MESSAGE_KEYS if key in message}
+        if message.get("role") == "tool" and isinstance(item.get("content"), list):
+            pending_images.extend(_image_parts(item["content"]))
+            item["content"] = _text_content(item["content"])
         raw_calls = message.get("tool_calls")
         if isinstance(raw_calls, list):
             calls: list[dict[str, Any]] = []
@@ -317,7 +324,51 @@ def sanitize_messages_for_openai(
             if calls:
                 item["tool_calls"] = calls
         cleaned.append(item)
+    if pending_images:
+        cleaned.append(_tool_images_message(pending_images))
     return cleaned
+
+
+def _image_parts(value: Any) -> list[tuple[str, str]]:
+    """(media_type, base64) pairs from OpenAI-style `image_url` data-URL parts."""
+
+    images: list[tuple[str, str]] = []
+    if not isinstance(value, list):
+        return images
+    for part in value:
+        if not isinstance(part, dict) or part.get("type") != "image_url":
+            continue
+        image = part.get("image_url")
+        url = image.get("url") if isinstance(image, dict) else image
+        if not isinstance(url, str) or not url.startswith("data:"):
+            continue
+        header, _, data = url[5:].partition(",")
+        media_type, _, encoding = header.partition(";")
+        if encoding == "base64" and media_type.startswith("image/") and data:
+            images.append((media_type, data))
+    return images
+
+
+def _anthropic_images(images: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    return [
+        {"type": "image", "source": {"type": "base64", "media_type": kind, "data": data}}
+        for kind, data in images
+    ]
+
+
+def _google_images(images: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    return [{"inlineData": {"mimeType": kind, "data": data}} for kind, data in images]
+
+
+def _tool_images_message(images: list[tuple[str, str]]) -> dict[str, Any]:
+    """OpenAI chat tool messages are text-only; images follow as a user turn."""
+
+    parts: list[dict[str, Any]] = [
+        {"type": "text", "text": "Images returned by the tool calls above."}
+    ]
+    for kind, data in images:
+        parts.append({"type": "image_url", "image_url": {"url": f"data:{kind};base64,{data}"}})
+    return {"role": "user", "content": parts}
 
 
 def _text_content(value: Any) -> str:
@@ -497,6 +548,13 @@ def convert_messages_for_anthropic(
                 system_parts.append(content)
             continue
         if role == "tool":
+            raw = message.get("content")
+            text = _text_content(raw)
+            images = _image_parts(raw)
+            result: str | list[dict[str, Any]] = text
+            if images:
+                result = [{"type": "text", "text": text}] if text else []
+                result += _anthropic_images(images)
             _append_blocks(
                 converted,
                 "user",
@@ -504,7 +562,7 @@ def convert_messages_for_anthropic(
                     {
                         "type": "tool_result",
                         "tool_use_id": str(message.get("tool_call_id") or ""),
-                        "content": _text_content(message.get("content")),
+                        "content": result,
                     }
                 ],
             )
@@ -541,7 +599,9 @@ def convert_messages_for_anthropic(
             _append_blocks(converted, "assistant", blocks)
             continue
         content = _text_content(message.get("content"))
-        _append_blocks(converted, "user", [{"type": "text", "text": content}] if content else [])
+        user_blocks = [{"type": "text", "text": content}] if content else []
+        user_blocks += _anthropic_images(_image_parts(message.get("content")))
+        _append_blocks(converted, "user", user_blocks)
     return system_parts, _normalize_anthropic_turns(converted)
 
 
@@ -631,12 +691,12 @@ def convert_messages_for_responses(
             call_id = str(message.get("tool_call_id") or "").strip()
             if not call_id:
                 continue
+            output = _text_content(message.get("content"))
+            dropped = len(_image_parts(message.get("content")))
+            if dropped:
+                output += f"\n[{dropped} image(s) not sent: unsupported on this protocol]"
             items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": _text_content(message.get("content")),
-                }
+                {"type": "function_call_output", "call_id": call_id, "output": output}
             )
             continue
         if role == "assistant":
@@ -826,13 +886,15 @@ def convert_messages_for_google(
                                 "content": _text_content(message.get("content"))
                             },
                         }
-                    }
+                    },
+                    *_google_images(_image_parts(message.get("content"))),
                 ],
             )
             continue
         content = _text_content(message.get("content"))
-        if content:
-            append("user", [{"text": content}])
+        user_parts = [{"text": content}] if content else []
+        user_parts += _google_images(_image_parts(message.get("content")))
+        append("user", user_parts)
     return system_parts, contents
 
 
@@ -902,6 +964,7 @@ class DoneEvent:
 ProviderEvent = TextDelta | ToolCallDelta | UsageEvent | DoneEvent
 
 
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 MAX_RETRY_DELAY_SECONDS = 15.0
 
@@ -1256,6 +1319,7 @@ class OpenCodeProvider:
         model: str | None = None,
         session_id: str | None = None,
         deadline: float | None = None,
+        effort: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Stream one model step.
 
@@ -1263,21 +1327,38 @@ class OpenCodeProvider:
         `retry_partial`, each attempt is buffered and released only once it
         completes, so a retryable failure mid-stream discards the partial turn
         and the model never sees an incomplete one. `deadline` is a
-        `time.monotonic()` value; no retry wait may cross it.
+        `time.monotonic()` value; no retry wait may cross it. With both,
+        `max_retries` no longer bounds the attempts: the deadline does.
+        `effort` overrides `provider.effort` for this call only (per-phase effort).
         """
 
         model_id = self.model_id(model)
         self._ensure_protocol(model_id)
         key = self._require_api_key()
+        if effort is not None and effort not in EFFORT_LEVELS:
+            raise ProviderError(
+                f"unknown effort {effort!r}",
+                hint="use one of " + ", ".join(EFFORT_LEVELS),
+                details={"effort": effort},
+            )
         session = session_id or self.session_id
         attempts = self.settings.max_retries + 1
         buffer = self.settings.retry_partial
-        for attempt in range(attempts):
+        # Headless runs with a deadline never give up on a transient failure:
+        # rate limits and endpoint outages are retried until the clock runs out.
+        until_deadline = buffer and deadline is not None
+        attempt = 0
+        while True:
             emitted = False
             buffered: list[ProviderEvent] = []
             try:
                 async for event in self._stream_once(
-                    messages, tools, model_id=model_id, key=key, session_id=session
+                    messages,
+                    tools,
+                    model_id=model_id,
+                    key=key,
+                    session_id=session,
+                    effort=effort,
                 ):
                     if buffer:
                         buffered.append(event)
@@ -1286,9 +1367,10 @@ class OpenCodeProvider:
                     yield event
             except ProviderError as exc:
                 retryable = bool(exc.details.get("retryable")) if exc.details else False
-                if emitted or not retryable or attempt + 1 >= attempts:
+                if emitted or not retryable or (not until_deadline and attempt + 1 >= attempts):
                     raise
                 await self._sleep_before_retry(attempt, exc, deadline=deadline)
+                attempt += 1
                 continue
             for event in buffered:
                 yield event
@@ -1302,28 +1384,29 @@ class OpenCodeProvider:
         model_id: str,
         key: str,
         session_id: str,
+        effort: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         protocol = self.protocol_for(model_id)
         if protocol == PROTOCOL_ANTHROPIC:
             async for event in self._stream_anthropic(
-                messages, tools, model_id=model_id, key=key, session_id=session_id
+                messages, tools, model_id=model_id, key=key, session_id=session_id, effort=effort
             ):
                 yield event
             return
         if protocol == PROTOCOL_RESPONSES:
             async for event in self._stream_responses(
-                messages, tools, model_id=model_id, key=key, session_id=session_id
+                messages, tools, model_id=model_id, key=key, session_id=session_id, effort=effort
             ):
                 yield event
             return
         if protocol == PROTOCOL_GOOGLE:
             async for event in self._stream_google(
-                messages, tools, model_id=model_id, key=key, session_id=session_id
+                messages, tools, model_id=model_id, key=key, session_id=session_id, effort=effort
             ):
                 yield event
             return
         async for event in self._stream_openai(
-            messages, tools, model_id=model_id, key=key, session_id=session_id
+            messages, tools, model_id=model_id, key=key, session_id=session_id, effort=effort
         ):
             yield event
 
@@ -1368,6 +1451,7 @@ class OpenCodeProvider:
         model_id: str,
         key: str,
         session_id: str,
+        effort: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         chat_messages = sanitize_messages_for_openai(messages)
         if self._cache_enabled(model_id):
@@ -1382,7 +1466,7 @@ class OpenCodeProvider:
         if not is_claude_model(model_id):
             # Claude answers 400 to any sampling parameter.
             payload["temperature"] = self.settings.temperature
-        effort = self._effort(model_id)
+        effort = effort or self._effort(model_id)
         if effort:
             payload["reasoning_effort"] = effort
         if tools:
@@ -1515,6 +1599,7 @@ class OpenCodeProvider:
         model_id: str,
         key: str,
         session_id: str,
+        effort: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Stream Anthropic Messages, normalized to the OpenAI-chat event shape."""
 
@@ -1542,7 +1627,7 @@ class OpenCodeProvider:
             )
         if tool_payload:
             payload["tools"] = tool_payload
-        effort = self._effort(model_id)
+        effort = effort or self._effort(model_id)
         if effort:
             payload["output_config"] = {"effort": effort}
         headers = {**self._headers(session_id=session_id, anthropic=True)}
@@ -1723,6 +1808,7 @@ class OpenCodeProvider:
         model_id: str,
         key: str,
         session_id: str,
+        effort: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Stream the OpenAI Responses API, normalized to the shared events."""
 
@@ -1735,7 +1821,7 @@ class OpenCodeProvider:
         }
         if instructions:
             payload["instructions"] = instructions
-        effort = self._effort(model_id)
+        effort = effort or self._effort(model_id)
         if effort:
             payload["reasoning"] = {"effort": effort}
         if tools:
@@ -1914,6 +2000,7 @@ class OpenCodeProvider:
         model_id: str,
         key: str,
         session_id: str,
+        effort: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Stream Gemini generateContent, normalized to the shared events."""
 

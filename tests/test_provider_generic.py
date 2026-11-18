@@ -523,3 +523,113 @@ def test_retry_never_waits_past_the_deadline() -> None:
         asyncio.run(collect(provider, deadline=time.monotonic() + 1.0))
     assert sleeps == []
     assert handler.count == 1
+
+
+# ---- N9: transient failures retried until the deadline ----
+
+
+def test_rate_limits_are_retried_past_max_retries_until_the_deadline() -> None:
+    handler = Sequence_(*([(429, "")] * 8), (200, CHAT_OK))
+    provider = make(handler, "glm-5.2", retry_partial=True, max_retries=2)
+    sleeps: list[float] = []
+    no_sleep(provider, sleeps)
+    events = asyncio.run(collect(provider, deadline=time.monotonic() + 3_600))
+    assert handler.count == 9
+    assert len(sleeps) == 8
+    assert [e.text for e in events if isinstance(e, TextDelta)] == ["ok"]
+
+
+def test_without_a_deadline_max_retries_still_bounds_attempts() -> None:
+    handler = Sequence_(*([(429, "")] * 8), (200, CHAT_OK))
+    provider = make(handler, "glm-5.2", retry_partial=True, max_retries=2)
+    no_sleep(provider)
+    with pytest.raises(ProviderError):
+        asyncio.run(collect(provider))
+    assert handler.count == 3
+
+
+def test_retry_until_deadline_still_never_repeats_a_400() -> None:
+    handler = Sequence_((400, "bad"), (200, CHAT_OK))
+    provider = make(handler, "glm-5.2", retry_partial=True)
+    no_sleep(provider)
+    with pytest.raises(ProviderError):
+        asyncio.run(collect(provider, deadline=time.monotonic() + 3_600))
+    assert handler.count == 1
+
+
+# ---- N5: byte-exact thinking replay ----
+
+
+def _thinking_stream(thinking: str, signature: str) -> str:
+    return anthropic_sse(
+        {"type": "message_start", "message": {"model": "claude-opus-5-5", "usage": {}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+        *(
+            [{"type": "content_block_delta", "index": 0,
+              "delta": {"type": "thinking_delta", "thinking": part}}
+             for part in (thinking[:5], thinking[5:])]
+            if thinking
+            else []
+        ),
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "signature_delta", "signature": signature}},
+        {"type": "content_block_start", "index": 1,
+         "content_block": {"type": "redacted_thinking", "data": "  opaque\n"}},
+        {"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 2,
+         "delta": {"type": "text_delta", "text": "answer  \n"}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}},
+        {"type": "message_stop"},
+    )
+
+
+@pytest.mark.parametrize(
+    "thinking",
+    ["step one  \n\n  step two \t", "", "unicode: ü — 東京  "],
+)
+def test_thinking_round_trips_byte_for_byte(thinking: str) -> None:
+    signature = "EqQBCkYIBxgCKkA+/=="
+    provider = make(Capture(_thinking_stream(thinking, signature)), "claude-opus-5-5")
+    done = [e for e in asyncio.run(collect(provider)) if isinstance(e, DoneEvent)][-1]
+    blocks = done.metadata["anthropic_content"]
+    assert blocks[0] == {"type": "thinking", "thinking": thinking, "signature": signature}
+    assert blocks[1] == {"type": "redacted_thinking", "data": "  opaque\n"}
+    assert blocks[2] == {"type": "text", "text": "answer  \n"}
+
+    history = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "answer  \n", "provider_meta": done.metadata},
+        {"role": "user", "content": "next"},
+    ]
+    capture = Capture(ANTHROPIC_OK)
+    asyncio.run(collect(make(capture, "claude-opus-5-5"), messages=history))
+    sent = json.loads(capture.requests[-1].content)["messages"][1]["content"]
+    assert sent == blocks
+
+
+# ---- N7: per-request effort ----
+
+
+@pytest.mark.parametrize(
+    ("model", "body", "field"),
+    [
+        ("claude-opus-5-5", ANTHROPIC_OK, lambda p: p["output_config"]["effort"]),
+        ("glm-5.2", CHAT_OK, lambda p: p["reasoning_effort"]),
+    ],
+)
+def test_request_effort_overrides_the_setting(model, body, field) -> None:
+    capture = Capture(body)
+    provider = make(capture, model, effort="high")
+    asyncio.run(collect(provider, effort="medium"))
+    assert field(capture.payload) == "medium"
+    asyncio.run(collect(provider))
+    assert field(capture.payload) == "high"
+
+
+def test_unknown_request_effort_fails_before_any_request() -> None:
+    capture = Capture(CHAT_OK)
+    provider = make(capture, "glm-5.2")
+    with pytest.raises(ProviderError):
+        asyncio.run(collect(provider, effort="extreme"))
+    assert capture.requests == []
