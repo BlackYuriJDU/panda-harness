@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +36,10 @@ from panda_core.workspace import Workspace
 DEFAULT_SYSTEM_CHARS = 24_000
 LOG_STRING_LIMIT = 8_000
 LOG_LIST_LIMIT = 200
+# Context trimming never elides the tool results of the newest messages.
+TRIM_KEEP_RECENT = 6
+ELIDE_MIN_CHARS = 200
+ELIDED_MARKER = "[tool result elided"
 
 SYSTEM_PROMPT = """You are Panda, a fail-closed biomedical evidence harness.
 
@@ -194,6 +199,7 @@ class Agent:
         on_event: Callable[[AgentEvent], None] | None = None,
         private: bool = False,
         context_window: int | None = None,
+        deadline_seconds: float | None = None,
     ) -> None:
         self.workspace = workspace
         self.provider = provider
@@ -201,6 +207,9 @@ class Agent:
         self.session = session if session is not None else tools.ctx.session
         self.model = model or workspace.config.model
         self.max_steps = max(1, int(max_steps))
+        # Optional wall-clock budget per turn; the loop stops at whichever of
+        # max_steps or the deadline comes first.
+        self.deadline_seconds = deadline_seconds
         self.active_study = active_study
         self.private = private
         self._approver = approver
@@ -277,17 +286,76 @@ class Agent:
     def estimate_context_tokens(self) -> int:
         return max(0, _messages_chars(self.messages) // 4)
 
+    def _instruction_index(self) -> int | None:
+        """Index of the first user message: the task instruction, never trimmed."""
+
+        for index, message in enumerate(self.messages):
+            if message.get("role") == "user":
+                return index
+        return None
+
+    def _elide_tool_results(self, budget: int) -> bool:
+        """Replace old tool results with a stub, oldest first, until under budget."""
+
+        edited = False
+        cutoff = len(self.messages) - TRIM_KEEP_RECENT
+        for index in range(1, max(1, cutoff)):
+            if _messages_chars(self.messages) <= budget:
+                break
+            message = self.messages[index]
+            content = message.get("content")
+            if (
+                message.get("role") != "tool"
+                or not isinstance(content, str)
+                or len(content) < ELIDE_MIN_CHARS
+                or content.startswith(ELIDED_MARKER)
+            ):
+                continue
+            self.messages[index] = {
+                **message,
+                "content": (
+                    f"{ELIDED_MARKER}: {len(content)} chars to save context; "
+                    "re-run the tool if it is still needed]"
+                ),
+            }
+            edited = True
+        return edited
+
+    def _drop_thinking(self) -> None:
+        """Remove replayed Claude thinking blocks from the whole history.
+
+        A signed thinking block is valid only while everything before it is
+        unchanged; after any non-append edit, replaying it is a 400. Dropping
+        every block is always accepted.
+        """
+
+        for message in self.messages:
+            meta = message.get("provider_meta")
+            if isinstance(meta, dict) and "anthropic_content" in meta:
+                rest = {key: value for key, value in meta.items() if key != "anthropic_content"}
+                if rest:
+                    message["provider_meta"] = rest
+                else:
+                    message.pop("provider_meta", None)
+
     def _trim(self) -> None:
         budget = self._context_budget_chars()
-        while len(self.messages) > 2 and _messages_chars(self.messages) > budget:
-            head = self.messages[1]
-            self.messages.pop(1)
+        edited = False
+        if _messages_chars(self.messages) > budget:
+            edited = self._elide_tool_results(budget)
+        pin = self._instruction_index()
+        start = pin + 1 if pin is not None else 1
+        while len(self.messages) > start + 1 and _messages_chars(self.messages) > budget:
+            head = self.messages.pop(start)
+            edited = True
             if head.get("role") == "assistant" and head.get("tool_calls"):
                 # Keep tool results paired with their assistant message.
-                while len(self.messages) > 1 and self.messages[1].get("role") == "tool":
-                    self.messages.pop(1)
-            while len(self.messages) > 1 and self.messages[1].get("role") == "tool":
-                self.messages.pop(1)
+                while len(self.messages) > start and self.messages[start].get("role") == "tool":
+                    self.messages.pop(start)
+            while len(self.messages) > start and self.messages[start].get("role") == "tool":
+                self.messages.pop(start)
+        if edited:
+            self._drop_thinking()
         self.last_context_tokens = self.estimate_context_tokens()
 
     # ---- turn ----
@@ -303,6 +371,7 @@ class Agent:
                 "turn": turn,
                 "model": self.model,
                 "max_steps": self.max_steps,
+                "deadline_seconds": self.deadline_seconds,
                 "active_study": self.active_study,
             },
         )
@@ -319,25 +388,36 @@ class Agent:
         texts: list[str] = []
         usage = Usage()
         status = "completed"
+        deadline = (
+            time.monotonic() + self.deadline_seconds
+            if self.deadline_seconds is not None
+            else None
+        )
         try:
             while steps < self.max_steps:
+                if deadline is not None and time.monotonic() >= deadline:
+                    status = "deadline"
+                    break
                 steps += 1
                 self._trim()
                 step_parts: list[str] = []
                 calls: list[Any] = []
                 usage_box: list[Usage] = [Usage()]
-                async for event in self.provider.stream(
-                    self.messages,
-                    self.tools.to_openai(),
-                    model=self.model,
-                    session_id=self.session_id,
+                meta_box: list[dict[str, Any] | None] = [None]
+                if not await self._stream_step(
+                    step_parts, usage_box, calls, meta_box, deadline
                 ):
-                    self._handle_provider_event(event, step_parts, usage_box, calls)
+                    # The step ran out of time: its partial output is discarded
+                    # so the history never holds an incomplete turn.
+                    status = "deadline"
+                    break
                 step_usage = usage_box[0]
                 step_text = "".join(step_parts)
                 if step_text:
                     texts.append(step_text)
                 assistant: dict[str, Any] = {"role": "assistant", "content": step_text or None}
+                if meta_box[0]:
+                    assistant["provider_meta"] = meta_box[0]
                 if calls:
                     assistant["tool_calls"] = [
                         {
@@ -445,12 +525,46 @@ class Agent:
             session_id=self.session.session_id if self.session else None,
         )
 
+    async def _stream_step(
+        self,
+        step_parts: list[str],
+        usage_box: list[Usage],
+        calls: list[Any],
+        meta_box: list[dict[str, Any] | None],
+        deadline: float | None,
+    ) -> bool:
+        """Run one provider call; False when the turn deadline cut it short."""
+
+        kwargs: dict[str, Any] = {"model": self.model, "session_id": self.session_id}
+        if deadline is None:
+            async for event in self.provider.stream(
+                self.messages, self.tools.to_openai(), **kwargs
+            ):
+                self._handle_provider_event(event, step_parts, usage_box, calls, meta_box)
+            return True
+        kwargs["deadline"] = deadline
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            async with asyncio.timeout(remaining) as scope:
+                async for event in self.provider.stream(
+                    self.messages, self.tools.to_openai(), **kwargs
+                ):
+                    self._handle_provider_event(
+                        event, step_parts, usage_box, calls, meta_box
+                    )
+        except TimeoutError:
+            if scope.expired():
+                return False
+            raise
+        return True
+
     def _handle_provider_event(
         self,
         event: ProviderEvent,
         step_parts: list[str],
         usage_box: list[Usage],
         calls: list[Any],
+        meta_box: list[dict[str, Any] | None] | None = None,
     ) -> None:
         if isinstance(event, TextDelta):
             step_parts.append(event.text)
@@ -467,6 +581,8 @@ class Agent:
             )
         elif isinstance(event, DoneEvent):
             calls.extend(event.tool_calls)
+            if meta_box is not None:
+                meta_box[0] = getattr(event, "metadata", None)
 
     async def _execute_tool(self, call: Any) -> ToolResult:
         try:
@@ -481,6 +597,7 @@ class Agent:
     # ---- conversation control ----
     def set_model(self, model: str) -> None:
         self.model = model
+        self._drop_thinking()
         self.messages[0] = {
             "role": "system",
             "content": build_system_prompt(self.workspace, active_study=self.active_study),
@@ -489,6 +606,7 @@ class Agent:
     def set_active_study(self, study_id: str | None) -> None:
         self.active_study = study_id
         self.tools.ctx.active_study = study_id
+        self._drop_thinking()
         self.messages[0] = {
             "role": "system",
             "content": build_system_prompt(self.workspace, active_study=study_id),

@@ -50,7 +50,8 @@ Nothing is enforced only in the prompt.
 |---|---|
 | `config.py` | Typed `.panda/config.json` (schema 2), provider settings, path restrictions. |
 | `workspace.py` | Root discovery, path normalization, git/tool probes. |
-| `provider.py` | OpenCode Go client: catalogue, protocol classification, streaming adapters for OpenAI chat, Anthropic Messages, Responses, and Google generateContent, usage. |
+| `provider.py` | Model client for OpenCode Go or a generic gateway: catalogue, protocol classification, streaming adapters for OpenAI chat, Anthropic Messages, Responses, and Google generateContent, usage, retries. |
+| `profiles.py` | Named provider settings built from the environment (the PLE gateway). |
 | `agent.py` | System prompt, turn loop, tool dispatch, context trimming, approvals, usage accounting. |
 | `tools.py` | JSON-schema tool specs, path resolution, read/write/shell/validate/study/evidence/claim/number/session tools. |
 | `policy.py` | Ordered rules, last-match-wins, hard denies, `ask` handling. |
@@ -132,6 +133,58 @@ The key is read from the environment by name (`OPENCODE_API_KEY` by default) and
 only used in the `Authorization` header. Error messages name the variable, never
 its value.
 
+### Generic endpoint profile
+
+`provider.endpoint_profile: generic` serves the same four adapters from any
+gateway with caller-supplied base URLs (the PLE model gateway is the first
+target; `profiles.ple_provider_settings()` builds it from the environment):
+
+```text
+POST {base_url}/chat/completions
+POST {anthropic_base_url}/v1/messages
+POST {base_url}/responses
+POST {google_base_url}/v1beta/models/<id>:streamGenerateContent?alt=sse
+GET  {base_url}/models
+```
+
+No `x-opencode-session` is sent. The key goes in `Authorization: Bearer`, and
+also in `x-api-key` (Anthropic) and `x-goog-api-key` (Google). `gpt-*` ids fall
+back to OpenAI chat, and `provider.protocol` can force any adapter.
+
+Per-model parameters: `claude*` never receives `temperature`, `top_*`,
+`thinking`, `budget_tokens`, or a forced `tool_choice` on any protocol (each is a
+`400` on current Claude models); depth is set only through `provider.effort`.
+Gemini never receives a `thinkingConfig` (Gemini 4 Argon answers `400` to any
+`thinkingBudget`).
+
+### Claude thinking and the append-only rule
+
+Current Claude models return signed `thinking`/`redacted_thinking` blocks, can
+interleave them between `tool_use` blocks, and expect them back unchanged. A
+block is bound to the exact prefix that produced it (system prompt, tools, and
+every earlier message); replaying it after any edit of that prefix is a `400`
+on enforced accounts. The Anthropic adapter therefore returns the turn's
+ordered blocks in `DoneEvent.metadata["anthropic_content"]`, the agent stores
+them as the assistant message's `provider_meta`, and the converter replays them
+verbatim. Other protocols never see them. Whenever the agent edits history
+instead of appending to it (context trimming, eliding a tool result,
+`set_model`, `set_active_study`), it first drops every stored thinking block;
+dropping all of them is always accepted.
+
+With `prompt_cache`, the system prompt and the newest non-thinking block get a
+`cache_control: ephemeral` breakpoint (two of the four allowed), so an
+append-only loop re-reads its prefix from cache.
+
+### Retries
+
+`max_retries` bounds attempts on `408/409/425/429/5xx`, timeouts, and transport
+errors, with exponential backoff from `retry_base_seconds` capped at
+`max_retry_delay_seconds` (or `Retry-After`). By default nothing is retried once
+an event has been yielded. With `retry_partial` (headless runs), each attempt is
+buffered and released only when it completes, so a cut stream is discarded and
+repeated and the model never sees an incomplete turn. `stream(deadline=...)`
+refuses any retry wait that would cross the deadline.
+
 ## Agent loop
 
 One turn is:
@@ -147,9 +200,14 @@ One turn is:
 6. append `assistant.message` and return a `TurnResult` with usage and context
    estimate.
 
-Context is trimmed by character budget derived from `provider.context_window`,
-never by dropping the system prompt. `max_steps` bounds a turn, so a model that
-keeps calling tools cannot run forever.
+Context is trimmed by character budget derived from `provider.context_window`.
+The system prompt and the first user message (the task instruction) are never
+dropped. Old tool results outside the newest six messages are elided to a stub
+first, oldest first; only if that is not enough are the oldest messages after
+the instruction dropped, keeping tool results paired with their call.
+`max_steps` bounds a turn, so a model that keeps calling tools cannot run
+forever; `Agent(deadline_seconds=...)` adds a wall-clock bound for long headless
+tasks. A step cut by the deadline is discarded and the turn ends as `deadline`.
 
 Tool results are data. A file, log, or web page that contains instructions is not
 an order; the system prompt says so and the tool layer enforces scopes anyway.

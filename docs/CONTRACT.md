@@ -108,7 +108,17 @@ enabled legacy export both produce a warning line.
 | `provider.timeout_seconds` | `120` |
 | `provider.context_window` | `131072` |
 | `provider.max_output_tokens` | `8192` |
-| `provider.temperature` | `0.2` |
+| `provider.temperature` | `0.2` (never sent to `claude*` models) |
+| `provider.max_retries` | `2` (0–5) |
+| `provider.retry_base_seconds` | `0.5` |
+| `provider.max_retry_delay_seconds` | `15` (0–300) |
+| `provider.endpoint_profile` | `opencode-go` (`generic` for any multi-protocol gateway) |
+| `provider.anthropic_base_url` | `null` (generic only; falls back to `base_url`) |
+| `provider.google_base_url` | `null` (generic only; falls back to `base_url`) |
+| `provider.protocol` | `auto` (or `openai-chat`, `anthropic`, `responses`, `google`) |
+| `provider.effort` | `null` (or `low`, `medium`, `high`, `xhigh`, `max`) |
+| `provider.prompt_cache` | `false` |
+| `provider.retry_partial` | `false` |
 | `validator` | `corpus/validation/validate.mjs` |
 | `node` | `node` |
 | `node_min_major` | `20` |
@@ -121,6 +131,25 @@ enabled legacy export both produce a warning line.
 workspace. `model` must use the `provider/model` form and its provider must
 match `provider.name`. The API key itself is never stored in the workspace; only
 the environment variable name is.
+
+Every provider field added after `0.2.0a4` defaults to the earlier behavior, so
+an existing config loads and runs unchanged. With `endpoint_profile: generic`
+the routes are `{base_url}/chat/completions`, `{base_url}/responses`,
+`{base_url}/models`, `{anthropic_base_url}/v1/messages`, and
+`{google_base_url}/v1beta/models/<id>:streamGenerateContent?alt=sse`; no
+`x-opencode-session` header is sent, and `gpt-*` ids use OpenAI chat because a
+generic gateway has no Responses route for them. `effort` is sent as
+`reasoning_effort` (chat), `reasoning.effort` (Responses), or
+`output_config.effort` (Anthropic), never to Google. `prompt_cache` marks the
+system prompt and the newest block with `cache_control` for `claude*` models
+only. `retry_partial` buffers each attempt and retries a retryable failure even
+after output started, discarding the partial turn; a stream that ends without a
+finish reason counts as such a failure. A `400` is never retried.
+
+`panda_core.profiles.ple_provider_settings()` builds generic settings from the
+PLE evaluator's environment (`MODEL_BASE_URL`, `MODEL_NAME`, `MODEL_API_KEY`,
+optional `ANTHROPIC_BASE_URL` and `GOOGLE_GEMINI_BASE_URL`). It is a library
+entry point; no CLI flag selects it.
 
 ## 4. Commands
 
@@ -171,7 +200,9 @@ panda chat [--model M] [--max-steps N] [--session ID] [--auto] [--private]
 - `--private` persists only the task hash and length; the text is not written.
 - `--json` suppresses streaming and prints one result object
   (`status`, `text`, `steps`, `tool_calls`, `usage`, `context_tokens`,
-  `context_window`, `context_ratio`, `session_id`).
+  `context_window`, `context_ratio`, `session_id`). `status` is `completed`,
+  `max_steps`, `cancelled`, or `deadline` (library callers that set
+  `Agent(deadline_seconds=...)`; the step cut by the clock is discarded).
 - A timeout maps to exit code `4`.
 
 ### 4.2 `panda models`

@@ -314,3 +314,167 @@ def test_system_prompt_carries_the_rules(workspace) -> None:
     assert "gse160208" in prompt
     assert str(workspace.root.as_posix()) in prompt
     assert "validate" in prompt
+
+# ---- PLE readiness: instruction pinning, thinking hygiene, wall-clock loop ----
+
+THINKING_META = {
+    "anthropic_content": [
+        {"type": "thinking", "thinking": "", "signature": "sig"},
+        {"type": "text", "text": "ok"},
+    ]
+}
+
+
+def _fit_budget(agent: Agent, extra_chars: int) -> None:
+    """Size the context window so the budget is the current history plus extra."""
+
+    from panda_core.agent import _messages_chars
+
+    agent.context_window = int((_messages_chars(agent.messages) + extra_chars) / 3.6) + 1
+
+
+def test_trimming_never_drops_the_task_instruction(workspace) -> None:
+    agent, _, provider = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]]
+    )
+    agent.messages.append({"role": "user", "content": "TASK: size the cables"})
+    _fit_budget(agent, 3_000)
+    for index in range(30):
+        agent.messages.append({"role": "assistant", "content": "x" * 1_000 + str(index)})
+        agent.messages.append({"role": "user", "content": "y" * 1_000 + str(index)})
+    asyncio.run(agent.run_turn("latest"))
+    assert agent.messages[1] == {"role": "user", "content": "TASK: size the cables"}
+    sent = provider.calls[-1]
+    assert sent[1] == {"role": "user", "content": "TASK: size the cables"}
+    assert {"role": "user", "content": "latest"} in sent
+    assert len(sent) < 63
+
+
+def test_trimming_elides_old_tool_results_before_dropping_messages(workspace) -> None:
+    agent, _, _ = make_agent(workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]])
+    agent.messages.append({"role": "user", "content": "TASK"})
+    _fit_budget(agent, 2_500)
+    agent.messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+    agent.messages.append({"role": "tool", "tool_call_id": "c1", "content": "z" * 6_000})
+    for index in range(4):
+        agent.messages.append({"role": "assistant", "content": f"note {index}"})
+        agent.messages.append({"role": "user", "content": f"more {index}"})
+    before = len(agent.messages)
+    asyncio.run(agent.run_turn("latest"))
+    # Nothing was dropped: eliding the stale tool result was enough.
+    assert len(agent.messages) == before + 2
+    tool = next(m for m in agent.messages if m.get("role") == "tool")
+    assert tool["tool_call_id"] == "c1"
+    assert tool["content"].startswith("[tool result elided: 6000 chars")
+
+
+def test_append_only_history_keeps_thinking(workspace) -> None:
+    agent, _, provider = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]]
+    )
+    agent.messages.append({"role": "user", "content": "TASK"})
+    agent.messages.append({"role": "assistant", "content": "ok", "provider_meta": THINKING_META})
+    asyncio.run(agent.run_turn("next"))
+    sent = next(m for m in provider.calls[-1] if m.get("role") == "assistant")
+    assert sent["provider_meta"] == THINKING_META
+
+
+def test_trimming_drops_every_thinking_block(workspace) -> None:
+    agent, _, provider = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]]
+    )
+    agent.messages.append({"role": "user", "content": "TASK"})
+    _fit_budget(agent, 3_000)
+    for index in range(10):
+        agent.messages.append(
+            {"role": "assistant", "content": "x" * 1_000, "provider_meta": THINKING_META}
+        )
+        agent.messages.append({"role": "user", "content": f"more {index}"})
+    asyncio.run(agent.run_turn("latest"))
+    assert all("provider_meta" not in m for m in provider.calls[-1])
+
+
+def test_set_model_drops_thinking_but_keeps_other_meta(workspace) -> None:
+    agent, _, _ = make_agent(workspace, [])
+    agent.messages.append({"role": "user", "content": "TASK"})
+    agent.messages.append(
+        {
+            "role": "assistant",
+            "content": "ok",
+            "provider_meta": {**THINKING_META, "other": 1},
+        }
+    )
+    agent.set_model("opencode-go/glm-5.2")
+    assert agent.messages[-1]["provider_meta"] == {"other": 1}
+    agent.messages[-1]["provider_meta"] = dict(THINKING_META)
+    agent.set_active_study(None)
+    assert "provider_meta" not in agent.messages[-1]
+
+
+def test_turn_metadata_reaches_the_next_provider_call(workspace) -> None:
+    call = ToolCall(id="toolu_1", name="read_file", arguments='{"path":"README.md"}')
+    agent, _, provider = make_agent(
+        workspace,
+        [
+            [DoneEvent(finish_reason="tool_calls", tool_calls=(call,), metadata=THINKING_META)],
+            [TextDelta("done"), DoneEvent(finish_reason="stop")],
+        ],
+    )
+    asyncio.run(agent.run_turn("read it"))
+    sent = next(m for m in provider.calls[1] if m.get("role") == "assistant")
+    assert sent["provider_meta"] == THINKING_META
+
+
+class SlowProvider:
+    def __init__(self) -> None:
+        self.deadlines: list[float | None] = []
+
+    async def stream(self, messages, tools=None, model=None, session_id=None, deadline=None):
+        self.deadlines.append(deadline)
+        yield TextDelta("partial")
+        await asyncio.sleep(10)
+        yield DoneEvent(finish_reason="stop")
+
+
+def _agent_with(workspace, provider, **kwargs) -> tuple[Agent, SessionLog]:
+    session = SessionLog.create(workspace.sessions_dir, label="deadline")
+    policy, _ = load_policy_or_default(workspace.policy_path)
+    context = ToolContext(
+        workspace=workspace,
+        policy=PolicyEngine(policy, root=workspace.root),
+        session=session,
+    )
+    return Agent(workspace, provider, ToolRegistry(context), session=session, **kwargs), session
+
+
+def test_loop_stops_on_the_wall_clock_without_a_partial_turn(workspace) -> None:
+    provider = SlowProvider()
+    agent, session = _agent_with(workspace, provider, max_steps=1_000, deadline_seconds=0.05)
+    result = asyncio.run(asyncio.wait_for(agent.run_turn("task"), timeout=5))
+    assert result.status == "deadline"
+    assert result.steps == 1
+    assert agent.messages[-1] == {"role": "user", "content": "task"}
+    assert provider.deadlines and provider.deadlines[0] is not None
+    ends = [event.data for event in session.events() if event.type == "turn.end"]
+    assert ends[-1]["status"] == "deadline"
+
+
+def test_expired_deadline_stops_before_calling_the_model(workspace) -> None:
+    provider = SlowProvider()
+    agent, _ = _agent_with(workspace, provider, deadline_seconds=0)
+    result = asyncio.run(agent.run_turn("task"))
+    assert result.status == "deadline"
+    assert result.steps == 0
+    assert provider.deadlines == []

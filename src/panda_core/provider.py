@@ -15,6 +15,17 @@ Go also requires two non-generic headers on every request: a stable
 `x-opencode-session` id per conversation and a `panda-harness/<version>`
 User-Agent. Without them the endpoint answers 400 `MissingSessionID`.
 
+The `generic` endpoint profile targets any gateway serving the same protocols
+under caller-supplied base URLs (the PLE model gateway, for example): routes are
+`{base}/chat/completions`, `{anthropic_base}/v1/messages`, and
+`{google_base}/v1beta/models/...`, and no Go session header is sent.
+
+Claude thinking blocks are signed and bound to the conversation prefix that
+produced them. The Anthropic adapter returns the turn's ordered content blocks
+in `DoneEvent.metadata["anthropic_content"]`; the agent stores them as the
+assistant message's `provider_meta` and the converter replays them verbatim.
+Any non-append edit of the history must drop them first (see agent `_trim`).
+
 No secret ever appears in an error message. The API key comes from the
 environment or the user-scoped credential store (never the workspace) and is
 only used in the Authorization header.
@@ -23,9 +34,11 @@ only used in the Authorization header.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import random
+import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -38,6 +51,7 @@ from panda_core.config import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
     DEFAULT_PROVIDER,
+    ENDPOINT_GENERIC,
     PandaConfig,
     ProviderSettings,
     accepted_providers,
@@ -400,6 +414,66 @@ def _normalize_anthropic_turns(
     return merged
 
 
+def _anthropic_content(message: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Return a deep copy of the stored Anthropic blocks of an assistant turn."""
+
+    meta = message.get("provider_meta")
+    blocks = meta.get("anthropic_content") if isinstance(meta, dict) else None
+    if not isinstance(blocks, list) or not blocks:
+        return None
+    if not all(isinstance(block, dict) and block.get("type") for block in blocks):
+        return None
+    return copy.deepcopy(blocks)
+
+
+def is_claude_model(model_id: str) -> bool:
+    """Claude rejects sampling parameters; detect it on any protocol."""
+
+    return model_id.strip().lower().startswith("claude")
+
+
+EPHEMERAL_CACHE = {"type": "ephemeral"}
+
+
+def _mark_last_block_for_cache(messages: list[dict[str, Any]]) -> None:
+    """Put a cache breakpoint on the newest block that accepts one."""
+
+    if not messages:
+        return
+    content = messages[-1].get("content")
+    if not isinstance(content, list):
+        return
+    for block in reversed(content):
+        if isinstance(block, dict) and block.get("type") not in {
+            "thinking",
+            "redacted_thinking",
+        }:
+            block["cache_control"] = dict(EPHEMERAL_CACHE)
+            return
+
+
+def _cache_chat_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark the system prompt and the newest text message for Claude caching."""
+
+    def as_parts(message: dict[str, Any]) -> dict[str, Any]:
+        text = message.get("content")
+        if not isinstance(text, str) or not text:
+            return message
+        return {
+            **message,
+            "content": [
+                {"type": "text", "text": text, "cache_control": dict(EPHEMERAL_CACHE)}
+            ],
+        }
+
+    marked = list(messages)
+    if marked and marked[0].get("role") == "system":
+        marked[0] = as_parts(marked[0])
+    if len(marked) > 1 and marked[-1].get("role") in {"user", "tool"}:
+        marked[-1] = as_parts(marked[-1])
+    return marked
+
+
 def convert_messages_for_anthropic(
     messages: Sequence[dict[str, Any]],
 ) -> tuple[list[str], list[dict[str, Any]]]:
@@ -436,6 +510,11 @@ def convert_messages_for_anthropic(
             )
             continue
         if role == "assistant":
+            verbatim = _anthropic_content(message)
+            if verbatim is not None:
+                # Signed thinking blocks must be replayed unchanged and in order.
+                _append_blocks(converted, "assistant", verbatim)
+                continue
             blocks: list[dict[str, Any]] = []
             content = _text_content(message.get("content"))
             if content:
@@ -816,6 +895,8 @@ class DoneEvent:
     finish_reason: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
     model: str | None = None
+    # Turn-level provider state the next request must echo (Claude thinking).
+    metadata: dict[str, Any] | None = None
 
 
 ProviderEvent = TextDelta | ToolCallDelta | UsageEvent | DoneEvent
@@ -878,8 +959,41 @@ def _error_for_status(
     )
 
 
+def _anthropic_turn_metadata(
+    blocks: dict[int, dict[str, Any]], tool_parts: dict[int, dict[str, str]]
+) -> dict[str, Any] | None:
+    """Ordered content of a Claude turn, only when it carries thinking blocks."""
+
+    if not any(
+        block.get("type") in {"thinking", "redacted_thinking"} for block in blocks.values()
+    ):
+        return None
+    ordered: list[dict[str, Any]] = []
+    for index, block in sorted(blocks.items()):
+        kind = block.get("type")
+        if kind == "tool_use":
+            slot = tool_parts.get(index)
+            if not slot or not slot["name"]:
+                continue
+            ordered.append(
+                {
+                    "type": "tool_use",
+                    "id": slot["id"] or f"call_{index}",
+                    "name": slot["name"],
+                    "input": _tool_input(slot["arguments"]),
+                }
+            )
+        elif kind == "text":
+            # The Messages API rejects empty text blocks.
+            if block.get("text"):
+                ordered.append(dict(block))
+        else:
+            ordered.append(dict(block))
+    return {"anthropic_content": ordered}
+
+
 class OpenCodeProvider:
-    """Streaming client for OpenCode Go (OpenAI chat + Anthropic Messages)."""
+    """Streaming client for OpenCode Go or a generic multi-protocol gateway."""
 
     def __init__(
         self,
@@ -924,23 +1038,39 @@ class OpenCodeProvider:
 
     # ---- urls ----
     @property
+    def generic(self) -> bool:
+        return self.settings.endpoint_profile == ENDPOINT_GENERIC
+
+    @property
     def models_url(self) -> str:
+        if self.generic:
+            return f"{self.settings.base_url}/models"
         return f"{self.settings.base_url}/v1/models"
 
     @property
     def chat_url(self) -> str:
+        if self.generic:
+            return f"{self.settings.base_url}/chat/completions"
         return f"{self.settings.base_url}/openai/v1/chat/completions"
 
     @property
     def anthropic_url(self) -> str:
+        if self.generic:
+            base = self.settings.anthropic_base_url or self.settings.base_url
+            return f"{base}/v1/messages"
         return f"{self.settings.base_url}/anthropic/v1/messages"
 
     @property
     def responses_url(self) -> str:
+        if self.generic:
+            return f"{self.settings.base_url}/responses"
         return f"{self.settings.base_url}/openai/v1/responses"
 
     def google_url(self, model_id: str) -> str:
         quoted = quote(model_id, safe="")
+        if self.generic:
+            base = self.settings.google_base_url or self.settings.base_url
+            return f"{base}/v1beta/models/{quoted}:streamGenerateContent?alt=sse"
         return (
             f"{self.settings.base_url}/google/v1beta/models/{quoted}"
             ":streamGenerateContent?alt=sse"
@@ -973,20 +1103,29 @@ class OpenCodeProvider:
         return key
 
     def _headers(
-        self, *, session_id: str | None = None, anthropic: bool = False
+        self,
+        *,
+        session_id: str | None = None,
+        anthropic: bool = False,
+        google: bool = False,
     ) -> dict[str, str]:
         headers = {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
-            # Go rejects generic clients; this pair is required on every call.
             "User-Agent": USER_AGENT,
-            "x-opencode-session": session_id or self.session_id,
         }
+        if not self.generic:
+            # Go rejects generic clients; this pair is required on every call.
+            headers["x-opencode-session"] = session_id or self.session_id
         if anthropic:
             headers["anthropic-version"] = ANTHROPIC_VERSION
         key = self.api_key()
         if key:
             headers["Authorization"] = f"Bearer {key}"
+            if self.generic and anthropic:
+                headers["x-api-key"] = key
+            if self.generic and google:
+                headers["x-goog-api-key"] = key
         return headers
 
     # ---- model resolution ----
@@ -1010,8 +1149,22 @@ class OpenCodeProvider:
             )
         return name
 
-    def _ensure_protocol(self, model_id: str) -> None:
+    def protocol_for(self, model_id: str) -> str:
+        """Wire protocol for a model: the configured override, else by prefix.
+
+        The generic profile has no Responses route for `gpt-*` ids (for example
+        `gpt-oss-120b`), so those fall back to OpenAI chat.
+        """
+
+        if self.settings.protocol != "auto":
+            return self.settings.protocol
         protocol = classify_protocol(model_id)
+        if self.generic and protocol == PROTOCOL_RESPONSES:
+            return PROTOCOL_OPENAI_CHAT
+        return protocol
+
+    def _ensure_protocol(self, model_id: str) -> None:
+        protocol = self.protocol_for(model_id)
         if protocol not in SUPPORTED_PROTOCOLS:
             raise ProviderError(
                 f"model {model_id!r} uses the {protocol} protocol, "
@@ -1102,26 +1255,44 @@ class OpenCodeProvider:
         *,
         model: str | None = None,
         session_id: str | None = None,
+        deadline: float | None = None,
     ) -> AsyncIterator[ProviderEvent]:
+        """Stream one model step.
+
+        By default a retry is only attempted before the first event. With
+        `retry_partial`, each attempt is buffered and released only once it
+        completes, so a retryable failure mid-stream discards the partial turn
+        and the model never sees an incomplete one. `deadline` is a
+        `time.monotonic()` value; no retry wait may cross it.
+        """
+
         model_id = self.model_id(model)
         self._ensure_protocol(model_id)
         key = self._require_api_key()
         session = session_id or self.session_id
         attempts = self.settings.max_retries + 1
+        buffer = self.settings.retry_partial
         for attempt in range(attempts):
             emitted = False
+            buffered: list[ProviderEvent] = []
             try:
                 async for event in self._stream_once(
                     messages, tools, model_id=model_id, key=key, session_id=session
                 ):
+                    if buffer:
+                        buffered.append(event)
+                        continue
                     emitted = True
                     yield event
-                return
             except ProviderError as exc:
                 retryable = bool(exc.details.get("retryable")) if exc.details else False
                 if emitted or not retryable or attempt + 1 >= attempts:
                     raise
-                await self._sleep_before_retry(attempt, exc)
+                await self._sleep_before_retry(attempt, exc, deadline=deadline)
+                continue
+            for event in buffered:
+                yield event
+            return
 
     async def _stream_once(
         self,
@@ -1132,7 +1303,7 @@ class OpenCodeProvider:
         key: str,
         session_id: str,
     ) -> AsyncIterator[ProviderEvent]:
-        protocol = classify_protocol(model_id)
+        protocol = self.protocol_for(model_id)
         if protocol == PROTOCOL_ANTHROPIC:
             async for event in self._stream_anthropic(
                 messages, tools, model_id=model_id, key=key, session_id=session_id
@@ -1156,17 +1327,35 @@ class OpenCodeProvider:
         ):
             yield event
 
-    async def _sleep_before_retry(self, attempt: int, exc: ProviderError) -> None:
+    async def _sleep_before_retry(
+        self, attempt: int, exc: ProviderError, *, deadline: float | None = None
+    ) -> None:
         details = exc.details or {}
         retry_after = details.get("retry_after")
         if isinstance(retry_after, (int, float)) and retry_after >= 0:
             delay = float(retry_after)
         else:
             delay = self.settings.retry_base_seconds * (2**attempt)
-        delay = min(delay, MAX_RETRY_DELAY_SECONDS)
+        delay = min(delay, self.settings.max_retry_delay_seconds)
         # Jitter spreads retries; it is not a security boundary.
         delay *= random.uniform(0.7, 1.3)  # noqa: S311
+        if deadline is not None and time.monotonic() + delay >= deadline:
+            # Waiting would eat the time reserved for wrapping up.
+            raise exc
         await self._sleep(delay)
+
+    def _effort(self, model_id: str) -> str | None:
+        return self.settings.effort
+
+    def _cache_enabled(self, model_id: str) -> bool:
+        return self.settings.prompt_cache and is_claude_model(model_id)
+
+    def _incomplete_stream(self, protocol: str) -> ProviderError:
+        return ProviderError(
+            "provider stream ended without a finish reason",
+            hint="the partial turn was discarded",
+            details={"protocol": protocol, "retryable": True},
+        )
 
     async def _sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -1180,14 +1369,22 @@ class OpenCodeProvider:
         key: str,
         session_id: str,
     ) -> AsyncIterator[ProviderEvent]:
+        chat_messages = sanitize_messages_for_openai(messages)
+        if self._cache_enabled(model_id):
+            chat_messages = _cache_chat_messages(chat_messages)
         payload: dict[str, Any] = {
             "model": model_id,
-            "messages": sanitize_messages_for_openai(messages),
+            "messages": chat_messages,
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": self.settings.max_output_tokens,
-            "temperature": self.settings.temperature,
         }
+        if not is_claude_model(model_id):
+            # Claude answers 400 to any sampling parameter.
+            payload["temperature"] = self.settings.temperature
+        effort = self._effort(model_id)
+        if effort:
+            payload["reasoning_effort"] = effort
         if tools:
             payload["tools"] = list(tools)
             payload["tool_choice"] = "auto"
@@ -1294,6 +1491,8 @@ class OpenCodeProvider:
                 details={"error": type(exc).__name__, "retryable": True},
             ) from exc
 
+        if finish_reason is None and self.settings.retry_partial:
+            raise self._incomplete_stream(PROTOCOL_OPENAI_CHAT)
         calls = tuple(
             ToolCall(
                 id=slot["id"] or f"call_{index}",
@@ -1323,6 +1522,11 @@ class OpenCodeProvider:
         tool_payload = convert_tools_for_anthropic(tools)
         # Newer Claude models reject temperature ("temperature is deprecated
         # for this model"), so the adapter omits it and lets the API default apply.
+        # Claude also rejects budget_tokens, disabled thinking and forced
+        # tool_choice, so none is sent; depth is controlled by effort only.
+        cache = self._cache_enabled(model_id)
+        if cache:
+            _mark_last_block_for_cache(converted)
         payload: dict[str, Any] = {
             "model": model_id,
             "max_tokens": self.settings.max_output_tokens,
@@ -1330,13 +1534,23 @@ class OpenCodeProvider:
             "stream": True,
         }
         if system_parts:
-            payload["system"] = "\n\n".join(system_parts)
+            system_text = "\n\n".join(system_parts)
+            payload["system"] = (
+                [{"type": "text", "text": system_text, "cache_control": dict(EPHEMERAL_CACHE)}]
+                if cache
+                else system_text
+            )
         if tool_payload:
             payload["tools"] = tool_payload
+        effort = self._effort(model_id)
+        if effort:
+            payload["output_config"] = {"effort": effort}
         headers = {**self._headers(session_id=session_id, anthropic=True)}
         headers["Authorization"] = f"Bearer {key}"
 
         tool_parts: dict[int, dict[str, str]] = {}
+        # Every content block of the turn, by stream index, for verbatim replay.
+        content_blocks: dict[int, dict[str, Any]] = {}
         usage_raw: dict[str, Any] = {}
         finish_reason: str | None = None
         response_model: str | None = model_id
@@ -1392,7 +1606,9 @@ class OpenCodeProvider:
                         block = chunk.get("content_block")
                         if not isinstance(block, dict):
                             continue
-                        if block.get("type") == "tool_use":
+                        block_type = block.get("type")
+                        if block_type == "tool_use":
+                            content_blocks[index] = {"type": "tool_use"}
                             slot = tool_parts.setdefault(
                                 index, {"id": "", "name": "", "arguments": ""}
                             )
@@ -1403,10 +1619,22 @@ class OpenCodeProvider:
                             yield ToolCallDelta(
                                 index=index, id=slot["id"] or None, name=slot["name"] or None
                             )
-                        elif block.get("type") == "text":
+                        elif block_type == "text":
                             initial = block.get("text")
+                            content_blocks[index] = {
+                                "type": "text",
+                                "text": initial if isinstance(initial, str) else "",
+                            }
                             if isinstance(initial, str) and initial:
                                 yield TextDelta(initial)
+                        elif block_type == "thinking":
+                            content_blocks[index] = {
+                                "type": "thinking",
+                                "thinking": str(block.get("thinking") or ""),
+                                "signature": str(block.get("signature") or ""),
+                            }
+                        elif block_type == "redacted_thinking":
+                            content_blocks[index] = copy.deepcopy(block)
                         continue
                     if kind == "content_block_delta":
                         index = _as_int(chunk.get("index"))
@@ -1414,10 +1642,19 @@ class OpenCodeProvider:
                         if not isinstance(delta, dict):
                             continue
                         delta_type = delta.get("type")
+                        target = content_blocks.get(index)
                         if delta_type == "text_delta":
                             content = delta.get("text")
                             if isinstance(content, str) and content:
+                                if target is not None and target["type"] == "text":
+                                    target["text"] += content
                                 yield TextDelta(content)
+                        elif delta_type == "thinking_delta":
+                            if target is not None and target["type"] == "thinking":
+                                target["thinking"] += str(delta.get("thinking") or "")
+                        elif delta_type == "signature_delta":
+                            if target is not None and target["type"] == "thinking":
+                                target["signature"] += str(delta.get("signature") or "")
                         elif delta_type == "input_json_delta":
                             fragment = delta.get("partial_json")
                             if isinstance(fragment, str) and fragment:
@@ -1454,6 +1691,8 @@ class OpenCodeProvider:
                 details={"error": type(exc).__name__, "retryable": True},
             ) from exc
 
+        if finish_reason is None and self.settings.retry_partial:
+            raise self._incomplete_stream(PROTOCOL_ANTHROPIC)
         usage = parse_anthropic_usage(usage_raw)
         if usage is not None:
             yield UsageEvent(usage)
@@ -1468,7 +1707,12 @@ class OpenCodeProvider:
         )
         if finish_reason is None:
             finish_reason = "tool_calls" if calls else "stop"
-        yield DoneEvent(finish_reason=finish_reason, tool_calls=calls, model=response_model)
+        yield DoneEvent(
+            finish_reason=finish_reason,
+            tool_calls=calls,
+            model=response_model,
+            metadata=_anthropic_turn_metadata(content_blocks, tool_parts),
+        )
 
 
     async def _stream_responses(
@@ -1491,6 +1735,9 @@ class OpenCodeProvider:
         }
         if instructions:
             payload["instructions"] = instructions
+        effort = self._effort(model_id)
+        if effort:
+            payload["reasoning"] = {"effort": effort}
         if tools:
             tool_payload = convert_tools_for_responses(tools)
             if tool_payload:
@@ -1671,13 +1918,11 @@ class OpenCodeProvider:
         """Stream Gemini generateContent, normalized to the shared events."""
 
         system_parts, contents = convert_messages_for_google(messages)
-        payload: dict[str, Any] = {
-            "contents": contents,
-            "generationConfig": {
-                "maxOutputTokens": self.settings.max_output_tokens,
-                "temperature": self.settings.temperature,
-            },
-        }
+        generation: dict[str, Any] = {"maxOutputTokens": self.settings.max_output_tokens}
+        if not is_claude_model(model_id):
+            generation["temperature"] = self.settings.temperature
+        # No thinkingConfig: Gemini 4 Argon answers 400 to any thinkingBudget.
+        payload: dict[str, Any] = {"contents": contents, "generationConfig": generation}
         if system_parts:
             payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_parts)}]}
         if tools:
@@ -1685,7 +1930,10 @@ class OpenCodeProvider:
             if tool_payload:
                 payload["tools"] = tool_payload
 
-        headers = {**self._headers(session_id=session_id), "Authorization": f"Bearer {key}"}
+        headers = {
+            **self._headers(session_id=session_id, google=True),
+            "Authorization": f"Bearer {key}",
+        }
         slots: dict[int, dict[str, str]] = {}
         signatures: dict[str, str] = {}
         usage_raw: dict[str, Any] = {}
@@ -1890,6 +2138,7 @@ __all__ = [
     "convert_tools_for_anthropic",
     "convert_tools_for_google",
     "convert_tools_for_responses",
+    "is_claude_model",
     "is_free_model",
     "is_supported_model",
     "model_protocol",

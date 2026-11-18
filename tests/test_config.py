@@ -157,3 +157,59 @@ def test_go_base_url_and_legacy_prefix_alias() -> None:
     bare = ProviderSettings(name="console-local", base_url="https://opencode.ai/inference")
     assert accepted_providers(bare) == {"console-local"}
     assert canonical_model("opencode/x", bare) == "opencode/x"
+
+
+def test_pre_ple_provider_section_still_loads(tmp_path: Path) -> None:
+    # A 0.2.0a4 provider section, without any of the generic-profile fields.
+    legacy = {
+        "name": "opencode-go",
+        "base_url": "https://opencode.ai/inference/go",
+        "api_key_env": "OPENCODE_API_KEY",
+        "timeout_seconds": 120.0,
+        "context_window": 131072,
+        "max_output_tokens": 8192,
+        "temperature": 0.2,
+        "max_retries": 2,
+        "retry_base_seconds": 0.5,
+    }
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"schema_version": 2, "provider": legacy}), encoding="utf-8")
+    provider = load_config(path).provider
+    assert provider == ProviderSettings()
+
+
+def test_generic_profile_fields_roundtrip(tmp_path: Path) -> None:
+    config = PandaConfig(
+        model="google-cloud/claude-opus-5-5",
+        provider=ProviderSettings(
+            name="google-cloud",
+            base_url="https://gateway.example/v1",
+            endpoint_profile="generic",
+            anthropic_base_url="https://gateway.example/",
+            protocol="anthropic",
+            effort="xhigh",
+            prompt_cache=True,
+            retry_partial=True,
+            max_retry_delay_seconds=120,
+        ),
+    )
+    path = tmp_path / "config.json"
+    path.write_text(config.model_dump_json(indent=2), encoding="utf-8")
+    loaded = load_config(path)
+    assert loaded == config
+    assert loaded.provider.anthropic_base_url == "https://gateway.example"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"endpoint_profile": "vertex"},
+        {"protocol": "grpc"},
+        {"effort": "extreme"},
+        {"max_retry_delay_seconds": 301},
+        {"google_base_url": "ftp://gateway.example"},
+    ],
+)
+def test_generic_profile_fields_are_validated(field: dict) -> None:
+    with pytest.raises(ValidationError):
+        ProviderSettings(**field)
