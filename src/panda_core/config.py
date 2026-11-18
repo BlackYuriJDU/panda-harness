@@ -10,10 +10,10 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Final, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from panda_core.errors import ConfigError
 from panda_core.version import __version__
@@ -34,8 +34,15 @@ DEFAULT_SESSIONS = ".panda/sessions"
 DEFAULT_INSTRUCTIONS = ".panda/instructions.md"
 DEFAULT_OPENCODE_CONFIG = "opencode.json"
 
+ENDPOINT_OPENCODE_GO: Final = "opencode-go"
+ENDPOINT_GENERIC: Final = "generic"
+
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,63}$")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+EndpointProfile = Literal["opencode-go", "generic"]
+ProtocolChoice = Literal["auto", "openai-chat", "anthropic", "responses", "google"]
+Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
 def split_model(model: str) -> tuple[str, str]:
@@ -64,11 +71,33 @@ def _relative_posix_path(value: str) -> str:
     return candidate.as_posix()
 
 
-class ProviderSettings(BaseModel):
-    """OpenCode Go provider settings.
+def _validate_base_url(value: str, field: str) -> str:
+    """Normalize a base URL; plain-http hosts are checked per profile later."""
 
-    Only `base_url`, `api_key_env`, and decoding limits are configured here.
-    The API key itself is never stored in the workspace.
+    text = value.strip().rstrip("/")
+    parts = urlsplit(text)
+    if not parts.scheme or not parts.hostname:
+        raise ValueError(f"{field} must be an absolute URL")
+    if parts.scheme not in {"https", "http"}:
+        raise ValueError(f"{field} must use http or https")
+    if parts.query or parts.fragment:
+        raise ValueError(f"{field} must not have a query or fragment")
+    return text
+
+
+def _is_remote_http(url: str) -> bool:
+    parts = urlsplit(url)
+    return parts.scheme == "http" and parts.hostname not in _LOOPBACK_HOSTS
+
+
+class ProviderSettings(BaseModel):
+    """Model provider settings.
+
+    The default endpoint profile is OpenCode Go. The `generic` profile targets
+    any gateway that serves the OpenAI chat, Anthropic Messages, Responses, or
+    Gemini wire protocols under caller-supplied base URLs (for example the PLE
+    model gateway). Every field added after 0.2.0a4 defaults to the previous
+    behavior. The API key itself is never stored in the workspace.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -82,21 +111,29 @@ class ProviderSettings(BaseModel):
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_retries: int = Field(default=2, ge=0, le=5)
     retry_base_seconds: float = Field(default=0.5, ge=0, le=30)
+    max_retry_delay_seconds: float = Field(default=15.0, ge=0, le=300)
+    endpoint_profile: EndpointProfile = ENDPOINT_OPENCODE_GO
+    # Only read by the generic profile; Go serves every protocol under base_url.
+    anthropic_base_url: str | None = None
+    google_base_url: str | None = None
+    protocol: ProtocolChoice = "auto"
+    effort: Effort | None = None
+    prompt_cache: bool = False
+    # Headless mode: buffer each attempt and retry from scratch on a
+    # retryable failure, even after the stream started producing output.
+    retry_partial: bool = False
 
     @field_validator("base_url")
     @classmethod
     def _base_url_is_valid(cls, value: str) -> str:
-        text = value.strip().rstrip("/")
-        parts = urlsplit(text)
-        if not parts.scheme or not parts.hostname:
-            raise ValueError("provider.base_url must be an absolute URL")
-        if parts.scheme not in {"https", "http"}:
-            raise ValueError("provider.base_url must use http or https")
-        if parts.scheme == "http" and parts.hostname not in _LOOPBACK_HOSTS:
-            raise ValueError("provider.base_url must use https outside loopback")
-        if parts.query or parts.fragment:
-            raise ValueError("provider.base_url must not have a query or fragment")
-        return text
+        return _validate_base_url(value, "provider.base_url")
+
+    @field_validator("anthropic_base_url", "google_base_url")
+    @classmethod
+    def _optional_base_url_is_valid(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_base_url(value, "provider base URL")
 
     @field_validator("api_key_env")
     @classmethod
@@ -104,6 +141,18 @@ class ProviderSettings(BaseModel):
         if not _ENV_NAME_RE.match(value):
             raise ValueError("provider.api_key_env must be an environment variable name")
         return value
+
+    @model_validator(mode="after")
+    def _remote_http_only_for_generic(self) -> ProviderSettings:
+        # A generic gateway may sit behind a local egress proxy that speaks
+        # plain http (the PLE kit uses http://host.docker.internal:4000/v1).
+        # Every other profile keeps https outside loopback.
+        if self.endpoint_profile == ENDPOINT_GENERIC:
+            return self
+        for url in (self.base_url, self.anthropic_base_url, self.google_base_url):
+            if url is not None and _is_remote_http(url):
+                raise ValueError("provider base URLs must use https outside loopback")
+        return self
 
 
 def is_go_base_url(base_url: str) -> bool:

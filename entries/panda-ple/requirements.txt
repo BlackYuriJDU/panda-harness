@@ -1,0 +1,2 @@
+websockets==15.0.1
+panda-harness @ git+https://github.com/BlackYuriJDU/panda-harness@9ca804610785d8d3ca5842b2bcfdfb3e12e0886d

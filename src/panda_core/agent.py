@@ -12,10 +12,11 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from panda_core.errors import PandaError, ProviderError
 from panda_core.limits import DEFAULT_MAX_STEPS
@@ -35,6 +36,12 @@ from panda_core.workspace import Workspace
 DEFAULT_SYSTEM_CHARS = 24_000
 LOG_STRING_LIMIT = 8_000
 LOG_LIST_LIMIT = 200
+# Context trimming never elides the tool results of the newest messages.
+TRIM_KEEP_RECENT = 6
+ELIDE_MIN_CHARS = 200
+ELIDED_MARKER = "[tool result elided"
+# Context estimate for one image part (~1,600 tokens), instead of its base64.
+IMAGE_CHARS = 6_400
 
 SYSTEM_PROMPT = """You are Panda, a fail-closed biomedical evidence harness.
 
@@ -70,6 +77,50 @@ your habits, the corpus wins. Cite concrete locations as `path:line`.
 Workspace instructions:
 {instructions}
 """
+
+
+class Toolset(Protocol):
+    """What the agent needs from a tool provider (local registry or remote)."""
+
+    def to_openai(self) -> list[dict[str, Any]]: ...
+
+    async def call(self, name: str, arguments: dict[str, Any] | str | None) -> ToolResult: ...
+
+
+class Ledger(Protocol):
+    """What the agent needs from a ledger (`SessionLog` or `MemoryLedger`)."""
+
+    session_id: str
+
+    def append(self, event_type: str, data: dict[str, Any] | None = None) -> Any: ...
+
+    def is_closed(self) -> bool: ...
+
+
+HookText = Awaitable[str | None]
+
+
+@dataclass
+class AgentHooks:
+    """Optional loop hooks; each may return text to add to the conversation.
+
+    Returned text is always appended as a new `user` message at the end of
+    the history, never written into earlier messages: editing history would
+    invalidate signed Claude thinking blocks.
+
+    - `before_model(agent)`: before each model call (clock warnings, phase
+      notes).
+    - `after_tool(agent, call, result)`: after each tool result; notes from one
+      step are joined into a single message after all of its tool results.
+    - `before_finish(agent, text)`: when the model answers without tool calls;
+      returned text reopens the turn (gates that failed), at most
+      `max_finish_reopens` times per turn.
+    """
+
+    before_model: Callable[[Agent], HookText] | None = None
+    after_tool: Callable[[Agent, Any, ToolResult], HookText] | None = None
+    before_finish: Callable[[Agent, str], HookText] | None = None
+    max_finish_reopens: int = 3
 
 
 @dataclass(frozen=True)
@@ -138,14 +189,43 @@ def _usage_sum(left: Usage, right: Usage) -> Usage:
     )
 
 
+def _content_chars(content: list[Any]) -> int:
+    total = 0
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "image_url":
+            total += IMAGE_CHARS
+        elif isinstance(part, dict):
+            total += len(str(part.get("text") or "")) + 32
+    return total
+
+
 def _messages_chars(messages: list[dict[str, Any]]) -> int:
     total = 0
     for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            # Count image parts by a fixed estimate, not their base64 size.
+            rest = {key: value for key, value in message.items() if key != "content"}
+            total += _content_chars(content) + len(json.dumps(rest, default=str))
+            continue
         try:
             total += len(json.dumps(message, ensure_ascii=False, default=str))
         except (TypeError, ValueError):
             total += len(str(message))
     return total
+
+
+def _tool_content(result: ToolResult) -> str | list[dict[str, Any]]:
+    """Tool message content; images travel as OpenAI-style data-URL parts."""
+
+    images = getattr(result, "images", None)
+    if not images:
+        return result.content
+    parts: list[dict[str, Any]] = [{"type": "text", "text": result.content}]
+    for media_type, data in images:
+        url = f"data:{media_type};base64,{data}"
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
 
 
 def _read_instructions(workspace: Workspace, limit: int = DEFAULT_SYSTEM_CHARS) -> str:
@@ -182,11 +262,11 @@ def build_system_prompt(
 class Agent:
     def __init__(
         self,
-        workspace: Workspace,
+        workspace: Workspace | None,
         provider: OpenCodeProvider,
-        tools: ToolRegistry,
+        tools: ToolRegistry | Toolset,
         *,
-        session: SessionLog | None = None,
+        session: SessionLog | Ledger | None = None,
         model: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         active_study: str | None = None,
@@ -194,23 +274,45 @@ class Agent:
         on_event: Callable[[AgentEvent], None] | None = None,
         private: bool = False,
         context_window: int | None = None,
+        deadline_seconds: float | None = None,
+        hooks: AgentHooks | None = None,
+        freeze_tools: bool = False,
+        effort: str | None = None,
+        system_prompt: str | None = None,
     ) -> None:
+        # Without a workspace (a remote task container), the caller supplies
+        # the model, the context window, and the system prompt explicitly.
+        if workspace is None and not (model and context_window and system_prompt):
+            raise ValueError("an agent without a workspace needs model, context_window, "
+                             "and system_prompt")
         self.workspace = workspace
         self.provider = provider
         self.tools = tools
-        self.session = session if session is not None else tools.ctx.session
-        self.model = model or workspace.config.model
+        ctx = getattr(tools, "ctx", None)
+        self.session = session if session is not None else getattr(ctx, "session", None)
+        self.model = model or (workspace.config.model if workspace else "")
         self.max_steps = max(1, int(max_steps))
+        # Optional wall-clock budget per turn; the loop stops at whichever of
+        # max_steps or the deadline comes first.
+        self.deadline_seconds = deadline_seconds
+        self.hooks = hooks or AgentHooks()
+        # Changing the tool list mid-session invalidates signed Claude
+        # thinking; a frozen list is captured on the first model call.
+        self.freeze_tools = freeze_tools
+        self._frozen_tools: list[dict[str, Any]] | None = None
+        # Per-request effort override (per-phase effort); None keeps the
+        # provider setting.
+        self.effort = effort
         self.active_study = active_study
         self.private = private
         self._approver = approver
         self._on_event = on_event
-        self.context_window = context_window or workspace.config.provider.context_window
+        self.context_window = context_window or (
+            workspace.config.provider.context_window if workspace else 0
+        )
+        self._fixed_system_prompt = system_prompt
         self.messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": build_system_prompt(workspace, active_study=active_study),
-            }
+            {"role": "system", "content": self._system_prompt(active_study)}
         ]
         self.turn_index = 0
         self.last_usage = Usage()
@@ -219,10 +321,17 @@ class Agent:
         self.last_steps = 0
         self._cancelled = False
         # The tool context is shared: one policy, one session, one approver.
-        if self.session is not None:
-            self.tools.ctx.session = self.session
-        self.tools.ctx.approve = self._approve
-        self.tools.ctx.active_study = active_study
+        if ctx is not None:
+            if self.session is not None:
+                ctx.session = self.session
+            ctx.approve = self._approve
+            ctx.active_study = active_study
+
+    def _system_prompt(self, active_study: str | None) -> str:
+        if self._fixed_system_prompt is not None:
+            return self._fixed_system_prompt
+        assert self.workspace is not None  # guaranteed by __init__
+        return build_system_prompt(self.workspace, active_study=active_study)
 
     # ---- observability ----
     def _emit(self, kind: str, **data: Any) -> None:
@@ -277,17 +386,100 @@ class Agent:
     def estimate_context_tokens(self) -> int:
         return max(0, _messages_chars(self.messages) // 4)
 
+    def _instruction_index(self) -> int | None:
+        """Index of the first user message: the task instruction, never trimmed."""
+
+        for index, message in enumerate(self.messages):
+            if message.get("role") == "user":
+                return index
+        return None
+
+    def _elide_tool_results(self, budget: int) -> bool:
+        """Replace old tool results with a stub, oldest first, until under budget."""
+
+        edited = False
+        cutoff = len(self.messages) - TRIM_KEEP_RECENT
+        for index in range(1, max(1, cutoff)):
+            if _messages_chars(self.messages) <= budget:
+                break
+            message = self.messages[index]
+            content = message.get("content")
+            if message.get("role") != "tool":
+                continue
+            if isinstance(content, list):
+                size = _content_chars(content)
+            elif isinstance(content, str) and not content.startswith(ELIDED_MARKER):
+                size = len(content)
+            else:
+                continue
+            if size < ELIDE_MIN_CHARS:
+                continue
+            self.messages[index] = {
+                **message,
+                "content": (
+                    f"{ELIDED_MARKER}: {size} chars to save context; "
+                    "re-run the tool if it is still needed]"
+                ),
+            }
+            edited = True
+        return edited
+
+    def _drop_thinking(self) -> None:
+        """Remove replayed Claude thinking blocks from the whole history.
+
+        A signed thinking block is valid only while everything before it is
+        unchanged; after any non-append edit, replaying it is a 400. Dropping
+        every block is always accepted.
+        """
+
+        for message in self.messages:
+            meta = message.get("provider_meta")
+            if isinstance(meta, dict) and "anthropic_content" in meta:
+                rest = {key: value for key, value in meta.items() if key != "anthropic_content"}
+                if rest:
+                    message["provider_meta"] = rest
+                else:
+                    message.pop("provider_meta", None)
+
+    def _tool_specs(self) -> list[dict[str, Any]]:
+        if not self.freeze_tools:
+            return self.tools.to_openai()
+        if self._frozen_tools is None:
+            self._frozen_tools = self.tools.to_openai()
+        return self._frozen_tools
+
+    def _append_hook_message(self, hook: str, text: str | None) -> bool:
+        """Append hook text as a new user message at the end of the history."""
+
+        if not text or not text.strip():
+            return False
+        self.messages.append({"role": "user", "content": text})
+        if self.private:
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            self._log("hook.message", {"hook": hook, "sha256": digest, "chars": len(text)})
+        else:
+            self._log("hook.message", {"hook": hook, "content": text, "chars": len(text)})
+        self._emit("hook_message", hook=hook, chars=len(text))
+        return True
+
     def _trim(self) -> None:
         budget = self._context_budget_chars()
-        while len(self.messages) > 2 and _messages_chars(self.messages) > budget:
-            head = self.messages[1]
-            self.messages.pop(1)
+        edited = False
+        if _messages_chars(self.messages) > budget:
+            edited = self._elide_tool_results(budget)
+        pin = self._instruction_index()
+        start = pin + 1 if pin is not None else 1
+        while len(self.messages) > start + 1 and _messages_chars(self.messages) > budget:
+            head = self.messages.pop(start)
+            edited = True
             if head.get("role") == "assistant" and head.get("tool_calls"):
                 # Keep tool results paired with their assistant message.
-                while len(self.messages) > 1 and self.messages[1].get("role") == "tool":
-                    self.messages.pop(1)
-            while len(self.messages) > 1 and self.messages[1].get("role") == "tool":
-                self.messages.pop(1)
+                while len(self.messages) > start and self.messages[start].get("role") == "tool":
+                    self.messages.pop(start)
+            while len(self.messages) > start and self.messages[start].get("role") == "tool":
+                self.messages.pop(start)
+        if edited:
+            self._drop_thinking()
         self.last_context_tokens = self.estimate_context_tokens()
 
     # ---- turn ----
@@ -303,6 +495,7 @@ class Agent:
                 "turn": turn,
                 "model": self.model,
                 "max_steps": self.max_steps,
+                "deadline_seconds": self.deadline_seconds,
                 "active_study": self.active_study,
             },
         )
@@ -319,25 +512,41 @@ class Agent:
         texts: list[str] = []
         usage = Usage()
         status = "completed"
+        deadline = (
+            time.monotonic() + self.deadline_seconds
+            if self.deadline_seconds is not None
+            else None
+        )
+        reopens = 0
         try:
             while steps < self.max_steps:
+                if deadline is not None and time.monotonic() >= deadline:
+                    status = "deadline"
+                    break
                 steps += 1
+                if self.hooks.before_model is not None:
+                    self._append_hook_message(
+                        "before_model", await self.hooks.before_model(self)
+                    )
                 self._trim()
                 step_parts: list[str] = []
                 calls: list[Any] = []
                 usage_box: list[Usage] = [Usage()]
-                async for event in self.provider.stream(
-                    self.messages,
-                    self.tools.to_openai(),
-                    model=self.model,
-                    session_id=self.session_id,
+                meta_box: list[dict[str, Any] | None] = [None]
+                if not await self._stream_step(
+                    step_parts, usage_box, calls, meta_box, deadline
                 ):
-                    self._handle_provider_event(event, step_parts, usage_box, calls)
+                    # The step ran out of time: its partial output is discarded
+                    # so the history never holds an incomplete turn.
+                    status = "deadline"
+                    break
                 step_usage = usage_box[0]
                 step_text = "".join(step_parts)
                 if step_text:
                     texts.append(step_text)
                 assistant: dict[str, Any] = {"role": "assistant", "content": step_text or None}
+                if meta_box[0]:
+                    assistant["provider_meta"] = meta_box[0]
                 if calls:
                     assistant["tool_calls"] = [
                         {
@@ -369,7 +578,18 @@ class Agent:
                     self.last_context_tokens = self.estimate_context_tokens()
                 self.usage_total = _usage_sum(self.usage_total, step_usage)
                 if not calls:
+                    if (
+                        self.hooks.before_finish is not None
+                        and reopens < self.hooks.max_finish_reopens
+                        and steps < self.max_steps
+                        and self._append_hook_message(
+                            "before_finish", await self.hooks.before_finish(self, step_text)
+                        )
+                    ):
+                        reopens += 1
+                        continue
                     break
+                notes: list[str] = []
                 for call in calls:
                     tool_calls += 1
                     self._log(
@@ -405,9 +625,15 @@ class Agent:
                         {
                             "role": "tool",
                             "tool_call_id": call.id,
-                            "content": result.content,
+                            "content": _tool_content(result),
                         }
                     )
+                    if self.hooks.after_tool is not None:
+                        note = await self.hooks.after_tool(self, call, result)
+                        if note and note.strip():
+                            notes.append(note)
+                # One message after all results keeps tool results contiguous.
+                self._append_hook_message("after_tool", "\n\n".join(notes))
                 if steps >= self.max_steps:
                     status = "max_steps"
         except asyncio.CancelledError:
@@ -445,12 +671,45 @@ class Agent:
             session_id=self.session.session_id if self.session else None,
         )
 
+    async def _stream_step(
+        self,
+        step_parts: list[str],
+        usage_box: list[Usage],
+        calls: list[Any],
+        meta_box: list[dict[str, Any] | None],
+        deadline: float | None,
+    ) -> bool:
+        """Run one provider call; False when the turn deadline cut it short."""
+
+        kwargs: dict[str, Any] = {"model": self.model, "session_id": self.session_id}
+        if self.effort is not None:
+            kwargs["effort"] = self.effort
+        tools = self._tool_specs()
+        if deadline is None:
+            async for event in self.provider.stream(self.messages, tools, **kwargs):
+                self._handle_provider_event(event, step_parts, usage_box, calls, meta_box)
+            return True
+        kwargs["deadline"] = deadline
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            async with asyncio.timeout(remaining) as scope:
+                async for event in self.provider.stream(self.messages, tools, **kwargs):
+                    self._handle_provider_event(
+                        event, step_parts, usage_box, calls, meta_box
+                    )
+        except TimeoutError:
+            if scope.expired():
+                return False
+            raise
+        return True
+
     def _handle_provider_event(
         self,
         event: ProviderEvent,
         step_parts: list[str],
         usage_box: list[Usage],
         calls: list[Any],
+        meta_box: list[dict[str, Any] | None] | None = None,
     ) -> None:
         if isinstance(event, TextDelta):
             step_parts.append(event.text)
@@ -467,6 +726,8 @@ class Agent:
             )
         elif isinstance(event, DoneEvent):
             calls.extend(event.tool_calls)
+            if meta_box is not None:
+                meta_box[0] = getattr(event, "metadata", None)
 
     async def _execute_tool(self, call: Any) -> ToolResult:
         try:
@@ -481,18 +742,16 @@ class Agent:
     # ---- conversation control ----
     def set_model(self, model: str) -> None:
         self.model = model
-        self.messages[0] = {
-            "role": "system",
-            "content": build_system_prompt(self.workspace, active_study=self.active_study),
-        }
+        self._drop_thinking()
+        self.messages[0] = {"role": "system", "content": self._system_prompt(self.active_study)}
 
     def set_active_study(self, study_id: str | None) -> None:
         self.active_study = study_id
-        self.tools.ctx.active_study = study_id
-        self.messages[0] = {
-            "role": "system",
-            "content": build_system_prompt(self.workspace, active_study=study_id),
-        }
+        ctx = getattr(self.tools, "ctx", None)
+        if ctx is not None:
+            ctx.active_study = study_id
+        self._drop_thinking()
+        self.messages[0] = {"role": "system", "content": self._system_prompt(study_id)}
 
     def reset_conversation(self) -> None:
         self.messages = [self.messages[0]]
@@ -508,6 +767,9 @@ __all__ = [
     "DEFAULT_MAX_STEPS",
     "Agent",
     "AgentEvent",
+    "AgentHooks",
+    "Ledger",
+    "Toolset",
     "SYSTEM_PROMPT",
     "TurnResult",
     "build_system_prompt",

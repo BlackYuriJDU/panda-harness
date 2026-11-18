@@ -314,3 +314,411 @@ def test_system_prompt_carries_the_rules(workspace) -> None:
     assert "gse160208" in prompt
     assert str(workspace.root.as_posix()) in prompt
     assert "validate" in prompt
+
+# ---- PLE readiness: instruction pinning, thinking hygiene, wall-clock loop ----
+
+THINKING_META = {
+    "anthropic_content": [
+        {"type": "thinking", "thinking": "", "signature": "sig"},
+        {"type": "text", "text": "ok"},
+    ]
+}
+
+
+def _fit_budget(agent: Agent, extra_chars: int) -> None:
+    """Size the context window so the budget is the current history plus extra."""
+
+    from panda_core.agent import _messages_chars
+
+    agent.context_window = int((_messages_chars(agent.messages) + extra_chars) / 3.6) + 1
+
+
+def test_trimming_never_drops_the_task_instruction(workspace) -> None:
+    agent, _, provider = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]]
+    )
+    agent.messages.append({"role": "user", "content": "TASK: size the cables"})
+    _fit_budget(agent, 3_000)
+    for index in range(30):
+        agent.messages.append({"role": "assistant", "content": "x" * 1_000 + str(index)})
+        agent.messages.append({"role": "user", "content": "y" * 1_000 + str(index)})
+    asyncio.run(agent.run_turn("latest"))
+    assert agent.messages[1] == {"role": "user", "content": "TASK: size the cables"}
+    sent = provider.calls[-1]
+    assert sent[1] == {"role": "user", "content": "TASK: size the cables"}
+    assert {"role": "user", "content": "latest"} in sent
+    assert len(sent) < 63
+
+
+def test_trimming_elides_old_tool_results_before_dropping_messages(workspace) -> None:
+    agent, _, _ = make_agent(workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]])
+    agent.messages.append({"role": "user", "content": "TASK"})
+    _fit_budget(agent, 2_500)
+    agent.messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+    agent.messages.append({"role": "tool", "tool_call_id": "c1", "content": "z" * 6_000})
+    for index in range(4):
+        agent.messages.append({"role": "assistant", "content": f"note {index}"})
+        agent.messages.append({"role": "user", "content": f"more {index}"})
+    before = len(agent.messages)
+    asyncio.run(agent.run_turn("latest"))
+    # Nothing was dropped: eliding the stale tool result was enough.
+    assert len(agent.messages) == before + 2
+    tool = next(m for m in agent.messages if m.get("role") == "tool")
+    assert tool["tool_call_id"] == "c1"
+    assert tool["content"].startswith("[tool result elided: 6000 chars")
+
+
+def test_append_only_history_keeps_thinking(workspace) -> None:
+    agent, _, provider = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]]
+    )
+    agent.messages.append({"role": "user", "content": "TASK"})
+    agent.messages.append({"role": "assistant", "content": "ok", "provider_meta": THINKING_META})
+    asyncio.run(agent.run_turn("next"))
+    sent = next(m for m in provider.calls[-1] if m.get("role") == "assistant")
+    assert sent["provider_meta"] == THINKING_META
+
+
+def test_trimming_drops_every_thinking_block(workspace) -> None:
+    agent, _, provider = make_agent(
+        workspace, [[TextDelta("ok"), DoneEvent(finish_reason="stop")]]
+    )
+    agent.messages.append({"role": "user", "content": "TASK"})
+    _fit_budget(agent, 3_000)
+    for index in range(10):
+        agent.messages.append(
+            {"role": "assistant", "content": "x" * 1_000, "provider_meta": THINKING_META}
+        )
+        agent.messages.append({"role": "user", "content": f"more {index}"})
+    asyncio.run(agent.run_turn("latest"))
+    assert all("provider_meta" not in m for m in provider.calls[-1])
+
+
+def test_set_model_drops_thinking_but_keeps_other_meta(workspace) -> None:
+    agent, _, _ = make_agent(workspace, [])
+    agent.messages.append({"role": "user", "content": "TASK"})
+    agent.messages.append(
+        {
+            "role": "assistant",
+            "content": "ok",
+            "provider_meta": {**THINKING_META, "other": 1},
+        }
+    )
+    agent.set_model("opencode-go/glm-5.2")
+    assert agent.messages[-1]["provider_meta"] == {"other": 1}
+    agent.messages[-1]["provider_meta"] = dict(THINKING_META)
+    agent.set_active_study(None)
+    assert "provider_meta" not in agent.messages[-1]
+
+
+def test_turn_metadata_reaches_the_next_provider_call(workspace) -> None:
+    call = ToolCall(id="toolu_1", name="read_file", arguments='{"path":"README.md"}')
+    agent, _, provider = make_agent(
+        workspace,
+        [
+            [DoneEvent(finish_reason="tool_calls", tool_calls=(call,), metadata=THINKING_META)],
+            [TextDelta("done"), DoneEvent(finish_reason="stop")],
+        ],
+    )
+    asyncio.run(agent.run_turn("read it"))
+    sent = next(m for m in provider.calls[1] if m.get("role") == "assistant")
+    assert sent["provider_meta"] == THINKING_META
+
+
+class SlowProvider:
+    def __init__(self) -> None:
+        self.deadlines: list[float | None] = []
+
+    async def stream(self, messages, tools=None, model=None, session_id=None, deadline=None):
+        self.deadlines.append(deadline)
+        yield TextDelta("partial")
+        await asyncio.sleep(10)
+        yield DoneEvent(finish_reason="stop")
+
+
+def _agent_with(workspace, provider, **kwargs) -> tuple[Agent, SessionLog]:
+    session = SessionLog.create(workspace.sessions_dir, label="deadline")
+    policy, _ = load_policy_or_default(workspace.policy_path)
+    context = ToolContext(
+        workspace=workspace,
+        policy=PolicyEngine(policy, root=workspace.root),
+        session=session,
+    )
+    return Agent(workspace, provider, ToolRegistry(context), session=session, **kwargs), session
+
+
+def test_loop_stops_on_the_wall_clock_without_a_partial_turn(workspace) -> None:
+    provider = SlowProvider()
+    agent, session = _agent_with(workspace, provider, max_steps=1_000, deadline_seconds=0.05)
+    result = asyncio.run(asyncio.wait_for(agent.run_turn("task"), timeout=5))
+    assert result.status == "deadline"
+    assert result.steps == 1
+    assert agent.messages[-1] == {"role": "user", "content": "task"}
+    assert provider.deadlines and provider.deadlines[0] is not None
+    ends = [event.data for event in session.events() if event.type == "turn.end"]
+    assert ends[-1]["status"] == "deadline"
+
+
+def test_expired_deadline_stops_before_calling_the_model(workspace) -> None:
+    provider = SlowProvider()
+    agent, _ = _agent_with(workspace, provider, deadline_seconds=0)
+    result = asyncio.run(agent.run_turn("task"))
+    assert result.status == "deadline"
+    assert result.steps == 0
+    assert provider.deadlines == []
+
+
+# ---- Onda 1.5: hooks, frozen tools, per-request effort ----
+
+
+class KwargsProvider(FakeProvider):
+    def __init__(self, script: list[list[Any]]) -> None:
+        super().__init__(script)
+        self.kwargs: list[dict[str, Any]] = []
+        self.tool_names: list[list[str]] = []
+
+    async def stream(self, messages, tools=None, **kwargs):
+        self.kwargs.append(kwargs)
+        self.tool_names.append([tool["function"]["name"] for tool in tools or []])
+        async for event in super().stream(
+            messages, tools, model=kwargs.get("model"), session_id=kwargs.get("session_id")
+        ):
+            yield event
+
+
+def test_before_finish_reopens_the_turn_with_a_message_at_the_end(workspace) -> None:
+    from panda_core.agent import AgentHooks
+
+    seen: list[str] = []
+
+    async def gate(agent: Agent, text: str) -> str | None:
+        seen.append(text)
+        return None if len(seen) > 1 else "GATE: FAIL — deliverable missing"
+
+    agent, session, provider = make_agent(
+        workspace,
+        [
+            [TextDelta("done?"), DoneEvent(finish_reason="stop")],
+            [TextDelta("fixed"), DoneEvent(finish_reason="stop")],
+        ],
+    )
+    agent.hooks = AgentHooks(before_finish=gate)
+    result = asyncio.run(agent.run_turn("task"))
+    assert result.status == "completed"
+    assert result.steps == 2
+    assert seen == ["done?", "fixed"]
+    second = provider.calls[1]
+    assert second[-1] == {"role": "user", "content": "GATE: FAIL — deliverable missing"}
+    assert second[-2]["role"] == "assistant"
+    assert "hook.message" in event_types(session)
+
+
+def test_before_finish_reopens_are_bounded(workspace) -> None:
+    from panda_core.agent import AgentHooks
+
+    async def always_fail(agent: Agent, text: str) -> str:
+        return "GATE: FAIL"
+
+    agent, _, provider = make_agent(
+        workspace,
+        [[TextDelta("x"), DoneEvent(finish_reason="stop")]] * 10,
+        max_steps=10,
+    )
+    agent.hooks = AgentHooks(before_finish=always_fail, max_finish_reopens=2)
+    result = asyncio.run(agent.run_turn("task"))
+    assert result.steps == 3
+    assert len(provider.calls) == 3
+
+
+def test_after_tool_notes_follow_all_tool_results(workspace) -> None:
+    from panda_core.agent import AgentHooks
+
+    calls = (
+        ToolCall(id="c1", name="read_file", arguments='{"path":"README.md"}'),
+        ToolCall(id="c2", name="read_file", arguments='{"path":"README.md"}'),
+    )
+
+    async def loop_detector(agent: Agent, call: Any, result: Any) -> str | None:
+        return f"note {call.id}"
+
+    agent, _, provider = make_agent(
+        workspace,
+        [
+            [DoneEvent(finish_reason="tool_calls", tool_calls=calls)],
+            [TextDelta("done"), DoneEvent(finish_reason="stop")],
+        ],
+    )
+    agent.hooks = AgentHooks(after_tool=loop_detector)
+    asyncio.run(agent.run_turn("task"))
+    tail = [m["role"] for m in provider.calls[1][-4:]]
+    assert tail == ["assistant", "tool", "tool", "user"]
+    assert provider.calls[1][-1]["content"] == "note c1\n\nnote c2"
+
+
+def test_before_model_message_is_appended_before_each_call(workspace) -> None:
+    from panda_core.agent import AgentHooks
+
+    async def clock(agent: Agent) -> str:
+        return "45% of the clock used"
+
+    agent, _, provider = make_agent(workspace, [[TextDelta("ok"), DoneEvent()]])
+    agent.hooks = AgentHooks(before_model=clock)
+    asyncio.run(agent.run_turn("task"))
+    assert provider.calls[0][-2:] == [
+        {"role": "user", "content": "task"},
+        {"role": "user", "content": "45% of the clock used"},
+    ]
+
+
+def test_hooks_never_edit_earlier_messages(workspace) -> None:
+    from panda_core.agent import AgentHooks
+
+    async def gate(agent: Agent, text: str) -> str | None:
+        return "fix it" if text == "first" else None
+
+    agent, _, provider = make_agent(
+        workspace,
+        [
+            [TextDelta("first"), DoneEvent(finish_reason="stop")],
+            [TextDelta("second"), DoneEvent(finish_reason="stop")],
+        ],
+    )
+    agent.hooks = AgentHooks(before_finish=gate)
+    asyncio.run(agent.run_turn("task"))
+    first, second = provider.calls
+    assert second[: len(first)] == first
+
+
+def test_frozen_tools_ignore_later_registry_changes(workspace) -> None:
+    call = ToolCall(id="c1", name="read_file", arguments='{"path":"README.md"}')
+    session = SessionLog.create(workspace.sessions_dir, label="freeze")
+    policy, _ = load_policy_or_default(workspace.policy_path)
+    ctx = ToolContext(
+        workspace=workspace, policy=PolicyEngine(policy, root=workspace.root), session=session
+    )
+    registry = ToolRegistry(ctx)
+    provider = KwargsProvider(
+        [
+            [DoneEvent(finish_reason="tool_calls", tool_calls=(call,))],
+            [TextDelta("done"), DoneEvent(finish_reason="stop")],
+        ]
+    )
+    agent = Agent(workspace, provider, registry, session=session, freeze_tools=True)
+    original = registry.to_openai
+
+    def grown() -> list[dict[str, Any]]:
+        extra = {"type": "function", "function": {"name": "late_tool", "parameters": {}}}
+        return [*original(), extra]
+
+    async def scenario() -> None:
+        stream = provider.stream
+
+        async def wrapped(messages, tools=None, **kwargs):
+            registry.to_openai = grown  # type: ignore[method-assign]
+            async for event in stream(messages, tools, **kwargs):
+                yield event
+
+        provider.stream = wrapped  # type: ignore[method-assign]
+        await agent.run_turn("task")
+
+    asyncio.run(scenario())
+    assert provider.tool_names[0] == provider.tool_names[1]
+    assert "late_tool" not in provider.tool_names[1]
+
+
+def test_effort_is_sent_only_when_set(workspace) -> None:
+    session = SessionLog.create(workspace.sessions_dir, label="effort")
+    policy, _ = load_policy_or_default(workspace.policy_path)
+    ctx = ToolContext(
+        workspace=workspace, policy=PolicyEngine(policy, root=workspace.root), session=session
+    )
+    provider = KwargsProvider([[TextDelta("a"), DoneEvent()], [TextDelta("b"), DoneEvent()]])
+    agent = Agent(workspace, provider, ToolRegistry(ctx), session=session)
+    asyncio.run(agent.run_turn("one"))
+    agent.effort = "max"
+    asyncio.run(agent.run_turn("two"))
+    assert "effort" not in provider.kwargs[0]
+    assert provider.kwargs[1]["effort"] == "max"
+
+
+# ---- Onda 2: agent without a workspace, in-memory ledger ----
+
+
+class EchoTools:
+    """A minimal Toolset: no ctx, no workspace."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def to_openai(self) -> list[dict[str, Any]]:
+        return [{"type": "function", "function": {"name": "echo", "parameters": {}}}]
+
+    async def call(self, name, arguments):
+        from panda_core.tools import ToolResult
+
+        self.calls.append((name, arguments))
+        return ToolResult(ok=True, content="echoed")
+
+
+def test_agent_runs_without_a_workspace_and_logs_in_memory() -> None:
+    from panda_core.ledger import MemoryLedger
+
+    ledger = MemoryLedger("s-1")
+    tools = EchoTools()
+    call = ToolCall(id="c1", name="echo", arguments="{}")
+    provider = FakeProvider(
+        [
+            [DoneEvent(finish_reason="tool_calls", tool_calls=(call,))],
+            [TextDelta("done"), DoneEvent(finish_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        None,
+        provider,
+        tools,
+        session=ledger,
+        model="google-cloud/glm-5.2",
+        context_window=100_000,
+        system_prompt="You are an engineering agent.",
+        private=True,
+    )
+    result = asyncio.run(agent.run_turn("secret task text"))
+    assert result.status == "completed"
+    assert result.session_id == "s-1"
+    assert tools.calls == [("echo", {})]
+    assert provider.calls[0][0] == {"role": "system", "content": "You are an engineering agent."}
+    kinds = [event.type for event in ledger.events()]
+    assert kinds[0] == "turn.start" and kinds[-1] == "turn.end"
+    user = next(event for event in ledger.events() if event.type == "message.user")
+    assert "content" not in user.data and user.data["private"] is True
+    agent.set_model("google-cloud/claude-opus-5-5")
+    assert agent.messages[0]["content"] == "You are an engineering agent."
+
+
+def test_agent_without_a_workspace_requires_explicit_settings() -> None:
+    with pytest.raises(ValueError):
+        Agent(None, FakeProvider([]), EchoTools(), model="m", context_window=1_000)
+
+
+def test_memory_ledger_is_bounded() -> None:
+    from panda_core.ledger import MemoryLedger
+
+    ledger = MemoryLedger(max_events=3)
+    for index in range(5):
+        ledger.append("tool.call", {"n": index})
+    assert [event.data["n"] for event in ledger.events()] == [2, 3, 4]
+    assert not ledger.is_closed()
+    ledger.close()
+    assert ledger.is_closed()

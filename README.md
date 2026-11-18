@@ -226,6 +226,10 @@ are refused on purpose.
   can be omitted with `--private`.
 - **Boring core.** Python 3.12, Typer, Rich, Pydantic, Textual; Node only for the
   corpus validator.
+- **One core, other gateways.** `provider.endpoint_profile: generic` points the
+  same adapters at any gateway serving OpenAI chat, Anthropic Messages, or
+  Gemini (for example the PLE model gateway, via
+  `panda_core.profiles.ple_provider_settings()`). The default stays OpenCode Go.
 
 More detail: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
 [`docs/DESIGN.md`](docs/DESIGN.md), and [`SECURITY.md`](SECURITY.md).

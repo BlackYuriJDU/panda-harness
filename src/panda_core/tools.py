@@ -9,6 +9,7 @@ validator; nothing here reimplements those checks.
 from __future__ import annotations
 
 import asyncio
+import base64
 import difflib
 import json
 import os
@@ -43,6 +44,14 @@ IGNORED_DIRS = {
     "build",
 }
 MAX_READ_BYTES = 1_048_576
+# Base64 inflates by 4/3; providers cap a single image at about 5 MB encoded.
+MAX_IMAGE_BYTES = 3_750_000
+IMAGE_SIGNATURES = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
 MAX_WRITE_BYTES = 2_097_152
 PREVIEW_LIMIT = 6_000
 DEFAULT_OUTPUT_LIMIT = 30_000
@@ -84,14 +93,19 @@ class ToolResult:
     content: str
     data: dict[str, Any] = field(default_factory=dict)
     blocked: bool = False
+    # (media_type, base64) pairs the model should see next to `content`.
+    images: list[tuple[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "ok": self.ok,
             "blocked": self.blocked,
             "content": self.content,
             "data": self.data,
         }
+        if self.images:
+            payload["images"] = len(self.images)
+        return payload
 @dataclass(frozen=True)
 class ApprovalRequest:
     tool: str
@@ -127,6 +141,8 @@ class ToolContext:
     active_study: str | None = None
     approve: Approver | None = None
     output_limit: int = DEFAULT_OUTPUT_LIMIT
+    # Opt-in: registers `view_image`, which sends image bytes to the model.
+    vision: bool = False
 
 
 def _json(payload: Any) -> str:
@@ -396,6 +412,8 @@ class ToolRegistry:
             "number_list": self._number_list,
             "number_show": self._number_show,
         }
+        if ctx.vision:
+            self._handlers["view_image"] = self._view_image
         self._specs: dict[str, ToolSpec] = {spec.name: spec for spec in self._build_specs()}
     # ---- contract ----
     def specs(self) -> list[ToolSpec]:
@@ -503,6 +521,41 @@ class ToolRegistry:
             },
             text=body,
         )
+    async def _view_image(self, args: dict[str, Any]) -> ToolResult:
+        path_value = _string_arg(args, "path")
+        path, relative = resolve_inside(self.ctx.workspace.root, path_value)
+        decision, blocked = await _authorize(
+            self.ctx, tool="view_image", action="read", resource=relative
+        )
+        if blocked:
+            return blocked
+        if not path.is_file():
+            raise ToolInputError(f"file not found: {relative}")
+        if path.stat().st_size > MAX_IMAGE_BYTES:
+            raise ToolInputError(
+                f"image is larger than {MAX_IMAGE_BYTES} bytes; downscale or crop it first"
+            )
+        raw = path.read_bytes()
+        media_type = next(
+            (kind for magic, kind in IMAGE_SIGNATURES if raw.startswith(magic)),
+            "image/webp" if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP" else None,
+        )
+        if media_type is None:
+            raise ToolInputError(
+                "not a PNG, JPEG, GIF, or WebP image; render PDF pages to PNG first"
+            )
+        result = _ok(
+            "view_image",
+            {
+                "path": relative,
+                "media_type": media_type,
+                "bytes": len(raw),
+                "rule": decision.rule_id if decision else None,
+            },
+        )
+        result.images.append((media_type, base64.b64encode(raw).decode("ascii")))
+        return result
+
     async def _list_files(self, args: dict[str, Any]) -> ToolResult:
         pattern = _string_arg(args, "pattern", default="*") or "*"
         limit = _int_arg(args, "limit", default=200, minimum=1, maximum=2_000)
@@ -951,7 +1004,7 @@ class ToolRegistry:
     # ---- specs ----
     def _build_specs(self) -> list[ToolSpec]:
         obj: dict[str, Any] = {"type": "object"}
-        return [
+        specs = [
             ToolSpec(
                 "workspace_info",
                 "Workspace root, provider, model, validator, policy, studies, session state.",
@@ -1207,6 +1260,23 @@ class ToolRegistry:
                 },
             ),
         ]
+        if self.ctx.vision:
+            specs.append(
+                ToolSpec(
+                    "view_image",
+                    "Look at a PNG, JPEG, GIF, or WebP image inside the workspace "
+                    "(drawings, plots, rendered PDF pages).",
+                    {
+                        **obj,
+                        "properties": {
+                            "path": {"type": "string", "description": "Workspace-relative path."}
+                        },
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                )
+            )
+        return specs
 
 
 __all__ = [

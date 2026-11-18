@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Groundwork for running Panda as a headless harness behind a generic model
+gateway (the PLE competition). Every change is opt-in; defaults are unchanged.
+
+### Added
+
+- `provider.endpoint_profile: generic` with `anthropic_base_url` and
+  `google_base_url`: routes without the Go prefixes, no `x-opencode-session`,
+  key also sent as `x-api-key`/`x-goog-api-key`. `gpt-*` ids use OpenAI chat
+  there; `provider.protocol` forces an adapter.
+- `provider.effort`, sent as `reasoning_effort`, `reasoning.effort`, or
+  `output_config.effort` depending on the protocol.
+- Claude thinking: signed `thinking` and `redacted_thinking` blocks are captured
+  in stream order (including between tool calls) and replayed verbatim on the
+  next Anthropic request; other protocols never see them.
+- `provider.prompt_cache`: `cache_control` on the system prompt and newest block
+  for `claude*` models (Anthropic and chat).
+- `provider.retry_partial`: buffered attempts that discard a cut or failed
+  stream and repeat it; `provider.max_retry_delay_seconds`; retries never wait
+  past `stream(deadline=...)`.
+- `Agent(deadline_seconds=...)`: wall-clock bound per turn, status `deadline`.
+- `panda_core.profiles.ple_provider_settings()` builds settings from the PLE
+  evaluator's environment.
+- `AgentHooks` (`before_model`, `after_tool`, `before_finish`): opt-in loop
+  hooks whose text is always appended as a new user message at the end of the
+  history; `before_finish` can reopen a turn a bounded number of times.
+- `Agent(freeze_tools=True)` captures the tool list on the first model call, so
+  a registry change cannot invalidate signed Claude thinking mid-session.
+- Per-request effort: `stream(effort=...)` and `Agent.effort` override
+  `provider.effort` for one call (per-phase effort); unknown levels fail before
+  any request.
+- Opt-in vision: `ToolContext(vision=True)` registers `view_image` (PNG, JPEG,
+  GIF, WebP, up to 3.75 MB). Image parts are sent as Anthropic `image` blocks,
+  Gemini `inlineData`, and OpenAI chat `image_url` parts (tool images follow the
+  tool results as a user turn); the Responses adapter reports them as not sent.
+  The ledger never stores image bytes, and the context budget counts each image
+  as a fixed estimate.
+- `Agent(workspace=None, system_prompt=..., model=..., context_window=...)` runs
+  without a Panda workspace, with any toolset that has `to_openai()` and
+  `call()`; `panda_core.ledger.MemoryLedger` is a drop-in ledger that never
+  touches disk.
+- `entries/panda-ple/`: the PLE competition entry built on `panda_core` (remote
+  tools over the serve protocol, frozen MCP catalog, environment probe,
+  metadata-only logs, usage reporting, cancel-safe final message). It moves to
+  its own repository before submission.
+
+### Changed
+
+- The `generic` endpoint profile accepts plain `http` base URLs outside
+  loopback (the PLE kit's egress proxy is `http://host.docker.internal:4000/v1`);
+  every other profile still requires https outside loopback.
+- With `retry_partial` and a `deadline`, rate limits, 5xx, and transport
+  failures are retried until the deadline instead of stopping at
+  `max_retries`. A `400` is still never retried.
+- The PLE profile uses a 1800 s read timeout (silent thinking at max effort).
+
+- `claude*` models never receive `temperature`, on any protocol.
+- Context trimming keeps the first user message (the task instruction), elides
+  old tool results before dropping messages, and drops stored Claude thinking
+  whenever history is edited instead of appended (also on `set_model` and
+  `set_active_study`). Before, trimming removed the instruction first.
+
 ## [0.2.0a4] — 2026-10-30
 
 ### Fixed
