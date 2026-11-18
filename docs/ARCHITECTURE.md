@@ -52,6 +52,7 @@ Nothing is enforced only in the prompt.
 | `workspace.py` | Root discovery, path normalization, git/tool probes. |
 | `provider.py` | Model client for OpenCode Go or a generic gateway: catalogue, protocol classification, streaming adapters for OpenAI chat, Anthropic Messages, Responses, and Google generateContent, usage, retries. |
 | `profiles.py` | Named provider settings built from the environment (the PLE gateway). |
+| `ledger.py` | `MemoryLedger`: in-memory, bounded ledger for runs that must not write task content to disk. |
 | `agent.py` | System prompt, turn loop, tool dispatch, context trimming, approvals, usage accounting. |
 | `tools.py` | JSON-schema tool specs, path resolution, read/write/shell/validate/study/evidence/claim/number/session tools. |
 | `policy.py` | Ordered rules, last-match-wins, hard denies, `ask` handling. |

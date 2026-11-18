@@ -155,7 +155,10 @@ Library options (no CLI flag): `Agent(hooks=AgentHooks(...))` adds loop hooks
 whose text is appended as a new user message; `Agent(freeze_tools=True)` keeps
 the first tool list for the session; `Agent.effort` or `stream(effort=...)`
 overrides `provider.effort` per request; `ToolContext(vision=True)` registers the
-`view_image` tool. All are off by default.
+`view_image` tool. All are off by default. `Agent(None, ..., system_prompt=...,
+model=..., context_window=...)` runs without a workspace, and
+`panda_core.ledger.MemoryLedger` replaces the persisted session ledger when
+nothing may be written to disk.
 
 `panda_core.profiles.ple_provider_settings()` builds generic settings from the
 PLE evaluator's environment (`MODEL_BASE_URL`, `MODEL_NAME`, `MODEL_API_KEY`,

@@ -42,6 +42,14 @@ gateway (the PLE competition). Every change is opt-in; defaults are unchanged.
   tool results as a user turn); the Responses adapter reports them as not sent.
   The ledger never stores image bytes, and the context budget counts each image
   as a fixed estimate.
+- `Agent(workspace=None, system_prompt=..., model=..., context_window=...)` runs
+  without a Panda workspace, with any toolset that has `to_openai()` and
+  `call()`; `panda_core.ledger.MemoryLedger` is a drop-in ledger that never
+  touches disk.
+- `entries/panda-ple/`: the PLE competition entry built on `panda_core` (remote
+  tools over the serve protocol, frozen MCP catalog, environment probe,
+  metadata-only logs, usage reporting, cancel-safe final message). It moves to
+  its own repository before submission.
 
 ### Changed
 

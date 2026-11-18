@@ -651,3 +651,74 @@ def test_effort_is_sent_only_when_set(workspace) -> None:
     asyncio.run(agent.run_turn("two"))
     assert "effort" not in provider.kwargs[0]
     assert provider.kwargs[1]["effort"] == "max"
+
+
+# ---- Onda 2: agent without a workspace, in-memory ledger ----
+
+
+class EchoTools:
+    """A minimal Toolset: no ctx, no workspace."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+
+    def to_openai(self) -> list[dict[str, Any]]:
+        return [{"type": "function", "function": {"name": "echo", "parameters": {}}}]
+
+    async def call(self, name, arguments):
+        from panda_core.tools import ToolResult
+
+        self.calls.append((name, arguments))
+        return ToolResult(ok=True, content="echoed")
+
+
+def test_agent_runs_without_a_workspace_and_logs_in_memory() -> None:
+    from panda_core.ledger import MemoryLedger
+
+    ledger = MemoryLedger("s-1")
+    tools = EchoTools()
+    call = ToolCall(id="c1", name="echo", arguments="{}")
+    provider = FakeProvider(
+        [
+            [DoneEvent(finish_reason="tool_calls", tool_calls=(call,))],
+            [TextDelta("done"), DoneEvent(finish_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        None,
+        provider,
+        tools,
+        session=ledger,
+        model="google-cloud/glm-5.2",
+        context_window=100_000,
+        system_prompt="You are an engineering agent.",
+        private=True,
+    )
+    result = asyncio.run(agent.run_turn("secret task text"))
+    assert result.status == "completed"
+    assert result.session_id == "s-1"
+    assert tools.calls == [("echo", {})]
+    assert provider.calls[0][0] == {"role": "system", "content": "You are an engineering agent."}
+    kinds = [event.type for event in ledger.events()]
+    assert kinds[0] == "turn.start" and kinds[-1] == "turn.end"
+    user = next(event for event in ledger.events() if event.type == "message.user")
+    assert "content" not in user.data and user.data["private"] is True
+    agent.set_model("google-cloud/claude-opus-5-5")
+    assert agent.messages[0]["content"] == "You are an engineering agent."
+
+
+def test_agent_without_a_workspace_requires_explicit_settings() -> None:
+    with pytest.raises(ValueError):
+        Agent(None, FakeProvider([]), EchoTools(), model="m", context_window=1_000)
+
+
+def test_memory_ledger_is_bounded() -> None:
+    from panda_core.ledger import MemoryLedger
+
+    ledger = MemoryLedger(max_events=3)
+    for index in range(5):
+        ledger.append("tool.call", {"n": index})
+    assert [event.data["n"] for event in ledger.events()] == [2, 3, 4]
+    assert not ledger.is_closed()
+    ledger.close()
+    assert ledger.is_closed()

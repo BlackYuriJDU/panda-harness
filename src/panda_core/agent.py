@@ -16,7 +16,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from panda_core.errors import PandaError, ProviderError
 from panda_core.limits import DEFAULT_MAX_STEPS
@@ -77,6 +77,24 @@ your habits, the corpus wins. Cite concrete locations as `path:line`.
 Workspace instructions:
 {instructions}
 """
+
+
+class Toolset(Protocol):
+    """What the agent needs from a tool provider (local registry or remote)."""
+
+    def to_openai(self) -> list[dict[str, Any]]: ...
+
+    async def call(self, name: str, arguments: dict[str, Any] | str | None) -> ToolResult: ...
+
+
+class Ledger(Protocol):
+    """What the agent needs from a ledger (`SessionLog` or `MemoryLedger`)."""
+
+    session_id: str
+
+    def append(self, event_type: str, data: dict[str, Any] | None = None) -> Any: ...
+
+    def is_closed(self) -> bool: ...
 
 
 HookText = Awaitable[str | None]
@@ -244,11 +262,11 @@ def build_system_prompt(
 class Agent:
     def __init__(
         self,
-        workspace: Workspace,
+        workspace: Workspace | None,
         provider: OpenCodeProvider,
-        tools: ToolRegistry,
+        tools: ToolRegistry | Toolset,
         *,
-        session: SessionLog | None = None,
+        session: SessionLog | Ledger | None = None,
         model: str | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         active_study: str | None = None,
@@ -260,12 +278,19 @@ class Agent:
         hooks: AgentHooks | None = None,
         freeze_tools: bool = False,
         effort: str | None = None,
+        system_prompt: str | None = None,
     ) -> None:
+        # Without a workspace (a remote task container), the caller supplies
+        # the model, the context window, and the system prompt explicitly.
+        if workspace is None and not (model and context_window and system_prompt):
+            raise ValueError("an agent without a workspace needs model, context_window, "
+                             "and system_prompt")
         self.workspace = workspace
         self.provider = provider
         self.tools = tools
-        self.session = session if session is not None else tools.ctx.session
-        self.model = model or workspace.config.model
+        ctx = getattr(tools, "ctx", None)
+        self.session = session if session is not None else getattr(ctx, "session", None)
+        self.model = model or (workspace.config.model if workspace else "")
         self.max_steps = max(1, int(max_steps))
         # Optional wall-clock budget per turn; the loop stops at whichever of
         # max_steps or the deadline comes first.
@@ -282,12 +307,12 @@ class Agent:
         self.private = private
         self._approver = approver
         self._on_event = on_event
-        self.context_window = context_window or workspace.config.provider.context_window
+        self.context_window = context_window or (
+            workspace.config.provider.context_window if workspace else 0
+        )
+        self._fixed_system_prompt = system_prompt
         self.messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": build_system_prompt(workspace, active_study=active_study),
-            }
+            {"role": "system", "content": self._system_prompt(active_study)}
         ]
         self.turn_index = 0
         self.last_usage = Usage()
@@ -296,10 +321,17 @@ class Agent:
         self.last_steps = 0
         self._cancelled = False
         # The tool context is shared: one policy, one session, one approver.
-        if self.session is not None:
-            self.tools.ctx.session = self.session
-        self.tools.ctx.approve = self._approve
-        self.tools.ctx.active_study = active_study
+        if ctx is not None:
+            if self.session is not None:
+                ctx.session = self.session
+            ctx.approve = self._approve
+            ctx.active_study = active_study
+
+    def _system_prompt(self, active_study: str | None) -> str:
+        if self._fixed_system_prompt is not None:
+            return self._fixed_system_prompt
+        assert self.workspace is not None  # guaranteed by __init__
+        return build_system_prompt(self.workspace, active_study=active_study)
 
     # ---- observability ----
     def _emit(self, kind: str, **data: Any) -> None:
@@ -711,19 +743,15 @@ class Agent:
     def set_model(self, model: str) -> None:
         self.model = model
         self._drop_thinking()
-        self.messages[0] = {
-            "role": "system",
-            "content": build_system_prompt(self.workspace, active_study=self.active_study),
-        }
+        self.messages[0] = {"role": "system", "content": self._system_prompt(self.active_study)}
 
     def set_active_study(self, study_id: str | None) -> None:
         self.active_study = study_id
-        self.tools.ctx.active_study = study_id
+        ctx = getattr(self.tools, "ctx", None)
+        if ctx is not None:
+            ctx.active_study = study_id
         self._drop_thinking()
-        self.messages[0] = {
-            "role": "system",
-            "content": build_system_prompt(self.workspace, active_study=study_id),
-        }
+        self.messages[0] = {"role": "system", "content": self._system_prompt(study_id)}
 
     def reset_conversation(self) -> None:
         self.messages = [self.messages[0]]
@@ -740,6 +768,8 @@ __all__ = [
     "Agent",
     "AgentEvent",
     "AgentHooks",
+    "Ledger",
+    "Toolset",
     "SYSTEM_PROMPT",
     "TurnResult",
     "build_system_prompt",
